@@ -19,6 +19,7 @@ from typing import Any
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 import uvicorn
 
 load_dotenv()
@@ -61,6 +62,13 @@ PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
 ).replace("\\n", "\n").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+TBANK_TERMINAL_KEY = os.getenv("TBANK_TERMINAL_KEY", "").strip()
+TBANK_PASSWORD = os.getenv("TBANK_PASSWORD", "").strip()
+TBANK_INIT_URL = os.getenv("TBANK_INIT_URL", "https://securepay.tinkoff.ru/v2/Init").strip()
+TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
+TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
+TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -337,6 +345,14 @@ class UserStore:
             conn.commit()
             return int(cur.lastrowid)
 
+    def set_payment_provider_ref(self, request_id: int, provider_ref: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET provider_ref = ? WHERE id = ?",
+                (provider_ref, request_id),
+            )
+            conn.commit()
+
     def list_user_payments(self, chat_id: int, limit: int = 5) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -490,6 +506,58 @@ def openrouter_headers() -> dict[str, str]:
         "HTTP-Referer": "https://max.ru",
         "X-Title": "MAX Multi AI Bot",
     }
+
+
+def tbank_enabled() -> bool:
+    return bool(TBANK_TERMINAL_KEY and TBANK_PASSWORD)
+
+
+def tbank_order_id(request_id: int) -> str:
+    return f"MAXBOT-{request_id}"
+
+
+def parse_request_id_from_order_id(order_id: str) -> int | None:
+    value = order_id.strip().upper()
+    if not value.startswith("MAXBOT-"):
+        return None
+    suffix = value.split("-", 1)[1]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def scalar_string(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def tbank_token_from_payload(payload: dict[str, Any], password: str) -> str:
+    # T-Bank token uses only root scalar fields (+ Password), excluding Token and nested objects.
+    values: dict[str, str] = {}
+    for key, value in payload.items():
+        if key == "Token":
+            continue
+        if isinstance(value, (dict, list)):
+            continue
+        values[key] = scalar_string(value)
+    values["Password"] = password
+    raw = "".join(values[key] for key in sorted(values.keys()))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def tbank_notification_is_valid(payload: dict[str, Any]) -> bool:
+    if TBANK_TERMINAL_KEY:
+        terminal_key = scalar_string(payload.get("TerminalKey"))
+        if terminal_key != TBANK_TERMINAL_KEY:
+            return False
+    if not TBANK_PASSWORD:
+        return True
+    received = scalar_string(payload.get("Token")).lower()
+    if not received:
+        return False
+    expected = tbank_token_from_payload(payload, TBANK_PASSWORD).lower()
+    return received == expected
 
 
 def plan_allowed(plan: str, min_plan: str) -> bool:
@@ -999,8 +1067,16 @@ async def send_help(chat_id: int) -> None:
 
 
 async def send_menu(chat_id: int) -> None:
+    capabilities = (
+        "Что умею:\n"
+        "• ответы через GPT, Gemini и DeepSeek\n"
+        f"{image_capability_line()}\n"
+        "• сохранение контекста диалога"
+    )
     text = (
-        f"{WELCOME_TEXT}\n\n"
+        "Привет. Это твой AI-бот в MAX.\n\n"
+        f"{capabilities}\n\n"
+        "Выбери действие кнопками или просто напиши вопрос.\n\n"
         f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
         f"{usage_text(user_profile(chat_id))}\n\n"
         f"{MENU_TEXT}"
@@ -1065,12 +1141,138 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
             await max_send_message(admin_id, text)
 
 
+def image_capability_line() -> str:
+    label = DEFAULT_IMAGE_MODEL.label
+    description = (DEFAULT_IMAGE_MODEL.description or "").lower()
+    if "nano banana" in description:
+        return f"• генерация картинок через Nano Banana ({label})"
+    return f"• генерация картинок через {label}"
+
+
+def resolve_tbank_notification_url() -> str:
+    if TBANK_NOTIFICATION_URL:
+        return TBANK_NOTIFICATION_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/webhook/tbank"
+    return ""
+
+
+def resolve_tbank_success_url() -> str:
+    if TBANK_SUCCESS_URL:
+        return TBANK_SUCCESS_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/health"
+    return ""
+
+
+def resolve_tbank_fail_url() -> str:
+    if TBANK_FAIL_URL:
+        return TBANK_FAIL_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/health"
+    return ""
+
+
+async def tbank_init_payment(
+    request_id: int,
+    amount_rub: int,
+    description: str,
+) -> tuple[str, str]:
+    if not tbank_enabled():
+        raise RuntimeError("T-Bank credentials are not configured.")
+
+    order_id = tbank_order_id(request_id)
+    payload: dict[str, Any] = {
+        "TerminalKey": TBANK_TERMINAL_KEY,
+        "Amount": int(amount_rub) * 100,
+        "OrderId": order_id,
+        "Description": description[:140],
+        "PayType": "O",
+    }
+    notification_url = resolve_tbank_notification_url()
+    if notification_url:
+        payload["NotificationURL"] = notification_url
+    success_url = resolve_tbank_success_url()
+    if success_url:
+        payload["SuccessURL"] = success_url
+    fail_url = resolve_tbank_fail_url()
+    if fail_url:
+        payload["FailURL"] = fail_url
+
+    payload["Token"] = tbank_token_from_payload(payload, TBANK_PASSWORD)
+    session = await get_session()
+    async with session.post(TBANK_INIT_URL, json=payload) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status >= 400:
+            raise RuntimeError(f"T-Bank Init HTTP {resp.status}: {data}")
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid T-Bank Init response.")
+    if not data.get("Success"):
+        raise RuntimeError(f"T-Bank Init failed: {data.get('Message') or data.get('Details') or data}")
+    payment_url = data.get("PaymentURL")
+    payment_id = data.get("PaymentId")
+    if not isinstance(payment_url, str) or not payment_url:
+        raise RuntimeError(f"T-Bank Init missing PaymentURL: {data}")
+    return payment_url, scalar_string(payment_id)
+
+
+async def activate_payment_request(request_id: int, source: str) -> tuple[bool, str]:
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return False, f"payment #{request_id} not found"
+
+    status = str(payment.get("status", ""))
+    if status in {"paid", "canceled"}:
+        return False, f"payment #{request_id} already {status}"
+
+    target = int(payment["chat_id"])
+    plan = str(payment["plan"])
+    days = int(payment["days"])
+    selected = best_default_alias_for_plan(plan)
+    user_profile(target)
+    state.user_store.set_payment_status(request_id, "paid")
+    expires_at = state.user_store.set_subscription(target, plan, days, selected)
+    state.user_store.mark_payment_activated(request_id)
+
+    with suppress(Exception):
+        await max_send_message(
+            target,
+            f"Оплата подтверждена автоматически ({source}). Тариф {plan} активирован до {expires_at[:16]} UTC.",
+            attachments=build_keyboard(),
+        )
+    return True, expires_at
+
+
 async def create_buy_request_v2(chat_id: int, plan: str) -> tuple[int | None, str]:
     if plan not in {"start", "pro"}:
         return None, "Доступно: start или pro."
     amount, days = plan_price_and_days(plan)
     request_id = state.user_store.create_payment_request(chat_id, plan, days, amount)
     payment_purpose = f"Оплата подписки, заказ #{request_id}"
+    if tbank_enabled():
+        try:
+            payment_url, payment_id = await tbank_init_payment(
+                request_id=request_id,
+                amount_rub=amount,
+                description=f"Подписка {plan}, заказ #{request_id}",
+            )
+            state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
+            text = (
+                f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
+                "Оплати по ссылке Т-Банка:\n"
+                f"{payment_url}\n\n"
+                f"Назначение платежа: {payment_purpose}\n"
+                "После успешной оплаты тариф активируется автоматически."
+            )
+            return request_id, text
+        except Exception as exc:
+            log.exception("T-Bank Init failed for request %s", request_id)
+            text = (
+                f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n"
+                f"Автооплата сейчас недоступна ({exc}).\n\n"
+                "Используй ручную оплату ниже."
+            )
+            return request_id, text
     text = (
         f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
         "Куда оплачивать:\n"
@@ -1280,6 +1482,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_v2(), notify=False)
             return True
         status = str(payment["status"])
+        provider_ref = str(payment.get("provider_ref", ""))
+        if provider_ref.startswith("tbank:") and status == "pending":
+            if callback_id:
+                await answer_callback(callback_id, "ожидаем банк")
+            await max_send_message(
+                chat_id,
+                "Платеж проверяется автоматически через Т-Банк. Обычно это занимает до 1-2 минут.",
+                attachments=build_tariffs_keyboard_v2(),
+                notify=False,
+            )
+            return True
         if status == "paid":
             if callback_id:
                 await answer_callback(callback_id, "Уже подтверждено")
@@ -1574,6 +1787,32 @@ async def max_webhook(request: Request) -> dict[str, bool]:
         except Exception:
             log.exception("Unhandled webhook processing error")
     return {"ok": True}
+
+
+@app.post("/webhook/tbank")
+async def tbank_webhook(request: Request) -> PlainTextResponse:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid payload")
+
+    if not tbank_notification_is_valid(payload):
+        log.warning("Invalid T-Bank webhook signature or terminal")
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    order_id = scalar_string(payload.get("OrderId"))
+    status = scalar_string(payload.get("Status")).upper()
+    success_raw = payload.get("Success")
+    success = success_raw is True or scalar_string(success_raw).lower() == "true"
+
+    request_id = parse_request_id_from_order_id(order_id)
+    if request_id is not None and success and status == "CONFIRMED":
+        activated, info = await activate_payment_request(request_id, source="T-Bank webhook")
+        if activated:
+            log.info("T-Bank payment activated request_id=%s until=%s", request_id, info)
+        else:
+            log.info("T-Bank payment skipped request_id=%s reason=%s", request_id, info)
+
+    return PlainTextResponse("OK")
 
 
 def run() -> None:
