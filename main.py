@@ -775,13 +775,11 @@ async def send_help(chat_id: int) -> None:
 
 
 async def send_menu(chat_id: int) -> None:
-    admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
     text = (
         f"{WELCOME_TEXT}\n\n"
         f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
         f"{usage_text(user_profile(chat_id))}\n\n"
         f"{MENU_TEXT}"
-        f"{admin_part if is_admin(chat_id) else ''}"
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
