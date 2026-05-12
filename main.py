@@ -82,13 +82,22 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "Команды:\n"
     "/start или /menu — меню\n"
-    "/models — версии моделей и цены\n"
+    "/models — версии и описание моделей\n"
     "/plan — твой тариф и остатки\n"
     "/model <alias> — выбрать модель\n"
     "/gpt, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
     "/clear — очистить контекст"
+)
+
+ADMIN_HELP_TEXT = (
+    "\n\nАдмин:\n"
+    "/admin help\n"
+    "/admin user <chat_id>\n"
+    "/admin plan <chat_id> <free|start|pro>\n"
+    "/admin block <chat_id> <on|off>\n"
+    "/costs — модели и цены"
 )
 
 TARIFFS_TEXT = (
@@ -355,6 +364,10 @@ def plan_allowed(plan: str, min_plan: str) -> bool:
     return PLAN_ORDER.get(plan, 0) >= PLAN_ORDER.get(min_plan, 0)
 
 
+def is_admin(chat_id: int) -> bool:
+    return chat_id in ADMIN_IDS
+
+
 def best_default_alias_for_plan(plan: str) -> str:
     preferred = [DEFAULT_TEXT_MODEL.alias, "gpt", "deepseek"]
     for alias in preferred:
@@ -432,24 +445,26 @@ def build_keyboard() -> list[dict[str, Any]]:
     ]
 
 
-def model_line(model: ModelInfo) -> str:
-    return (
-        f"{model.alias} — {model.label} ({model.provider})\n"
-        f"версия: {model.version}, план: {model.min_plan}+\n"
-        f"цена: in ${model.input_price_usd_per_m}/M, out ${model.output_price_usd_per_m}/M\n"
-        f"для чего: {model.description}"
-    )
+def model_line(model: ModelInfo, include_prices: bool) -> str:
+    lines = [
+        f"{model.alias} — {model.label} ({model.provider})",
+        f"версия: {model.version}, план: {model.min_plan}+",
+        f"для чего: {model.description}",
+    ]
+    if include_prices:
+        lines.append(f"цена: in ${model.input_price_usd_per_m}/M, out ${model.output_price_usd_per_m}/M")
+    return "\n".join(lines)
 
 
-def build_models_text(user_plan: str) -> str:
+def build_models_text(user_plan: str, include_prices: bool = False) -> str:
     lines = ["Текстовые модели:"]
     for model in TEXT_MODELS.values():
         prefix = "доступно" if plan_allowed(user_plan, model.min_plan) else f"нужно {model.min_plan}+"
-        lines.append(f"\n[{prefix}]\n{model_line(model)}")
+        lines.append(f"\n[{prefix}]\n{model_line(model, include_prices)}")
     image_model = DEFAULT_IMAGE_MODEL
     image_prefix = "доступно" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {image_model.min_plan}+"
     lines.append("\nКартинки:")
-    lines.append(f"\n[{image_prefix}]\n{model_line(image_model)}")
+    lines.append(f"\n[{image_prefix}]\n{model_line(image_model, include_prices)}")
     return "\n".join(lines)
 
 
@@ -745,18 +760,25 @@ def current_model_label(chat_id: int) -> str:
 
 
 async def send_help(chat_id: int) -> None:
+    admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
     text = (
         f"{WELCOME_TEXT}\n\n"
         f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
         f"{usage_text(user_profile(chat_id))}\n\n"
         f"{HELP_TEXT}"
+        f"{admin_part}"
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
 
 async def send_models(chat_id: int) -> None:
     row = user_profile(chat_id)
-    await max_send_message(chat_id, build_models_text(row["plan"]), attachments=build_keyboard())
+    await max_send_message(chat_id, build_models_text(row["plan"], include_prices=False), attachments=build_keyboard())
+
+
+async def send_costs(chat_id: int) -> None:
+    row = user_profile(chat_id)
+    await max_send_message(chat_id, build_models_text(row["plan"], include_prices=True), attachments=build_keyboard())
 
 
 async def send_plan(chat_id: int) -> None:
@@ -897,6 +919,13 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/models":
         await send_models(chat_id)
+        return True
+
+    if command == "/costs":
+        if not is_admin(chat_id):
+            await max_send_message(chat_id, "Команда доступна только администратору.")
+            return True
+        await send_costs(chat_id)
         return True
 
     if command == "/tariffs":
