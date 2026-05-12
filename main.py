@@ -79,6 +79,11 @@ WELCOME_TEXT = (
     "Выбери действие кнопками или просто напиши вопрос."
 )
 
+MENU_TEXT = (
+    "Кнопки ниже — основной способ пользоваться ботом.\n"
+    "Если нужен список команд, отправь /help."
+)
+
 HELP_TEXT = (
     "Команды:\n"
     "/start или /menu — меню\n"
@@ -762,11 +767,21 @@ def current_model_label(chat_id: int) -> str:
 async def send_help(chat_id: int) -> None:
     admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
     text = (
+        f"Справка\n\n"
+        f"{HELP_TEXT}"
+        f"{admin_part}"
+    )
+    await max_send_message(chat_id, text, attachments=build_keyboard())
+
+
+async def send_menu(chat_id: int) -> None:
+    admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
+    text = (
         f"{WELCOME_TEXT}\n\n"
         f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
         f"{usage_text(user_profile(chat_id))}\n\n"
-        f"{HELP_TEXT}"
-        f"{admin_part}"
+        f"{MENU_TEXT}"
+        f"{admin_part if is_admin(chat_id) else ''}"
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
@@ -894,7 +909,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "action:menu":
         if callback_id:
             await answer_callback(callback_id, "Открываю меню")
-        await send_help(chat_id)
+        await send_menu(chat_id)
         return True
 
     return False
@@ -913,7 +928,11 @@ async def handle_command(chat_id: int, text: str) -> bool:
         command = "/model"
         arg = command[1:]
 
-    if command in {"/start", "/menu", "/help"}:
+    if command in {"/start", "/menu"}:
+        await send_menu(chat_id)
+        return True
+
+    if command == "/help":
         await send_help(chat_id)
         return True
 
@@ -1000,7 +1019,7 @@ async def process_update(update: dict[str, Any]) -> None:
         return
 
     if update_type in {"bot_started", "user_added", "bot_added"} and not text:
-        await send_help(chat_id)
+        await send_menu(chat_id)
         return
     if not text:
         return
