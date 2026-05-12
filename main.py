@@ -584,9 +584,8 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
             "payload": {
                 "buttons": [
                     [
-                        {"type": "callback", "text": "Купить 1", "payload": "buy:1"},
-                        {"type": "callback", "text": "Купить 2", "payload": "buy:2"},
-                        {"type": "callback", "text": "Купить 3", "payload": "buy:3"},
+                        {"type": "callback", "text": "Купить Start", "payload": "buy:start"},
+                        {"type": "callback", "text": "Купить Pro", "payload": "buy:pro"},
                     ],
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
@@ -1185,15 +1184,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload.startswith("buy:"):
-        raw_plan = payload.split(":", 1)[1].lower()
-        plan = {
-            "1": "free",
-            "2": "start",
-            "3": "pro",
-            "free": "free",
-            "start": "start",
-            "pro": "pro",
-        }.get(raw_plan, raw_plan)
+        plan = payload.split(":", 1)[1].lower()
         if plan == "free":
             user_profile(chat_id)
             state.user_store.set_plan(chat_id, "free")
@@ -1256,8 +1247,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not arg:
             await max_send_message(chat_id, BUY_TEXT, attachments=build_tariffs_keyboard_v2())
             return True
-        raw_plan = arg.lower().strip()
-        plan = {"1": "free", "2": "start", "3": "pro"}.get(raw_plan, raw_plan)
+        plan = arg.lower().strip()
         if plan == "free":
             user_profile(chat_id)
             state.user_store.set_plan(chat_id, "free")
@@ -1265,7 +1255,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_v2())
             return True
         if plan not in {"start", "pro"}:
-            await max_send_message(chat_id, "Доступно: /buy 1|2|3 или /buy start|pro", attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, "Доступно: /buy start или /buy pro", attachments=build_tariffs_keyboard_v2())
             return True
         msg = await create_buy_request(chat_id, plan)
         await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_v2())
