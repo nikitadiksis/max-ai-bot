@@ -1065,10 +1065,11 @@ async def create_buy_request_v2(chat_id: int, plan: str) -> tuple[int | None, st
         return None, "Доступно: start или pro."
     amount, days = plan_price_and_days(plan)
     request_id = state.user_store.create_payment_request(chat_id, plan, days, amount)
+    payment_purpose = f"Оплата подписки, заказ #{request_id}"
     text = (
         f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
         "Куда оплачивать:\n"
-        f"{PAYMENT_DETAILS_TEXT}\n\n"
+        f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
     )
     return request_id, text
