@@ -48,6 +48,14 @@ MAX_MESSAGE_LEN=3900
 DEDUP_CACHE_SIZE=300
 DB_PATH=data/bot.sqlite3
 ADMIN_IDS=123456789
+MAX_TEXT_INPUT_CHARS=2500
+MAX_IMAGE_PROMPT_CHARS=800
+MESSAGE_COOLDOWN_SECONDS=1
+IMAGE_COOLDOWN_SECONDS=20
+START_PLAN_PRICE_RUB=499
+PRO_PLAN_PRICE_RUB=1490
+START_PLAN_DAYS=30
+PRO_PLAN_DAYS=30
 
 WEBHOOK_SECRET=strong_random_secret
 ```
@@ -58,6 +66,8 @@ WEBHOOK_SECRET=strong_random_secret
 - `/models`
 - `/plan`
 - `/tariffs`
+- `/buy <start|pro>`
+- `/payments`
 - `/model <alias>`
 - `/gpt`, `/gemini`, `/deepseek`, `/gpt54`
 - `/image <prompt>`
@@ -67,7 +77,10 @@ Admin (`ADMIN_IDS` only):
 - `/admin help`
 - `/admin user <chat_id>`
 - `/admin plan <chat_id> <free|start|pro>`
+- `/admin sub <chat_id> <start|pro> <days>`
 - `/admin block <chat_id> <on|off>`
+- `/admin pay <request_id> <paid|cancel>`
+- `/costs`
 
 ## Deploy (Docker)
 

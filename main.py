@@ -5,7 +5,7 @@ import base64
 from contextlib import asynccontextmanager, suppress
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import hashlib
 from io import BytesIO
 import json
@@ -49,6 +49,14 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MAX_MESSAGE_LEN = int(os.getenv("MAX_MESSAGE_LEN", str(DEFAULT_MAX_MESSAGE_LEN)))
 DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "300"))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.sqlite3")))
+MAX_TEXT_INPUT_CHARS = int(os.getenv("MAX_TEXT_INPUT_CHARS", "2500"))
+MAX_IMAGE_PROMPT_CHARS = int(os.getenv("MAX_IMAGE_PROMPT_CHARS", "800"))
+MESSAGE_COOLDOWN_SECONDS = int(os.getenv("MESSAGE_COOLDOWN_SECONDS", "1"))
+IMAGE_COOLDOWN_SECONDS = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "20"))
+START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "499"))
+PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "1490"))
+START_PLAN_DAYS = int(os.getenv("START_PLAN_DAYS", "30"))
+PRO_PLAN_DAYS = int(os.getenv("PRO_PLAN_DAYS", "30"))
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -93,6 +101,8 @@ HELP_TEXT = (
     "/gpt, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
+    "/buy <start|pro> — заявка на подписку\n"
+    "/payments — мои заявки\n"
     "/clear — очистить контекст"
 )
 
@@ -101,7 +111,9 @@ ADMIN_HELP_TEXT = (
     "/admin help\n"
     "/admin user <chat_id>\n"
     "/admin plan <chat_id> <free|start|pro>\n"
+    "/admin sub <chat_id> <start|pro> <days>\n"
     "/admin block <chat_id> <on|off>\n"
+    "/admin pay <request_id> <paid|cancel>\n"
     "/costs — модели и цены"
 )
 
@@ -114,6 +126,14 @@ TARIFFS_TEXT = (
     "• free: DeepSeek V4 Flash, GPT-4.1 Mini\n"
     "• start: + Gemini 2.5 Flash\n"
     "• pro: + GPT-5.4"
+)
+
+BUY_TEXT = (
+    "Покупка (пока в ручном режиме):\n"
+    "/buy start — заявка на Start\n"
+    "/buy pro — заявка на Pro\n"
+    "/payments — мои заявки\n\n"
+    "После заявки админ подтверждает оплату и активирует подписку."
 )
 
 
@@ -192,6 +212,7 @@ class UserStore:
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
                     selected_model_alias TEXT NOT NULL DEFAULT '',
+                    subscription_expires_at TEXT NOT NULL DEFAULT '',
                     usage_date TEXT NOT NULL DEFAULT '',
                     daily_messages_used INTEGER NOT NULL DEFAULT 0,
                     daily_images_used INTEGER NOT NULL DEFAULT 0,
@@ -200,7 +221,31 @@ class UserStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    plan TEXT NOT NULL,
+                    days INTEGER NOT NULL,
+                    amount_rub INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    provider TEXT NOT NULL DEFAULT 'manual',
+                    provider_ref TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    paid_at TEXT NOT NULL DEFAULT '',
+                    activated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {row["name"] for row in info}
+        if column not in names:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
 
     def _today(self) -> str:
         return date.today().isoformat()
@@ -247,10 +292,86 @@ class UserStore:
             conn.commit()
 
     def set_plan(self, chat_id: int, plan: str) -> None:
+        expires = "" if plan == "free" else None
+        with self._connect() as conn:
+            if expires is None:
+                conn.execute(
+                    "UPDATE users SET plan = ?, updated_at = ? WHERE chat_id = ?",
+                    (plan, datetime.utcnow().isoformat(), chat_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET plan = ?, subscription_expires_at = ?, updated_at = ? WHERE chat_id = ?",
+                    (plan, expires, datetime.utcnow().isoformat(), chat_id),
+                )
+            conn.commit()
+
+    def set_subscription(self, chat_id: int, plan: str, days: int, selected_model_alias: str) -> str:
+        expires_at = (datetime.utcnow() + timedelta(days=days)).replace(microsecond=0).isoformat()
         with self._connect() as conn:
             conn.execute(
-                "UPDATE users SET plan = ?, updated_at = ? WHERE chat_id = ?",
-                (plan, datetime.utcnow().isoformat(), chat_id),
+                """
+                UPDATE users
+                SET plan = ?, subscription_expires_at = ?, selected_model_alias = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (plan, expires_at, selected_model_alias, datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+        return expires_at
+
+    def create_payment_request(self, chat_id: int, plan: str, days: int, amount_rub: int) -> int:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO payment_requests (chat_id, plan, days, amount_rub, status, created_at)
+                VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                (chat_id, plan, days, amount_rub, now),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_user_payments(self, chat_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, plan, days, amount_rub, status, created_at
+                FROM payment_requests
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_payment(self, request_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+            return dict(row) if row else None
+
+    def set_payment_status(self, request_id: int, status: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            if status == "paid":
+                conn.execute(
+                    "UPDATE payment_requests SET status = ?, paid_at = ? WHERE id = ?",
+                    (status, now, request_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE payment_requests SET status = ? WHERE id = ?",
+                    (status, request_id),
+                )
+            conn.commit()
+
+    def mark_payment_activated(self, request_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET activated_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), request_id),
             )
             conn.commit()
 
@@ -284,6 +405,8 @@ class BotState:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
         self.processed_updates: deque[str] = deque(maxlen=DEDUP_CACHE_SIZE)
         self.processed_lookup: set[str] = set()
+        self.last_message_at: dict[int, datetime] = {}
+        self.last_image_at: dict[int, datetime] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.user_store = UserStore(DB_PATH)
@@ -555,6 +678,23 @@ def parse_admin_target(value: str) -> int | None:
     return None
 
 
+def parse_iso_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def plan_price_and_days(plan: str) -> tuple[int, int]:
+    if plan == "start":
+        return START_PLAN_PRICE_RUB, START_PLAN_DAYS
+    if plan == "pro":
+        return PRO_PLAN_PRICE_RUB, PRO_PLAN_DAYS
+    return 0, 0
+
+
 async def get_session() -> aiohttp.ClientSession:
     if state.session is None or state.session.closed:
         timeout = aiohttp.ClientTimeout(total=180)
@@ -565,6 +705,13 @@ async def get_session() -> aiohttp.ClientSession:
 def user_profile(chat_id: int) -> dict[str, Any]:
     row = state.user_store.get_or_create_user(chat_id, best_default_alias_for_plan("free"))
     plan = row["plan"]
+    expires_at = parse_iso_datetime(row.get("subscription_expires_at", ""))
+    if plan != "free" and (expires_at is None or expires_at <= datetime.utcnow()):
+        state.user_store.set_plan(chat_id, "free")
+        state.user_store.set_selected_model(chat_id, best_default_alias_for_plan("free"))
+        row = state.user_store.get_or_create_user(chat_id, best_default_alias_for_plan("free"))
+        plan = row["plan"]
+
     selected = row["selected_model_alias"] or best_default_alias_for_plan(plan)
     info = TEXT_MODELS.get(selected)
     if info is None or not plan_allowed(plan, info.min_plan):
@@ -579,8 +726,14 @@ def usage_text(row: dict[str, Any]) -> str:
     cfg = PLAN_CONFIGS[plan_name]
     msg_left = max(0, cfg.daily_messages_limit - row["daily_messages_used"])
     img_left = max(0, cfg.daily_images_limit - row["daily_images_used"])
+    expires_raw = row.get("subscription_expires_at", "")
+    expires_at = parse_iso_datetime(expires_raw)
+    expires_text = "-"
+    if plan_name != "free":
+        expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "не задан"
     return (
         f"План: {plan_name}\n"
+        f"Подписка до: {expires_text}\n"
         f"Сегодня сообщений: {row['daily_messages_used']}/{cfg.daily_messages_limit} (осталось {msg_left})\n"
         f"Сегодня картинок: {row['daily_images_used']}/{cfg.daily_images_limit} (осталось {img_left})"
     )
@@ -611,6 +764,22 @@ def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
     if row["daily_images_used"] >= cfg.daily_images_limit:
         return False, "Лимит генераций картинок на сегодня исчерпан. Проверь /tariffs."
     state.user_store.increment_image_usage(chat_id)
+    return True, ""
+
+
+def check_cooldown(chat_id: int, kind: str) -> tuple[bool, str]:
+    now = datetime.utcnow()
+    if kind == "message":
+        last = state.last_message_at.get(chat_id)
+        if last and (now - last).total_seconds() < MESSAGE_COOLDOWN_SECONDS:
+            return False, f"Слишком часто. Подожди {MESSAGE_COOLDOWN_SECONDS} сек."
+        state.last_message_at[chat_id] = now
+        return True, ""
+
+    last = state.last_image_at.get(chat_id)
+    if last and (now - last).total_seconds() < IMAGE_COOLDOWN_SECONDS:
+        return False, f"Картинки можно запрашивать раз в {IMAGE_COOLDOWN_SECONDS} сек."
+    state.last_image_at[chat_id] = now
     return True, ""
 
 
@@ -799,6 +968,19 @@ async def send_plan(chat_id: int) -> None:
     await max_send_message(chat_id, usage_text(row), attachments=build_keyboard())
 
 
+async def send_payments(chat_id: int) -> None:
+    rows = state.user_store.list_user_payments(chat_id, limit=8)
+    if not rows:
+        await max_send_message(chat_id, "Заявок пока нет. Используй /buy start или /buy pro.", attachments=build_keyboard())
+        return
+    lines = ["Твои последние заявки:"]
+    for item in rows:
+        lines.append(
+            f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {item['status']} | {item['created_at'][:19]}"
+        )
+    await max_send_message(chat_id, "\n".join(lines), attachments=build_keyboard())
+
+
 async def set_user_model(chat_id: int, alias: str) -> str:
     row = user_profile(chat_id)
     ok, reason = can_use_model(row["plan"], alias)
@@ -819,7 +1001,9 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             "Админ-команды:\n"
             "/admin user <chat_id>\n"
             "/admin plan <chat_id> <free|start|pro>\n"
-            "/admin block <chat_id> <on|off>",
+            "/admin sub <chat_id> <start|pro> <days>\n"
+            "/admin block <chat_id> <on|off>\n"
+            "/admin pay <request_id> <paid|cancel>",
         )
         return True
 
@@ -846,6 +1030,23 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         await max_send_message(chat_id, f"План пользователя {target} -> {new_plan}. Модель -> {selected}.")
         return True
 
+    if action == "sub" and len(parts) >= 5:
+        target = parse_admin_target(parts[2])
+        plan = parts[3].lower()
+        days_raw = parts[4]
+        if target is None or plan not in {"start", "pro"} or not days_raw.isdigit():
+            await max_send_message(chat_id, "Используй: /admin sub <chat_id> <start|pro> <days>")
+            return True
+        days = int(days_raw)
+        if days <= 0 or days > 365:
+            await max_send_message(chat_id, "Дни должны быть в диапазоне 1..365")
+            return True
+        user_profile(target)
+        selected = best_default_alias_for_plan(plan)
+        expires_at = state.user_store.set_subscription(target, plan, days, selected)
+        await max_send_message(chat_id, f"Подписка активирована: user={target} plan={plan} days={days} until={expires_at}")
+        return True
+
     if action == "block" and len(parts) >= 4:
         target = parse_admin_target(parts[2])
         flag = parts[3].lower()
@@ -855,6 +1056,42 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         user_profile(target)
         state.user_store.set_blocked(target, flag == "on")
         await max_send_message(chat_id, f"Пользователь {target}: block={flag}")
+        return True
+
+    if action == "pay" and len(parts) >= 4:
+        req_raw = parts[2]
+        decision = parts[3].lower()
+        if not req_raw.isdigit() or decision not in {"paid", "cancel"}:
+            await max_send_message(chat_id, "Используй: /admin pay <request_id> <paid|cancel>")
+            return True
+        req_id = int(req_raw)
+        payment = state.user_store.get_payment(req_id)
+        if not payment:
+            await max_send_message(chat_id, f"Заявка #{req_id} не найдена")
+            return True
+        if payment["status"] not in {"pending", "paid"}:
+            await max_send_message(chat_id, f"Заявка #{req_id} уже обработана: {payment['status']}")
+            return True
+        if decision == "cancel":
+            state.user_store.set_payment_status(req_id, "canceled")
+            await max_send_message(chat_id, f"Заявка #{req_id} отменена")
+            return True
+
+        target = int(payment["chat_id"])
+        plan = str(payment["plan"])
+        days = int(payment["days"])
+        selected = best_default_alias_for_plan(plan)
+        user_profile(target)
+        state.user_store.set_payment_status(req_id, "paid")
+        expires_at = state.user_store.set_subscription(target, plan, days, selected)
+        state.user_store.mark_payment_activated(req_id)
+        await max_send_message(chat_id, f"Оплата #{req_id} подтверждена. user={target} plan={plan} until={expires_at}")
+        with suppress(Exception):
+            await max_send_message(
+                target,
+                f"Оплата подтверждена. Тариф {plan} активирован до {expires_at[:16]} UTC.",
+                attachments=build_keyboard(),
+            )
         return True
 
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
@@ -953,6 +1190,28 @@ async def handle_command(chat_id: int, text: str) -> bool:
         await send_plan(chat_id)
         return True
 
+    if command == "/buy":
+        if not arg:
+            await max_send_message(chat_id, BUY_TEXT, attachments=build_keyboard())
+            return True
+        plan = arg.lower()
+        if plan not in {"start", "pro"}:
+            await max_send_message(chat_id, "Доступно: /buy start или /buy pro", attachments=build_keyboard())
+            return True
+        amount, days = plan_price_and_days(plan)
+        request_id = state.user_store.create_payment_request(chat_id, plan, days, amount)
+        await max_send_message(
+            chat_id,
+            f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n"
+            "Сейчас подтверждение оплаты делает админ вручную.",
+            attachments=build_keyboard(),
+        )
+        return True
+
+    if command == "/payments":
+        await send_payments(chat_id)
+        return True
+
     if command == "/model":
         if not arg:
             await max_send_message(chat_id, "Укажи модель: /model deepseek|gpt|gemini|gpt54", attachments=build_keyboard())
@@ -969,6 +1228,17 @@ async def handle_command(chat_id: int, text: str) -> bool:
     if command == "/image":
         if not arg:
             await max_send_message(chat_id, "Пример: /image неоновый город под дождем", attachments=build_keyboard())
+            return True
+        if len(arg) > MAX_IMAGE_PROMPT_CHARS:
+            await max_send_message(
+                chat_id,
+                f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.",
+                attachments=build_keyboard(),
+            )
+            return True
+        ok_cd, reason_cd = check_cooldown(chat_id, "image")
+        if not ok_cd:
+            await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
             return True
 
         row = user_profile(chat_id)
@@ -1025,6 +1295,19 @@ async def process_update(update: dict[str, Any]) -> None:
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
     try:
         if await handle_command(chat_id, text):
+            return
+
+        if len(text) > MAX_TEXT_INPUT_CHARS:
+            await max_send_message(
+                chat_id,
+                f"Слишком длинное сообщение. Максимум {MAX_TEXT_INPUT_CHARS} символов.",
+                attachments=build_keyboard(),
+            )
+            return
+
+        ok_cd, reason_cd = check_cooldown(chat_id, "message")
+        if not ok_cd:
+            await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
             return
 
         ok, reason = check_and_consume_limit(chat_id, "messages")
