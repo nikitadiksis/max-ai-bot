@@ -19,7 +19,9 @@ from typing import Any
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse
 import uvicorn
 
 load_dotenv()
@@ -29,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "models.json"
 LOGS_DIR = BASE_DIR / "logs"
 DATA_DIR = BASE_DIR / "data"
+SITE_DIR = BASE_DIR / "site"
 LOGS_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -558,6 +561,13 @@ def tbank_notification_is_valid(payload: dict[str, Any]) -> bool:
         return False
     expected = tbank_token_from_payload(payload, TBANK_PASSWORD).lower()
     return received == expected
+
+
+def site_file(name: str) -> Path:
+    path = SITE_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="page not found")
+    return path
 
 
 def plan_allowed(plan: str, min_plan: str) -> bool:
@@ -1764,11 +1774,37 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MAX Multi AI Bot", lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory=str(SITE_DIR / "assets")), name="assets")
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "run_mode": RUN_MODE}
+
+
+@app.get("/", response_class=FileResponse)
+async def landing_index() -> FileResponse:
+    return FileResponse(site_file("index.html"))
+
+
+@app.get("/offer", response_class=FileResponse)
+async def landing_offer() -> FileResponse:
+    return FileResponse(site_file("offer.html"))
+
+
+@app.get("/privacy", response_class=FileResponse)
+async def landing_privacy() -> FileResponse:
+    return FileResponse(site_file("privacy.html"))
+
+
+@app.get("/refund", response_class=FileResponse)
+async def landing_refund() -> FileResponse:
+    return FileResponse(site_file("refund.html"))
+
+
+@app.get("/contacts", response_class=FileResponse)
+async def landing_contacts() -> FileResponse:
+    return FileResponse(site_file("contacts.html"))
 
 
 @app.post("/webhook/max")

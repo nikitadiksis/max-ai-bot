@@ -6,6 +6,7 @@ Production-ready bot for MAX messenger with OpenRouter models, image generation,
 
 - Text models via OpenRouter (`DeepSeek`, `GPT`, `Gemini`, `GPT-5.4`)
 - Image generation
+- Public landing pages (`/`, `/offer`, `/privacy`, `/refund`, `/contacts`)
 - Per-user plans (`free`, `start`, `pro`)
 - Daily limits for text and images
 - Model access by plan
@@ -58,6 +59,14 @@ START_PLAN_DAYS=30
 PRO_PLAN_DAYS=30
 
 WEBHOOK_SECRET=strong_random_secret
+PAYMENT_DETAILS_TEXT=Оплата на ИП ...\\nБанк: ...\\nР/с: ...
+PUBLIC_BASE_URL=https://your-domain
+TBANK_TERMINAL_KEY=
+TBANK_PASSWORD=
+TBANK_INIT_URL=https://securepay.tinkoff.ru/v2/Init
+TBANK_NOTIFICATION_URL=
+TBANK_SUCCESS_URL=
+TBANK_FAIL_URL=
 ```
 
 ## Commands
@@ -114,4 +123,12 @@ Check subscriptions:
 ```bash
 curl -X GET "https://platform-api.max.ru/subscriptions" \
   -H "Authorization: YOUR_MAX_TOKEN"
+```
+
+## T-Bank Webhook
+
+Use webhook URL:
+
+```text
+https://your-domain/webhook/tbank
 ```
