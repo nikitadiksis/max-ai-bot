@@ -1,0 +1,59 @@
+{
+  "text_models": {
+    "deepseek": {
+      "provider": "DeepSeek",
+      "model": "deepseek/deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash",
+      "version": "2026-04-24",
+      "input_price_usd_per_m": "0.14",
+      "output_price_usd_per_m": "0.28",
+      "min_plan": "free",
+      "description": "Самый выгодный по цене, быстрый и стабильный."
+    },
+    "gpt": {
+      "provider": "OpenAI",
+      "model": "openai/gpt-4.1-mini",
+      "label": "GPT-4.1 Mini",
+      "version": "2025-04-14",
+      "input_price_usd_per_m": "0.40",
+      "output_price_usd_per_m": "1.60",
+      "min_plan": "free",
+      "description": "Сильный универсал для обычных задач и кода.",
+      "prompt_style": "Отвечай структурированно, уверенно и практично."
+    },
+    "gemini": {
+      "provider": "Google",
+      "model": "google/gemini-2.5-flash",
+      "label": "Gemini 2.5 Flash",
+      "version": "2025-06-17",
+      "input_price_usd_per_m": "0.30",
+      "output_price_usd_per_m": "2.50",
+      "min_plan": "start",
+      "description": "Быстрый workhorse, хорошо подходит для длинных задач.",
+      "prompt_style": "Отвечай дружелюбно, по делу и без лишней воды."
+    },
+    "gpt54": {
+      "provider": "OpenAI",
+      "model": "openai/gpt-5.4",
+      "label": "GPT-5.4",
+      "version": "2026-03-05",
+      "input_price_usd_per_m": "2.50",
+      "output_price_usd_per_m": "15.00",
+      "min_plan": "pro",
+      "description": "Премиум-модель для сложных профессиональных задач.",
+      "prompt_style": "Давай максимально точные и обоснованные ответы."
+    }
+  },
+  "image_models": {
+    "image": {
+      "provider": "Google",
+      "model": "google/gemini-2.5-flash-image",
+      "label": "Gemini 2.5 Flash Image",
+      "version": "2025-10-07",
+      "input_price_usd_per_m": "0.30",
+      "output_price_usd_per_m": "2.50",
+      "min_plan": "start",
+      "description": "Генерация и редактирование картинок (Nano Banana)."
+    }
+  }
+}
