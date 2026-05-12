@@ -18,7 +18,7 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 import uvicorn
 
 load_dotenv()
@@ -407,7 +407,7 @@ class UserStore:
 class BotState:
     def __init__(self) -> None:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
-        self.processed_updates: deque[str] = deque(maxlen=DEDUP_CACHE_SIZE)
+        self.processed_updates: deque[str] = deque()
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
         self.last_image_at: dict[int, datetime] = {}
@@ -493,7 +493,12 @@ def openrouter_headers() -> dict[str, str]:
 
 
 def plan_allowed(plan: str, min_plan: str) -> bool:
-    return PLAN_ORDER.get(plan, 0) >= PLAN_ORDER.get(min_plan, 0)
+    if min_plan not in PLAN_ORDER:
+        log.warning("Unknown min_plan=%r in model config; denying access", min_plan)
+        return False
+    if plan not in PLAN_ORDER:
+        return False
+    return PLAN_ORDER[plan] >= PLAN_ORDER[min_plan]
 
 
 def is_admin(chat_id: int) -> bool:
@@ -1163,7 +1168,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         if not payment:
             await max_send_message(chat_id, f"Заявка #{req_id} не найдена")
             return True
-        if payment["status"] not in {"pending", "claimed", "paid"}:
+        if payment["status"] not in {"pending", "claimed"}:
             await max_send_message(chat_id, f"Заявка #{req_id} уже обработана: {payment['status']}")
             return True
         if decision == "cancel":
@@ -1279,6 +1284,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             if callback_id:
                 await answer_callback(callback_id, "Уже подтверждено")
             await max_send_message(chat_id, "Эта заявка уже подтверждена.", attachments=build_keyboard(), notify=False)
+            return True
+        if status == "claimed":
+            if callback_id:
+                await answer_callback(callback_id, "already sent")
+            await max_send_message(chat_id, "Заявка уже отправлена админу на проверку.", attachments=build_tariffs_keyboard_v2(), notify=False)
             return True
         if status == "canceled":
             if callback_id:
@@ -1554,7 +1564,7 @@ async def max_webhook(request: Request) -> dict[str, bool]:
         header_secret = request.headers.get("X-Max-Bot-Api-Secret", "")
         if header_secret != WEBHOOK_SECRET:
             log.warning("Webhook secret mismatch")
-            return {"ok": False}
+            raise HTTPException(status_code=403, detail="forbidden")
 
     payload = await request.json()
     updates = payload if isinstance(payload, list) else [payload]
