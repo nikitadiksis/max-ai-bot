@@ -1408,7 +1408,8 @@ async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> boo
         f"Тариф: {plan}\n"
         f"Сумма списания: {amount} ₽\n"
         f"Периодичность: каждые {days} дней\n\n"
-        "Нажми кнопку согласия ниже, чтобы перейти к оплате.\n"
+        "Нажимая кнопку согласия ниже, ты подтверждаешь регулярные списания по этим условиям.\n"
+        "После согласия откроется оплата.\n"
         "Отменить автопродление можно в «Мой план»."
     )
     await max_send_message(chat_id, text, attachments=build_consent_keyboard(plan), notify=notify)
@@ -1446,9 +1447,6 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
 
 def image_capability_line() -> str:
     label = DEFAULT_IMAGE_MODEL.label
-    description = (DEFAULT_IMAGE_MODEL.description or "").lower()
-    if "nano banana" in description:
-        return f"• генерация картинок через Nano Banana ({label})"
     return f"• генерация картинок через {label}"
 
 
