@@ -82,6 +82,12 @@ PRO_PLAN_PRICE_RUB=2990
 LITE_PLAN_DAYS=30
 START_PLAN_DAYS=30
 PRO_PLAN_DAYS=30
+TOPUP_SMALL_PRICE_RUB=199
+TOPUP_SMALL_CREDITS=1500
+TOPUP_MEDIUM_PRICE_RUB=499
+TOPUP_MEDIUM_CREDITS=4500
+TOPUP_LARGE_PRICE_RUB=990
+TOPUP_LARGE_CREDITS=10000
 
 WEBHOOK_SECRET=strong_random_secret
 PAYMENT_DETAILS_TEXT=Оплата на ИП ...\\nБанк: ...\\nР/с: ...
@@ -102,6 +108,7 @@ SUPPORT_TEXT=Поддержка: напиши нам, поможем быстр�
 - `/models`
 - `/plan`
 - `/tariffs`
+- `/topup`
 - `/buy <lite|start|pro>`
 - `/credits`
 - `/payments`

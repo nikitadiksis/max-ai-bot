@@ -88,6 +88,12 @@ CREDIT_COST_GPT = int(os.getenv("CREDIT_COST_GPT", "3"))
 CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
+TOPUP_SMALL_PRICE_RUB = int(os.getenv("TOPUP_SMALL_PRICE_RUB", "199"))
+TOPUP_SMALL_CREDITS = int(os.getenv("TOPUP_SMALL_CREDITS", "1500"))
+TOPUP_MEDIUM_PRICE_RUB = int(os.getenv("TOPUP_MEDIUM_PRICE_RUB", "499"))
+TOPUP_MEDIUM_CREDITS = int(os.getenv("TOPUP_MEDIUM_CREDITS", "4500"))
+TOPUP_LARGE_PRICE_RUB = int(os.getenv("TOPUP_LARGE_PRICE_RUB", "990"))
+TOPUP_LARGE_CREDITS = int(os.getenv("TOPUP_LARGE_CREDITS", "10000"))
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -160,6 +166,7 @@ HELP_TEXT = (
     "/gpt, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
+    "/topup — пакеты кредитов\n"
     "/buy <lite|start|pro> — заявка на подписку\n"
     "/payments — мои заявки\n"
     "/credits — остаток кредитов\n"
@@ -246,6 +253,24 @@ MODEL_CREDIT_COSTS = {
     "gpt": CREDIT_COST_GPT,
     "gemini": CREDIT_COST_GEMINI,
     "gpt54": CREDIT_COST_GPT54,
+}
+
+TOPUP_PACKS = {
+    "small": {
+        "label": "Small",
+        "price_rub": TOPUP_SMALL_PRICE_RUB,
+        "credits": TOPUP_SMALL_CREDITS,
+    },
+    "medium": {
+        "label": "Medium",
+        "price_rub": TOPUP_MEDIUM_PRICE_RUB,
+        "credits": TOPUP_MEDIUM_CREDITS,
+    },
+    "large": {
+        "label": "Large",
+        "price_rub": TOPUP_LARGE_PRICE_RUB,
+        "credits": TOPUP_LARGE_CREDITS,
+    },
 }
 
 
@@ -1004,6 +1029,24 @@ def credits_for_plan(plan: str) -> int:
     return int(PLAN_CREDITS.get(plan, 0))
 
 
+def topup_plan_code(code: str) -> str:
+    return f"topup_{code}"
+
+
+def topup_code_from_plan(plan: str) -> str:
+    if not plan.startswith("topup_"):
+        return ""
+    return plan.split("_", 1)[1]
+
+
+def is_topup_plan(plan: str) -> bool:
+    return topup_code_from_plan(plan) in TOPUP_PACKS
+
+
+def topup_spec(code: str) -> dict[str, Any] | None:
+    return TOPUP_PACKS.get(code)
+
+
 def text_credit_cost(alias: str) -> int:
     return int(MODEL_CREDIT_COSTS.get(alias, CREDIT_COST_GPT))
 
@@ -1058,6 +1101,9 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
                 "buttons": [
                     buy_row_1,
                     buy_row_2,
+                    [
+                        {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
+                    ],
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
@@ -1126,7 +1172,50 @@ def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
                     buy_row_1,
                     buy_row_2,
                     [
+                        {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
+                    ],
+                    [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_topups_keyboard() -> list[dict[str, Any]]:
+    small = TOPUP_PACKS["small"]
+    medium = TOPUP_PACKS["medium"]
+    large = TOPUP_PACKS["large"]
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"🪙 Small — {small['credits']} кр за {small['price_rub']}₽",
+                            "payload": "topup:small",
+                        },
+                    ],
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"💎 Medium — {medium['credits']} кр за {medium['price_rub']}₽",
+                            "payload": "topup:medium",
+                        },
+                    ],
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"🚀 Large — {large['credits']} кр за {large['price_rub']}₽",
+                            "payload": "topup:large",
+                        },
+                    ],
+                    [
+                        {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -1745,6 +1834,26 @@ async def send_credits(chat_id: int) -> None:
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
 
+async def send_topups(chat_id: int) -> None:
+    small = TOPUP_PACKS["small"]
+    medium = TOPUP_PACKS["medium"]
+    large = TOPUP_PACKS["large"]
+
+    def approx_images(credits: int) -> int:
+        if CREDIT_COST_IMAGE <= 0:
+            return 0
+        return credits // CREDIT_COST_IMAGE
+
+    text = (
+        "⭐ Пакеты кредитов\n\n"
+        f"• Small: {small['credits']} кредитов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
+        f"• Medium: {medium['credits']} кредитов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
+        f"• Large: {large['credits']} кредитов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
+        "Кредиты списываются за запросы к моделям и генерацию картинок."
+    )
+    await max_send_message(chat_id, text, attachments=build_topups_keyboard())
+
+
 async def send_payments(chat_id: int) -> None:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
@@ -1829,9 +1938,15 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
     plan = str(payment["plan"])
     amount = int(payment["amount_rub"])
     days = int(payment["days"])
+    item = plan
+    if is_topup_plan(plan):
+        code = topup_code_from_plan(plan)
+        pack = topup_spec(code)
+        if pack:
+            item = f"topup:{code} ({pack['credits']} credits)"
     text = (
         f"Пользователь подтвердил оплату по заявке #{request_id}.\n"
-        f"user={target}, plan={plan}, amount={amount} RUB, days={days}\n"
+        f"user={target}, item={item}, amount={amount} RUB, days={days}\n"
         f"Проверка: /admin pay {request_id} paid\n"
         f"Отмена: /admin pay {request_id} cancel"
     )
@@ -1966,9 +2081,28 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
     target = int(payment["chat_id"])
     plan = str(payment["plan"])
     days = int(payment["days"])
-    selected = best_default_alias_for_plan(plan)
     user_profile(target)
     state.user_store.set_payment_status(request_id, "paid")
+
+    if is_topup_plan(plan):
+        code = topup_code_from_plan(plan)
+        pack = topup_spec(code)
+        if not pack:
+            return False, f"unknown topup code in payment #{request_id}"
+        credits = int(pack["credits"])
+        row = user_profile(target)
+        current = int(row.get("credits_balance", 0) or 0)
+        state.user_store.set_credits(target, current + credits)
+        state.user_store.mark_payment_activated(request_id)
+        with suppress(Exception):
+            await max_send_message(
+                target,
+                f"Оплата подтверждена ({source}). Зачислено {credits} кредитов.",
+                attachments=build_keyboard(),
+            )
+        return True, f"credits+{credits}"
+
+    selected = best_default_alias_for_plan(plan)
     recurring_for_user = source.lower().startswith("t-bank")
     expires_at = state.user_store.set_subscription(
         target,
@@ -1994,9 +2128,30 @@ async def process_refund_payment_request(request_id: int, source: str, bank_stat
         return False, f"payment #{request_id} not found"
 
     target = int(payment["chat_id"])
+    plan = str(payment.get("plan", ""))
     current_status = str(payment.get("status", "")).lower()
     if current_status != "refunded":
         state.user_store.set_payment_status(request_id, "refunded")
+
+    if is_topup_plan(plan):
+        code = topup_code_from_plan(plan)
+        pack = topup_spec(code)
+        if not pack:
+            return False, "unknown topup for refund"
+        credits = int(pack["credits"])
+        row = user_profile(target)
+        current = int(row.get("credits_balance", 0) or 0)
+        state.user_store.set_credits(target, max(0, current - credits))
+        with suppress(Exception):
+            await max_send_message(
+                target,
+                (
+                    f"Возврат подтвержден ({source}, статус {bank_status}).\n"
+                    f"Пакет кредитов отменен, списано {credits} кредитов."
+                ),
+                attachments=build_keyboard(),
+            )
+        return True, f"topup credits-{credits}"
 
     row = user_profile(target)
     changed = False
@@ -2066,6 +2221,65 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
             return request_id, text
     text = (
         f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
+        "Куда оплачивать:\n"
+        f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
+        "После оплаты нажми кнопку «Я оплатил»."
+    )
+    return request_id, text
+
+
+async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, str]:
+    pack = topup_spec(code)
+    if not pack:
+        return None, "Неизвестный пакет кредитов."
+
+    amount = int(pack["price_rub"])
+    credits = int(pack["credits"])
+    row = user_profile(chat_id)
+    receipt_email, receipt_phone = effective_receipt_contact(row)
+    if not (receipt_email or receipt_phone):
+        return None, "Нужен email или телефон для чека. Нажми «Пакеты кредитов» и начни покупку заново."
+
+    request_id = state.user_store.create_payment_request(
+        chat_id,
+        topup_plan_code(code),
+        0,
+        amount,
+        recurring_consent=False,
+        recurring_consent_text="",
+        receipt_email=receipt_email,
+        receipt_phone=receipt_phone,
+    )
+    payment_purpose = f"Пакет кредитов {pack['label']}, заказ #{request_id}"
+    if tbank_enabled():
+        try:
+            payment_url, payment_id = await tbank_init_payment(
+                request_id=request_id,
+                amount_rub=amount,
+                description=f"Пакет кредитов {pack['label']}, заказ #{request_id}",
+                receipt_email=receipt_email,
+                receipt_phone=receipt_phone,
+            )
+            state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
+            text = (
+                f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n\n"
+                "Оплати по ссылке Т-Банка:\n"
+                f"{payment_url}\n\n"
+                f"Назначение платежа: {payment_purpose}\n"
+                "После успешной оплаты кредиты зачислятся автоматически."
+            )
+            return request_id, text
+        except Exception as exc:
+            log.exception("T-Bank Init failed for topup request %s", request_id)
+            text = (
+                f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n"
+                f"Автооплата сейчас недоступна ({exc}).\n\n"
+                "Используй ручную оплату ниже."
+            )
+            return request_id, text
+
+    text = (
+        f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n\n"
         "Куда оплачивать:\n"
         f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
@@ -2173,28 +2387,15 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, f"Заявка #{req_id} отменена")
             return True
 
-        target = int(payment["chat_id"])
-        plan = str(payment["plan"])
-        days = int(payment["days"])
-        provider_ref = str(payment.get("provider_ref", ""))
-        selected = best_default_alias_for_plan(plan)
-        user_profile(target)
-        state.user_store.set_payment_status(req_id, "paid")
-        expires_at = state.user_store.set_subscription(
-            target,
-            plan,
-            days,
-            selected,
-            recurring_enabled=provider_ref.startswith("tbank:"),
+        activated, info = await activate_payment_request(req_id, source="admin manual")
+        if not activated:
+            await max_send_message(chat_id, f"Заявка #{req_id}: {info}")
+            return True
+        payment = state.user_store.get_payment(req_id) or payment
+        await max_send_message(
+            chat_id,
+            f"Оплата #{req_id} подтверждена. user={payment['chat_id']} item={payment['plan']} result={info}",
         )
-        state.user_store.mark_payment_activated(req_id)
-        await max_send_message(chat_id, f"Оплата #{req_id} подтверждена. user={target} plan={plan} until={expires_at}")
-        with suppress(Exception):
-            await max_send_message(
-                target,
-                f"Оплата подтверждена. Тариф {plan} активирован до {expires_at[:16]} UTC.",
-                attachments=build_keyboard(),
-            )
         return True
 
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
@@ -2242,6 +2443,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if callback_id:
             await answer_callback(callback_id, "Показываю тарифы")
         await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), notify=False)
+        return True
+
+    if payload == "action:topups":
+        if callback_id:
+            await answer_callback(callback_id, "Показываю пакеты")
+        await send_topups(chat_id)
         return True
 
     if payload == "action:menu":
@@ -2347,6 +2554,33 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             return True
         return True
 
+    if payload.startswith("topup:"):
+        code = payload.split(":", 1)[1].lower().strip()
+        pack = topup_spec(code)
+        if not pack:
+            if callback_id:
+                await answer_callback(callback_id, "Неверный пакет")
+            await max_send_message(chat_id, "Неизвестный пакет кредитов.", attachments=build_topups_keyboard(), notify=False)
+            return True
+
+        row = user_profile(chat_id)
+        email, phone = effective_receipt_contact(row)
+        if not (email or phone):
+            state.pending_receipt_plan[chat_id] = f"topup:{code}"
+            if callback_id:
+                await answer_callback(callback_id, "Нужен контакт для чека")
+            await request_receipt_contact(chat_id, f"topup:{code}", notify=False)
+            return True
+
+        if callback_id:
+            await answer_callback(callback_id, "Открываю оплату")
+        request_id, msg = await create_topup_request_v2(chat_id, code)
+        if request_id is None:
+            await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
+            return True
+        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
+        return True
+
     if payload.startswith("paid:"):
         request_raw = payload.split(":", 1)[1].strip()
         if not request_raw.isdigit():
@@ -2437,6 +2671,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/tariffs":
         await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing())
+        return True
+
+    if command == "/topup":
+        await send_topups(chat_id)
         return True
 
     if command == "/plan":
@@ -2568,6 +2806,14 @@ async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
     state.pending_receipt_plan.pop(chat_id, None)
     label = email or phone
     await max_send_message(chat_id, f"Контакт для чека сохранен: {label}")
+    if plan.startswith("topup:"):
+        code = plan.split(":", 1)[1].lower().strip()
+        request_id, msg = await create_topup_request_v2(chat_id, code)
+        if request_id is None:
+            await max_send_message(chat_id, msg, attachments=build_topups_keyboard())
+            return True
+        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id))
+        return True
     await send_buy_consent(chat_id, plan)
     return True
 
