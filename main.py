@@ -13,6 +13,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -241,6 +242,8 @@ class UserStore:
                     chat_id INTEGER PRIMARY KEY,
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
+                    receipt_email TEXT NOT NULL DEFAULT '',
+                    receipt_phone TEXT NOT NULL DEFAULT '',
                     selected_model_alias TEXT NOT NULL DEFAULT '',
                     subscription_expires_at TEXT NOT NULL DEFAULT '',
                     recurring_enabled INTEGER NOT NULL DEFAULT 0,
@@ -265,6 +268,8 @@ class UserStore:
                     recurring_consent INTEGER NOT NULL DEFAULT 0,
                     recurring_consent_at TEXT NOT NULL DEFAULT '',
                     recurring_consent_text TEXT NOT NULL DEFAULT '',
+                    receipt_email TEXT NOT NULL DEFAULT '',
+                    receipt_phone TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
                     provider TEXT NOT NULL DEFAULT 'manual',
                     provider_ref TEXT NOT NULL DEFAULT '',
@@ -278,9 +283,13 @@ class UserStore:
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "receipt_email", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "recurring_consent", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "payment_requests", "recurring_consent_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "recurring_consent_text", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "payment_requests", "receipt_email", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "payment_requests", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -330,6 +339,14 @@ class UserStore:
             conn.execute(
                 "UPDATE users SET selected_model_alias = ?, updated_at = ? WHERE chat_id = ?",
                 (alias, datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def set_receipt_contact(self, chat_id: int, email: str, phone: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET receipt_email = ?, receipt_phone = ?, updated_at = ? WHERE chat_id = ?",
+                (email.strip(), phone.strip(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
 
@@ -414,6 +431,8 @@ class UserStore:
         amount_rub: int,
         recurring_consent: bool = False,
         recurring_consent_text: str = "",
+        receipt_email: str = "",
+        receipt_phone: str = "",
     ) -> int:
         now = datetime.utcnow().isoformat()
         consent_at = now if recurring_consent else ""
@@ -422,9 +441,9 @@ class UserStore:
                 """
                 INSERT INTO payment_requests (
                     chat_id, plan, days, amount_rub, recurring_consent,
-                    recurring_consent_at, recurring_consent_text, status, created_at
+                    recurring_consent_at, recurring_consent_text, receipt_email, receipt_phone, status, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
                 (
                     chat_id,
@@ -434,6 +453,8 @@ class UserStore:
                     1 if recurring_consent else 0,
                     consent_at,
                     recurring_consent_text,
+                    receipt_email.strip(),
+                    receipt_phone.strip(),
                     now,
                 ),
             )
@@ -518,6 +539,7 @@ class UserStore:
 class BotState:
     def __init__(self) -> None:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
+        self.pending_receipt_plan: dict[int, str] = {}
         self.processed_updates: deque[str] = deque()
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
@@ -647,7 +669,12 @@ def tbank_payment_id_from_provider_ref(provider_ref: str) -> str:
     return value
 
 
-def build_tbank_receipt(amount_rub: int, description: str) -> dict[str, Any]:
+def build_tbank_receipt(
+    amount_rub: int,
+    description: str,
+    receipt_email: str = "",
+    receipt_phone: str = "",
+) -> dict[str, Any]:
     amount_kop = int(amount_rub) * 100
     item_name = (description or "Подписка").strip()[:128] or "Подписка"
     receipt: dict[str, Any] = {
@@ -666,10 +693,10 @@ def build_tbank_receipt(amount_rub: int, description: str) -> dict[str, Any]:
     }
     if TBANK_RECEIPT_FFD_VERSION:
         receipt["FfdVersion"] = TBANK_RECEIPT_FFD_VERSION
-    if TBANK_RECEIPT_EMAIL:
-        receipt["Email"] = TBANK_RECEIPT_EMAIL
-    if TBANK_RECEIPT_PHONE:
-        receipt["Phone"] = TBANK_RECEIPT_PHONE
+    if receipt_email:
+        receipt["Email"] = receipt_email
+    if receipt_phone:
+        receipt["Phone"] = receipt_phone
     return receipt
 
 
@@ -1060,6 +1087,37 @@ def parse_admin_target(value: str) -> int | None:
     return None
 
 
+def normalize_receipt_phone(raw: str) -> str:
+    value = raw.strip()
+    has_plus = value.startswith("+")
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if not (10 <= len(digits) <= 15):
+        return ""
+    return f"+{digits}" if has_plus else digits
+
+
+def normalize_receipt_email(raw: str) -> str:
+    value = raw.strip().lower()
+    if not value:
+        return ""
+    if len(value) > 254:
+        return ""
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value):
+        return ""
+    return value
+
+
+def parse_receipt_contact(raw: str) -> tuple[str, str]:
+    text = raw.strip()
+    if not text:
+        return "", ""
+    if "@" in text:
+        email = normalize_receipt_email(text)
+        return email, ""
+    phone = normalize_receipt_phone(text)
+    return "", phone
+
+
 def parse_iso_datetime(value: str) -> datetime | None:
     if not value:
         return None
@@ -1432,6 +1490,40 @@ async def send_payments(chat_id: int) -> None:
     await max_send_message(chat_id, "\n".join(lines), attachments=build_keyboard())
 
 
+def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
+    email = str(row.get("receipt_email", "")).strip() or TBANK_RECEIPT_EMAIL
+    phone = str(row.get("receipt_phone", "")).strip() or TBANK_RECEIPT_PHONE
+    return email, phone
+
+
+async def request_receipt_contact(chat_id: int, plan: str, notify: bool = False) -> None:
+    state.pending_receipt_plan[chat_id] = plan
+    await max_send_message(
+        chat_id,
+        (
+            "Перед оплатой нужен контакт для отправки чека.\n"
+            "Отправь одним сообщением email или телефон.\n\n"
+            "Пример email: user@example.com\n"
+            "Пример телефона: +79991234567\n\n"
+            "Чтобы отменить — отправь «отмена»."
+        ),
+        attachments=build_tariffs_keyboard_pricing(),
+        notify=notify,
+    )
+
+
+async def start_buy_flow(chat_id: int, plan: str, notify: bool = False) -> bool:
+    if plan not in {"start", "pro"}:
+        await max_send_message(chat_id, "Доступно: start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
+        return False
+    row = user_profile(chat_id)
+    email, phone = effective_receipt_contact(row)
+    if not (email or phone):
+        await request_receipt_contact(chat_id, plan, notify=notify)
+        return False
+    return await send_buy_consent(chat_id, plan, notify=notify)
+
+
 async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> bool:
     if plan not in {"start", "pro"}:
         await max_send_message(chat_id, "Доступно: start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
@@ -1513,6 +1605,8 @@ async def tbank_init_payment(
     request_id: int,
     amount_rub: int,
     description: str,
+    receipt_email: str = "",
+    receipt_phone: str = "",
 ) -> tuple[str, str]:
     if not tbank_enabled():
         raise RuntimeError("T-Bank credentials are not configured.")
@@ -1525,11 +1619,18 @@ async def tbank_init_payment(
         "Description": description[:140],
         "PayType": "O",
     }
-    if not (TBANK_RECEIPT_EMAIL or TBANK_RECEIPT_PHONE):
+    final_email = receipt_email.strip() or TBANK_RECEIPT_EMAIL
+    final_phone = receipt_phone.strip() or TBANK_RECEIPT_PHONE
+    if not (final_email or final_phone):
         raise RuntimeError(
             "T-Bank Receipt required: set TBANK_RECEIPT_EMAIL or TBANK_RECEIPT_PHONE in .env"
         )
-    payload["Receipt"] = build_tbank_receipt(amount_rub=amount_rub, description=description)
+    payload["Receipt"] = build_tbank_receipt(
+        amount_rub=amount_rub,
+        description=description,
+        receipt_email=final_email,
+        receipt_phone=final_phone,
+    )
     notification_url = resolve_tbank_notification_url()
     if notification_url:
         payload["NotificationURL"] = notification_url
@@ -1654,6 +1755,10 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
     if plan not in {"start", "pro"}:
         return None, "Доступно: start или pro."
     amount, days = plan_price_and_days(plan)
+    row = user_profile(chat_id)
+    receipt_email, receipt_phone = effective_receipt_contact(row)
+    if not (receipt_email or receipt_phone):
+        return None, "Нужен email или телефон для чека. Нажми «Тарифы» и начни оплату заново."
     request_id = state.user_store.create_payment_request(
         chat_id,
         plan,
@@ -1661,6 +1766,8 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
         amount,
         recurring_consent=bool(consent_text),
         recurring_consent_text=consent_text,
+        receipt_email=receipt_email,
+        receipt_phone=receipt_phone,
     )
     payment_purpose = f"Оплата подписки, заказ #{request_id}"
     if tbank_enabled():
@@ -1669,6 +1776,8 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
                 request_id=request_id,
                 amount_rub=amount,
                 description=f"Подписка {plan}, заказ #{request_id}",
+                receipt_email=receipt_email,
+                receipt_phone=receipt_phone,
             )
             state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
             text = (
@@ -1961,7 +2070,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             return True
         if callback_id:
             await answer_callback(callback_id, "Проверь условия")
-        ok = await send_buy_consent(chat_id, plan, notify=False)
+        ok = await start_buy_flow(chat_id, plan, notify=False)
         if not ok:
             return True
         return True
@@ -2080,7 +2189,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if plan not in {"start", "pro"}:
             await max_send_message(chat_id, "Доступно: Start или Pro.", attachments=build_tariffs_keyboard_pricing())
             return True
-        ok = await send_buy_consent(chat_id, plan)
+        ok = await start_buy_flow(chat_id, plan)
         if not ok:
             return True
         return True
@@ -2146,6 +2255,37 @@ async def handle_command(chat_id: int, text: str) -> bool:
     return False
 
 
+async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
+    plan = state.pending_receipt_plan.get(chat_id)
+    if not plan:
+        return False
+
+    lowered = text.strip().lower()
+    if text.strip().startswith("/") and lowered != "/cancel":
+        return False
+    if lowered in {"отмена", "cancel", "/cancel"}:
+        state.pending_receipt_plan.pop(chat_id, None)
+        await max_send_message(chat_id, "Покупка отменена. Можно снова выбрать тариф.", attachments=build_tariffs_keyboard_pricing())
+        return True
+
+    email, phone = parse_receipt_contact(text)
+    if not (email or phone):
+        await max_send_message(
+            chat_id,
+            "Не удалось распознать контакт. Отправь email (user@example.com) или телефон (+79991234567).",
+            attachments=build_tariffs_keyboard_pricing(),
+        )
+        return True
+
+    user_profile(chat_id)
+    state.user_store.set_receipt_contact(chat_id, email=email, phone=phone)
+    state.pending_receipt_plan.pop(chat_id, None)
+    label = email or phone
+    await max_send_message(chat_id, f"Контакт для чека сохранен: {label}")
+    await send_buy_consent(chat_id, plan)
+    return True
+
+
 async def process_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict) or not is_supported_update(update):
         return
@@ -2174,6 +2314,8 @@ async def process_update(update: dict[str, Any]) -> None:
 
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
     try:
+        if await handle_pending_receipt_input(chat_id, text):
+            return
         if await handle_command(chat_id, text):
             return
 
