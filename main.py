@@ -572,15 +572,17 @@ def tbank_enabled() -> bool:
 
 
 def tbank_order_id(request_id: int) -> str:
-    return f"MAXBOT-{request_id}"
+    suffix = datetime.utcnow().strftime("%y%m%d%H%M%S")
+    return f"MAXBOT-{request_id}-{suffix}"
 
 
 def parse_request_id_from_order_id(order_id: str) -> int | None:
     value = order_id.strip().upper()
     if not value.startswith("MAXBOT-"):
         return None
-    suffix = value.split("-", 1)[1]
-    return int(suffix) if suffix.isdigit() else None
+    payload = value.split("-", 1)[1]
+    request_part = payload.split("-", 1)[0]
+    return int(request_part) if request_part.isdigit() else None
 
 
 def add_request_id_to_url(url: str, request_id: int) -> str:
