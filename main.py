@@ -253,6 +253,9 @@ class UserStore:
                     plan TEXT NOT NULL,
                     days INTEGER NOT NULL,
                     amount_rub INTEGER NOT NULL,
+                    recurring_consent INTEGER NOT NULL DEFAULT 0,
+                    recurring_consent_at TEXT NOT NULL DEFAULT '',
+                    recurring_consent_text TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
                     provider TEXT NOT NULL DEFAULT 'manual',
                     provider_ref TEXT NOT NULL DEFAULT '',
@@ -266,6 +269,9 @@ class UserStore:
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "payment_requests", "recurring_consent", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "payment_requests", "recurring_consent_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "payment_requests", "recurring_consent_text", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -391,15 +397,36 @@ class UserStore:
             )
             conn.commit()
 
-    def create_payment_request(self, chat_id: int, plan: str, days: int, amount_rub: int) -> int:
+    def create_payment_request(
+        self,
+        chat_id: int,
+        plan: str,
+        days: int,
+        amount_rub: int,
+        recurring_consent: bool = False,
+        recurring_consent_text: str = "",
+    ) -> int:
         now = datetime.utcnow().isoformat()
+        consent_at = now if recurring_consent else ""
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO payment_requests (chat_id, plan, days, amount_rub, status, created_at)
-                VALUES (?, ?, ?, ?, 'pending', ?)
+                INSERT INTO payment_requests (
+                    chat_id, plan, days, amount_rub, recurring_consent,
+                    recurring_consent_at, recurring_consent_text, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
-                (chat_id, plan, days, amount_rub, now),
+                (
+                    chat_id,
+                    plan,
+                    days,
+                    amount_rub,
+                    1 if recurring_consent else 0,
+                    consent_at,
+                    recurring_consent_text,
+                    now,
+                ),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -671,7 +698,7 @@ def support_help_text() -> str:
         "3. Открой «Мой план» и проверь статус.\n\n"
         f"{SUPPORT_TEXT}\n"
         f"Ссылка: {support_url_value()}\n\n"
-        "FAQ: /support"
+        "FAQ: страница «Помощь»"
     )
 
 
@@ -802,6 +829,29 @@ def build_payment_request_keyboard(request_id: int) -> list[dict[str, Any]]:
                     [
                         {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_consent_keyboard(plan: str) -> list[dict[str, Any]]:
+    amount, days = plan_price_and_days(plan)
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"Согласен: {amount}₽ каждые {days} дн",
+                            "payload": f"buy_consent:{plan}",
+                        },
+                    ],
+                    [
+                        {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
                     ],
                 ]
             },
@@ -988,10 +1038,22 @@ def build_tariffs_text() -> str:
         "• free: 40 сообщений/день, 0 картинок/день — бесплатно\n"
         f"• start: 400 сообщений/день, 12 картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней\n"
         f"• pro: 2500 сообщений/день, 80 картинок/день — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней\n\n"
+        "Для start/pro действует автопродление.\n"
+        "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
+        "Отменить автопродление можно в разделе «Мой план».\n\n"
         "Модели по тарифам:\n"
         "• free: DeepSeek V4 Flash, GPT-4.1 Mini\n"
         "• start: + Gemini 2.5 Flash\n"
         "• pro: + GPT-5.4"
+    )
+
+
+def recurring_terms_for_plan(plan: str) -> str:
+    amount, days = plan_price_and_days(plan)
+    return (
+        f"Подписка {plan}: {amount} ₽ каждые {days} дней. "
+        "Пользователь подтверждает регулярные списания до отмены. "
+        "Отменить автопродление можно в разделе «Мой план»."
     )
 
 
@@ -1089,12 +1151,12 @@ def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
 
     if limit_type == "messages":
         if row["daily_messages_used"] >= cfg.daily_messages_limit:
-            return False, "Лимит сообщений на сегодня исчерпан. Проверь /tariffs."
+            return False, "Лимит сообщений на сегодня исчерпан. Открой «Тарифы»."
         state.user_store.increment_message_usage(chat_id)
         return True, ""
 
     if row["daily_images_used"] >= cfg.daily_images_limit:
-        return False, "Лимит генераций картинок на сегодня исчерпан. Проверь /tariffs."
+        return False, "Лимит генераций картинок на сегодня исчерпан. Открой «Тарифы»."
     state.user_store.increment_image_usage(chat_id)
     return True, ""
 
@@ -1325,6 +1387,24 @@ async def send_payments(chat_id: int) -> None:
     await max_send_message(chat_id, "\n".join(lines), attachments=build_keyboard())
 
 
+async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> bool:
+    if plan not in {"start", "pro"}:
+        await max_send_message(chat_id, "Доступно: start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
+        return False
+
+    amount, days = plan_price_and_days(plan)
+    text = (
+        "Перед оплатой нужно согласие на автопродление.\n\n"
+        f"Тариф: {plan}\n"
+        f"Сумма списания: {amount} ₽\n"
+        f"Периодичность: каждые {days} дней\n\n"
+        "Нажми кнопку согласия ниже, чтобы перейти к оплате.\n"
+        "Отменить автопродление можно в «Мой план»."
+    )
+    await max_send_message(chat_id, text, attachments=build_consent_keyboard(plan), notify=notify)
+    return True
+
+
 async def create_buy_request(chat_id: int, plan: str) -> str:
     if plan not in {"start", "pro"}:
         return "Доступно: start или pro."
@@ -1484,11 +1564,18 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
     return True, expires_at
 
 
-async def create_buy_request_v2(chat_id: int, plan: str) -> tuple[int | None, str]:
+async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "") -> tuple[int | None, str]:
     if plan not in {"start", "pro"}:
         return None, "Доступно: start или pro."
     amount, days = plan_price_and_days(plan)
-    request_id = state.user_store.create_payment_request(chat_id, plan, days, amount)
+    request_id = state.user_store.create_payment_request(
+        chat_id,
+        plan,
+        days,
+        amount,
+        recurring_consent=bool(consent_text),
+        recurring_consent_text=consent_text,
+    )
     payment_purpose = f"Оплата подписки, заказ #{request_id}"
     if tbank_enabled():
         try:
@@ -1754,6 +1841,22 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await send_plan(chat_id)
         return True
 
+    if payload.startswith("buy_consent:"):
+        plan = payload.split(":", 1)[1].lower().strip()
+        if plan not in {"start", "pro"}:
+            if callback_id:
+                await answer_callback(callback_id, "Неверный тариф")
+            return True
+        if callback_id:
+            await answer_callback(callback_id, "Согласие получено")
+        terms = recurring_terms_for_plan(plan)
+        request_id, msg = await create_buy_request_v2(chat_id, plan, consent_text=terms)
+        if request_id is None:
+            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
+            return True
+        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
+        return True
+
     if payload.startswith("buy:"):
         plan = payload.split(":", 1)[1].lower()
         if plan == "free":
@@ -1765,13 +1868,16 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
 
-        request_id, msg = await create_buy_request_v2(chat_id, plan)
-        if callback_id:
-            await answer_callback(callback_id, "Заявка создана")
-        if request_id is None:
-            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
+        if plan not in {"start", "pro"}:
+            if callback_id:
+                await answer_callback(callback_id, "Неверный тариф")
+            await max_send_message(chat_id, "Доступно: Start или Pro.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
+        if callback_id:
+            await answer_callback(callback_id, "Проверь условия")
+        ok = await send_buy_consent(chat_id, plan, notify=False)
+        if not ok:
+            return True
         return True
 
     if payload.startswith("paid:"):
@@ -1886,13 +1992,11 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing())
             return True
         if plan not in {"start", "pro"}:
-            await max_send_message(chat_id, "Доступно: /buy start или /buy pro", attachments=build_tariffs_keyboard_pricing())
+            await max_send_message(chat_id, "Доступно: Start или Pro.", attachments=build_tariffs_keyboard_pricing())
             return True
-        request_id, msg = await create_buy_request_v2(chat_id, plan)
-        if request_id is None:
-            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing())
+        ok = await send_buy_consent(chat_id, plan)
+        if not ok:
             return True
-        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id))
         return True
 
     if command == "/payments":
@@ -1935,7 +2039,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
             await max_send_message(
                 chat_id,
-                f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой /tariffs.",
+                f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
                 attachments=build_keyboard(),
             )
             return True
