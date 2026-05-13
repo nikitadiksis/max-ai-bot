@@ -27,12 +27,14 @@
       </p>
 
       <h2>Поддержка</h2>
+      <p id="support-text">Если есть вопросы по оплате или боту, напиши в поддержку.</p>
       <p>
-        Email: support@aimaxbots.ru<br />
-        Телефон: +7 (000) 000‑00‑00
+        Email: <span id="contact-email">не указан</span><br />
+        Телефон: <span id="contact-phone">не указан</span><br />
+        Ссылка: <a id="support-link" href="/support">страница помощи</a>
       </p>
 
-      <p>Если данные контактов изменятся, актуальная версия публикуется на этой странице.</p>
+      <p>Если контакты изменятся, актуальная версия публикуется на этой странице.</p>
 
       <nav class="nav">
         <a href="/">Главная</a>
@@ -42,5 +44,23 @@
       </nav>
     </section>
   </main>
+  <script>
+    async function hydrateContacts() {
+      try {
+        const res = await fetch("/contacts/meta", { cache: "no-store" });
+        const data = await res.json();
+        const emailEl = document.getElementById("contact-email");
+        const phoneEl = document.getElementById("contact-phone");
+        const textEl = document.getElementById("support-text");
+        const linkEl = document.getElementById("support-link");
+
+        if (data && data.email) emailEl.textContent = data.email;
+        if (data && data.phone) phoneEl.textContent = data.phone;
+        if (data && data.support_text) textEl.textContent = data.support_text;
+        if (data && data.support_url) linkEl.href = data.support_url;
+      } catch (_) {}
+    }
+    hydrateContacts();
+  </script>
 </body>
 </html>

@@ -86,6 +86,8 @@ TBANK_CANCEL_STATUSES = {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}
 TBANK_REFUND_STATUSES = {"REFUNDED", "REVERSED", "PARTIAL_REVERSED", "PARTIAL_REFUNDED", "CHARGEDBACK"}
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip()
+CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -2437,6 +2439,16 @@ async def landing_refund() -> FileResponse:
 @app.get("/contacts", response_class=FileResponse)
 async def landing_contacts() -> FileResponse:
     return FileResponse(site_file("contacts.html"))
+
+
+@app.get("/contacts/meta")
+async def contacts_meta() -> dict[str, str]:
+    return {
+        "email": CONTACT_EMAIL,
+        "phone": CONTACT_PHONE,
+        "support_url": support_url_value(),
+        "support_text": SUPPORT_TEXT,
+    }
 
 
 @app.get("/support", response_class=FileResponse)
