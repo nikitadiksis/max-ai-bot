@@ -76,7 +76,7 @@ LITE_DAILY_IMAGES_LIMIT = int(os.getenv("LITE_DAILY_IMAGES_LIMIT", "1"))
 START_DAILY_IMAGES_LIMIT = int(os.getenv("START_DAILY_IMAGES_LIMIT", "3"))
 PRO_DAILY_IMAGES_LIMIT = int(os.getenv("PRO_DAILY_IMAGES_LIMIT", "8"))
 PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "8"))
-FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "30"))
+FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "40"))
 MAX_COMPLETION_TOKENS_FREE = int(os.getenv("MAX_COMPLETION_TOKENS_FREE", "500"))
 MAX_COMPLETION_TOKENS_LITE = int(os.getenv("MAX_COMPLETION_TOKENS_LITE", "550"))
 MAX_COMPLETION_TOKENS_START = int(os.getenv("MAX_COMPLETION_TOKENS_START", "650"))
@@ -89,7 +89,7 @@ CREDIT_COST_GPT = int(os.getenv("CREDIT_COST_GPT", "3"))
 CREDIT_COST_GPTO = int(os.getenv("CREDIT_COST_GPTO", "4"))
 CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
-CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
+CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "30"))
 TOPUP_SMALL_PRICE_RUB = int(os.getenv("TOPUP_SMALL_PRICE_RUB", "199"))
 TOPUP_SMALL_CREDITS = int(os.getenv("TOPUP_SMALL_CREDITS", "1500"))
 TOPUP_MEDIUM_PRICE_RUB = int(os.getenv("TOPUP_MEDIUM_PRICE_RUB", "499"))
@@ -1994,6 +1994,7 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     text = (
         "Генерация картинки\n\n"
         f"{image_params_summary(chat_id)}\n\n"
+        f"Стоимость: {CREDIT_COST_IMAGE} кредитов за 1 генерацию.\n\n"
         "Выбери стиль и формат, затем нажми «Сгенерировать»."
     )
     await max_send_message(chat_id, text, attachments=build_image_menu_keyboard(chat_id), notify=notify)
@@ -2861,6 +2862,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             chat_id,
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{image_params_summary(chat_id)}\n"
+            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n"
             "Чтобы отменить — нажми «Отмена» или отправь /cancel.",
             attachments=build_image_prompt_keyboard(),
             notify=False,
