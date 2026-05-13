@@ -57,12 +57,24 @@ DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "300"))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.sqlite3")))
 MAX_TEXT_INPUT_CHARS = int(os.getenv("MAX_TEXT_INPUT_CHARS", "2500"))
 MAX_IMAGE_PROMPT_CHARS = int(os.getenv("MAX_IMAGE_PROMPT_CHARS", "800"))
+MAX_ASSISTANT_OUTPUT_CHARS = int(os.getenv("MAX_ASSISTANT_OUTPUT_CHARS", "1800"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "7000"))
 MESSAGE_COOLDOWN_SECONDS = int(os.getenv("MESSAGE_COOLDOWN_SECONDS", "1"))
 IMAGE_COOLDOWN_SECONDS = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "20"))
-START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "499"))
-PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "1490"))
+START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "990"))
+PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "2990"))
 START_PLAN_DAYS = int(os.getenv("START_PLAN_DAYS", "30"))
 PRO_PLAN_DAYS = int(os.getenv("PRO_PLAN_DAYS", "30"))
+FREE_DAILY_MESSAGES_LIMIT = int(os.getenv("FREE_DAILY_MESSAGES_LIMIT", "40"))
+START_DAILY_MESSAGES_LIMIT = int(os.getenv("START_DAILY_MESSAGES_LIMIT", "120"))
+PRO_DAILY_MESSAGES_LIMIT = int(os.getenv("PRO_DAILY_MESSAGES_LIMIT", "300"))
+FREE_DAILY_IMAGES_LIMIT = int(os.getenv("FREE_DAILY_IMAGES_LIMIT", "0"))
+START_DAILY_IMAGES_LIMIT = int(os.getenv("START_DAILY_IMAGES_LIMIT", "3"))
+PRO_DAILY_IMAGES_LIMIT = int(os.getenv("PRO_DAILY_IMAGES_LIMIT", "8"))
+PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "8"))
+MAX_COMPLETION_TOKENS_FREE = int(os.getenv("MAX_COMPLETION_TOKENS_FREE", "500"))
+MAX_COMPLETION_TOKENS_START = int(os.getenv("MAX_COMPLETION_TOKENS_START", "650"))
+MAX_COMPLETION_TOKENS_PRO = int(os.getenv("MAX_COMPLETION_TOKENS_PRO", "800"))
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -175,12 +187,28 @@ class PlanInfo:
     name: str
     daily_messages_limit: int
     daily_images_limit: int
+    daily_gpt54_limit: int
 
 
 PLAN_CONFIGS = {
-    "free": PlanInfo(name="free", daily_messages_limit=40, daily_images_limit=0),
-    "start": PlanInfo(name="start", daily_messages_limit=400, daily_images_limit=12),
-    "pro": PlanInfo(name="pro", daily_messages_limit=2500, daily_images_limit=80),
+    "free": PlanInfo(
+        name="free",
+        daily_messages_limit=FREE_DAILY_MESSAGES_LIMIT,
+        daily_images_limit=FREE_DAILY_IMAGES_LIMIT,
+        daily_gpt54_limit=0,
+    ),
+    "start": PlanInfo(
+        name="start",
+        daily_messages_limit=START_DAILY_MESSAGES_LIMIT,
+        daily_images_limit=START_DAILY_IMAGES_LIMIT,
+        daily_gpt54_limit=0,
+    ),
+    "pro": PlanInfo(
+        name="pro",
+        daily_messages_limit=PRO_DAILY_MESSAGES_LIMIT,
+        daily_images_limit=PRO_DAILY_IMAGES_LIMIT,
+        daily_gpt54_limit=PRO_DAILY_GPT54_LIMIT,
+    ),
 }
 
 
@@ -254,6 +282,7 @@ class UserStore:
                     usage_date TEXT NOT NULL DEFAULT '',
                     daily_messages_used INTEGER NOT NULL DEFAULT 0,
                     daily_images_used INTEGER NOT NULL DEFAULT 0,
+                    daily_gpt54_used INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT ''
                 )
@@ -287,6 +316,7 @@ class UserStore:
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "daily_gpt54_used", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "payment_requests", "recurring_consent", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "payment_requests", "recurring_consent_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "recurring_consent_text", "TEXT NOT NULL DEFAULT ''")
@@ -314,8 +344,8 @@ class UserStore:
                     """
                     INSERT INTO users (
                         chat_id, plan, is_blocked, selected_model_alias, usage_date,
-                        daily_messages_used, daily_images_used, created_at, updated_at
-                    ) VALUES (?, 'free', 0, ?, ?, 0, 0, ?, ?)
+                        daily_messages_used, daily_images_used, daily_gpt54_used, created_at, updated_at
+                    ) VALUES (?, 'free', 0, ?, ?, 0, 0, 0, ?, ?)
                     """,
                     (chat_id, default_model_alias, today, now, now),
                 )
@@ -326,7 +356,7 @@ class UserStore:
                 conn.execute(
                     """
                     UPDATE users
-                    SET usage_date = ?, daily_messages_used = 0, daily_images_used = 0, updated_at = ?
+                    SET usage_date = ?, daily_messages_used = 0, daily_images_used = 0, daily_gpt54_used = 0, updated_at = ?
                     WHERE chat_id = ?
                     """,
                     (today, now, chat_id),
@@ -533,6 +563,14 @@ class UserStore:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE users SET daily_images_used = daily_images_used + 1, updated_at = ? WHERE chat_id = ?",
+                (datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def increment_gpt54_usage(self, chat_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET daily_gpt54_used = daily_gpt54_used + 1, updated_at = ? WHERE chat_id = ?",
                 (datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
@@ -838,6 +876,37 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
     return chunks
 
 
+def truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def trim_history_by_chars(history: list[dict[str, str]], budget_chars: int) -> list[dict[str, str]]:
+    if budget_chars <= 0:
+        return []
+    kept: list[dict[str, str]] = []
+    used = 0
+    for item in reversed(history):
+        content = str(item.get("content", ""))
+        role = str(item.get("role", ""))
+        size = len(content) + len(role) + 8
+        if used + size > budget_chars:
+            break
+        kept.append({"role": role, "content": content})
+        used += size
+    kept.reverse()
+    return kept
+
+
+def completion_tokens_for_plan(plan: str) -> int:
+    if plan == "pro":
+        return MAX_COMPLETION_TOKENS_PRO
+    if plan == "start":
+        return MAX_COMPLETION_TOKENS_START
+    return MAX_COMPLETION_TOKENS_FREE
+
+
 def build_keyboard() -> list[dict[str, Any]]:
     return [
         {
@@ -1138,11 +1207,17 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
 
 
 def build_tariffs_text() -> str:
+    free_cfg = PLAN_CONFIGS["free"]
+    start_cfg = PLAN_CONFIGS["start"]
+    pro_cfg = PLAN_CONFIGS["pro"]
+    pro_gpt54_line = ""
+    if pro_cfg.daily_gpt54_limit > 0:
+        pro_gpt54_line = f", GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день"
     return (
         "Тарифы:\n"
-        "• free: 40 сообщений/день, 0 картинок/день — бесплатно\n"
-        f"• start: 400 сообщений/день, 12 картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней\n"
-        f"• pro: 2500 сообщений/день, 80 картинок/день — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней\n\n"
+        f"• free: {free_cfg.daily_messages_limit} сообщений/день, {free_cfg.daily_images_limit} картинок/день — бесплатно\n"
+        f"• start: {start_cfg.daily_messages_limit} сообщений/день, {start_cfg.daily_images_limit} картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней\n"
+        f"• pro: {pro_cfg.daily_messages_limit} сообщений/день, {pro_cfg.daily_images_limit} картинок/день{pro_gpt54_line} — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней\n\n"
         "Для платных тарифов действует автопродление.\n"
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
         "Отменить автопродление можно в разделе «Мой план».\n\n"
@@ -1193,17 +1268,22 @@ def usage_text(row: dict[str, Any]) -> str:
     cfg = PLAN_CONFIGS[plan_name]
     msg_left = max(0, cfg.daily_messages_limit - row["daily_messages_used"])
     img_left = max(0, cfg.daily_images_limit - row["daily_images_used"])
+    gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
+    gpt54_left = max(0, cfg.daily_gpt54_limit - gpt54_used)
     expires_raw = row.get("subscription_expires_at", "")
     expires_at = parse_iso_datetime(expires_raw)
     expires_text = "-"
     if plan_name != "free":
         expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "не задан"
-    return (
+    text = (
         f"План: {plan_name}\n"
         f"Подписка до: {expires_text}\n"
         f"Сегодня сообщений: {row['daily_messages_used']}/{cfg.daily_messages_limit} (осталось {msg_left})\n"
         f"Сегодня картинок: {row['daily_images_used']}/{cfg.daily_images_limit} (осталось {img_left})"
     )
+    if cfg.daily_gpt54_limit > 0:
+        text += f"\nGPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})"
+    return text
 
 
 def recurring_enabled_for_row(row: dict[str, Any]) -> bool:
@@ -1257,7 +1337,14 @@ def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
     if limit_type == "messages":
         if row["daily_messages_used"] >= cfg.daily_messages_limit:
             return False, "Лимит сообщений на сегодня исчерпан. Открой «Тарифы»."
+        selected_alias = str(row.get("selected_model_alias") or "")
+        if selected_alias == "gpt54" and cfg.daily_gpt54_limit > 0:
+            gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
+            if gpt54_used >= cfg.daily_gpt54_limit:
+                return False, "Лимит GPT-5.4 на сегодня исчерпан. Выбери другую модель."
         state.user_store.increment_message_usage(chat_id)
+        if str(row.get("selected_model_alias") or "") == "gpt54" and cfg.daily_gpt54_limit > 0:
+            state.user_store.increment_gpt54_usage(chat_id)
         return True, ""
 
     if row["daily_images_used"] >= cfg.daily_images_limit:
@@ -1374,15 +1461,20 @@ async def fetch_image_bytes(url: str) -> ImageResult:
 async def ask_text_model(chat_id: int, user_text: str) -> str:
     session = await get_session()
     row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free"))
     selected_alias = row["selected_model_alias"] or best_default_alias_for_plan(row["plan"])
     model_info = TEXT_MODELS.get(selected_alias, DEFAULT_TEXT_MODEL)
-    history = list(state.history(chat_id))
+    history = trim_history_by_chars(list(state.history(chat_id)), MAX_CONTEXT_CHARS)
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": f"{SYSTEM_PROMPT_BASE} {STYLE_PROMPTS.get(selected_alias, '')}".strip()}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
 
-    payload = {"model": model_info.model, "messages": messages}
+    payload = {
+        "model": model_info.model,
+        "messages": messages,
+        "max_tokens": completion_tokens_for_plan(plan_name),
+    }
     async with session.post(OPENROUTER_CHAT_API, headers=openrouter_headers(), json=payload) as resp:
         data = await resp.json(content_type=None)
         if resp.status >= 400:
@@ -1391,6 +1483,7 @@ async def ask_text_model(chat_id: int, user_text: str) -> str:
 
     choice = data["choices"][0]["message"]
     answer = normalize_text_content(choice.get("content")) or "Не удалось получить текстовый ответ."
+    answer = truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS)
     state.history(chat_id).append({"role": "user", "content": user_text})
     state.history(chat_id).append({"role": "assistant", "content": answer})
     return answer
