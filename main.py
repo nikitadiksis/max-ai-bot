@@ -76,6 +76,7 @@ LITE_DAILY_IMAGES_LIMIT = int(os.getenv("LITE_DAILY_IMAGES_LIMIT", "1"))
 START_DAILY_IMAGES_LIMIT = int(os.getenv("START_DAILY_IMAGES_LIMIT", "3"))
 PRO_DAILY_IMAGES_LIMIT = int(os.getenv("PRO_DAILY_IMAGES_LIMIT", "8"))
 PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "8"))
+FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "30"))
 MAX_COMPLETION_TOKENS_FREE = int(os.getenv("MAX_COMPLETION_TOKENS_FREE", "500"))
 MAX_COMPLETION_TOKENS_LITE = int(os.getenv("MAX_COMPLETION_TOKENS_LITE", "550"))
 MAX_COMPLETION_TOKENS_START = int(os.getenv("MAX_COMPLETION_TOKENS_START", "650"))
@@ -203,9 +204,8 @@ ADMIN_HELP_TEXT = (
 
 TARIFFS_TEXT = (
     "Тарифы:\n"
-    "• free: 40 сообщений/день, 0 картинок/день\n"
-    "• start: 400 сообщений/день, 12 картинок/день\n"
-    "• pro: 2500 сообщений/день, 80 картинок/день\n\n"
+    "• free: дневной бонус кредитов\n"
+    "• lite/start/pro: доступ по кредитам\n\n"
     "Модели по тарифам:\n"
     "• free: DeepSeek V4 Flash, GPT-4.1 Nano\n"
     "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
@@ -448,6 +448,18 @@ class UserStore:
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
+            if row["plan"] == "free" and int(row["credits_balance"] or 0) < FREE_DAILY_CREDITS:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET credits_balance = ?, updated_at = ?
+                    WHERE chat_id = ?
+                    """,
+                    (FREE_DAILY_CREDITS, now, chat_id),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+
             return dict(row)
 
     def set_selected_model(self, chat_id: int, alias: str) -> None:
@@ -480,10 +492,11 @@ class UserStore:
                     UPDATE users
                     SET plan = ?, subscription_expires_at = ?, recurring_enabled = 0,
                         recurring_cancel_from = '', recurring_canceled_at = '',
-                        credits_balance = 0, updated_at = ?
+                        credits_balance = CASE WHEN credits_balance < ? THEN ? ELSE credits_balance END,
+                        updated_at = ?
                     WHERE chat_id = ?
                     """,
-                    (plan, expires, datetime.utcnow().isoformat(), chat_id),
+                    (plan, expires, FREE_DAILY_CREDITS, FREE_DAILY_CREDITS, datetime.utcnow().isoformat(), chat_id),
                 )
             conn.commit()
 
@@ -1265,11 +1278,11 @@ def build_consent_keyboard(plan: str) -> list[dict[str, Any]]:
 
 def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
     buy_row_1: list[dict[str, Any]] = [
-        {"type": "callback", "text": f"🍬 Купить Lite — {LITE_PLAN_PRICE_RUB}₽", "payload": "buy:lite"},
-        {"type": "callback", "text": f"👌 Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
+        {"type": "callback", "text": f"🍬 Lite {LITE_PLAN_PRICE_RUB}₽", "payload": "buy:lite"},
+        {"type": "callback", "text": f"👌 Start {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
     ]
     buy_row_2: list[dict[str, Any]] = [
-        {"type": "callback", "text": f"🚀 Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
+        {"type": "callback", "text": f"🚀 Pro {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
     ]
     return [
         {
@@ -1303,27 +1316,45 @@ def build_topups_keyboard() -> list[dict[str, Any]]:
                     [
                         {
                             "type": "callback",
-                            "text": f"🪙 Small — {small['credits']} кр за {small['price_rub']}₽",
+                            "text": f"🪙 Small {small['credits']} кр • {small['price_rub']}₽",
                             "payload": "topup:small",
                         },
                     ],
                     [
                         {
                             "type": "callback",
-                            "text": f"💎 Medium — {medium['credits']} кр за {medium['price_rub']}₽",
+                            "text": f"💎 Medium {medium['credits']} кр • {medium['price_rub']}₽",
                             "payload": "topup:medium",
                         },
                     ],
                     [
                         {
                             "type": "callback",
-                            "text": f"🚀 Large — {large['credits']} кр за {large['price_rub']}₽",
+                            "text": f"🚀 Large {large['credits']} кр • {large['price_rub']}₽",
                             "payload": "topup:large",
                         },
                     ],
                     [
                         {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_topup_consent_keyboard(code: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "Подтверждаю покупку", "payload": f"topup_consent:{code}"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Отмена", "payload": "action:topups"},
                     ],
                 ]
             },
@@ -1534,19 +1565,16 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
 
 
 def build_tariffs_text() -> str:
-    free_cfg = PLAN_CONFIGS["free"]
-    lite_cfg = PLAN_CONFIGS["lite"]
-    start_cfg = PLAN_CONFIGS["start"]
     pro_cfg = PLAN_CONFIGS["pro"]
-    pro_gpt54_line = ""
-    if pro_cfg.daily_gpt54_limit > 0:
-        pro_gpt54_line = f", GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день"
+    pro_gpt54_line = f" (GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день)" if pro_cfg.daily_gpt54_limit > 0 else ""
+    free_nano_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_GPT))
+    free_ds_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_DEEPSEEK))
     return (
         "💠 Тарифы:\n"
-        f"• 🆓 free: {free_cfg.daily_messages_limit} сообщений/день, {free_cfg.daily_images_limit} картинок/день — бесплатно\n"
-        f"• 🍬 lite: {lite_cfg.daily_messages_limit} сообщений/день, {lite_cfg.daily_images_limit} картинок/день — {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней ({credits_for_plan('lite')} кредитов)\n"
-        f"• 👌 start: {start_cfg.daily_messages_limit} сообщений/день, {start_cfg.daily_images_limit} картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней ({credits_for_plan('start')} кредитов)\n"
-        f"• 🚀 pro: {pro_cfg.daily_messages_limit} сообщений/день, {pro_cfg.daily_images_limit} картинок/день{pro_gpt54_line} — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней ({credits_for_plan('pro')} кредитов)\n\n"
+        f"• 🆓 free: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов)\n"
+        f"• 🍬 lite: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов\n"
+        f"• 👌 start: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов\n"
+        f"• 🚀 pro: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов{pro_gpt54_line}\n\n"
         "🪙 Списания кредитов:\n"
         f"• DeepSeek: {CREDIT_COST_DEEPSEEK}\n"
         f"• GPT-4.1 Nano: {CREDIT_COST_GPT}\n"
@@ -1554,6 +1582,7 @@ def build_tariffs_text() -> str:
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
         f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
+        "Объем использования измеряется кредитами, а не количеством сообщений/картинок.\n"
         "Для платных тарифов действует автопродление.\n"
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
         "Отменить автопродление можно в разделе «Мой план».\n\n"
@@ -1602,8 +1631,6 @@ def user_profile(chat_id: int) -> dict[str, Any]:
 def usage_text(row: dict[str, Any]) -> str:
     plan_name = row["plan"]
     cfg = PLAN_CONFIGS[plan_name]
-    msg_left = max(0, cfg.daily_messages_limit - row["daily_messages_used"])
-    img_left = max(0, cfg.daily_images_limit - row["daily_images_used"])
     gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
     gpt54_left = max(0, cfg.daily_gpt54_limit - gpt54_used)
     expires_raw = row.get("subscription_expires_at", "")
@@ -1611,14 +1638,14 @@ def usage_text(row: dict[str, Any]) -> str:
     expires_text = "-"
     if plan_name != "free":
         expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "не задан"
+    balance = int(row.get("credits_balance", 0) or 0)
     text = (
         f"План: {plan_name}\n"
         f"Подписка до: {expires_text}\n"
-        f"Сегодня сообщений: {row['daily_messages_used']}/{cfg.daily_messages_limit} (осталось {msg_left})\n"
-        f"Сегодня картинок: {row['daily_images_used']}/{cfg.daily_images_limit} (осталось {img_left})"
+        f"Кредиты: {balance}"
     )
-    if plan_name in PAID_PLANS:
-        text += f"\nКредиты: {int(row.get('credits_balance', 0) or 0)}"
+    if plan_name == "free":
+        text += f"\nДневной бонус free: {FREE_DAILY_CREDITS} кредитов"
     if cfg.daily_gpt54_limit > 0:
         text += f"\nGPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})"
     return text
@@ -1668,10 +1695,15 @@ def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
 def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) -> tuple[bool, str]:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
-    if plan_name not in PAID_PLANS or amount <= 0:
+    if amount <= 0:
         return True, ""
     balance = int(row.get("credits_balance", 0) or 0)
     if balance < amount:
+        if plan_name == "free":
+            return (
+                False,
+                f"На сегодня free-кредиты закончились для операции «{operation_name}». Нужно {amount}, доступно {balance}. Завтра бонус обновится, либо открой «Тарифы».",
+            )
         return (
             False,
             f"Недостаточно кредитов для операции «{operation_name}». Нужно {amount}, доступно {balance}. Открой «Тарифы».",
@@ -1695,8 +1727,6 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
     cfg = PLAN_CONFIGS[plan_name]
 
     if limit_type == "messages":
-        if row["daily_messages_used"] >= cfg.daily_messages_limit:
-            return False, "Лимит сообщений на сегодня исчерпан. Открой «Тарифы»."
         selected_alias = str(row.get("selected_model_alias") or "")
         if selected_alias == "gpt54" and cfg.daily_gpt54_limit > 0:
             gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
@@ -1704,20 +1734,16 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
                 return False, "Лимит GPT-5.4 на сегодня исчерпан. Выбери другую модель."
         return True, ""
 
-    if row["daily_images_used"] >= cfg.daily_images_limit:
-        return False, "Лимит генераций картинок на сегодня исчерпан. Открой «Тарифы»."
     return True, ""
 
 
 def consume_limit(chat_id: int, limit_type: str) -> None:
     row = user_profile(chat_id)
     if limit_type == "messages":
-        state.user_store.increment_message_usage(chat_id)
         cfg = PLAN_CONFIGS[row["plan"]]
         if str(row.get("selected_model_alias") or "") == "gpt54" and cfg.daily_gpt54_limit > 0:
             state.user_store.increment_gpt54_usage(chat_id)
         return
-    state.user_store.increment_image_usage(chat_id)
 
 
 def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
@@ -2038,7 +2064,7 @@ async def send_credits(chat_id: int) -> None:
     if plan_name not in PAID_PLANS:
         await max_send_message(
             chat_id,
-            "🆓 На free кредиты не списываются. Для расширенного режима и картинок открой «Тарифы».",
+            f"🆓 На free каждый день доступно {FREE_DAILY_CREDITS} кредитов. Сейчас у тебя: {int(row.get('credits_balance', 0) or 0)}.",
             attachments=build_tariffs_keyboard_pricing(),
         )
         return
@@ -2070,9 +2096,26 @@ async def send_topups(chat_id: int) -> None:
         f"• Small: {small['credits']} кредитов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
         f"• Medium: {medium['credits']} кредитов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
         f"• Large: {large['credits']} кредитов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
-        "Кредиты списываются за запросы к моделям и генерацию картинок."
+        "Кредиты списываются за запросы к моделям и генерацию картинок.\n"
+        "Перед созданием оплаты бот попросит подтверждение покупки пакета."
     )
     await max_send_message(chat_id, text, attachments=build_topups_keyboard())
+
+
+async def send_topup_consent(chat_id: int, code: str, notify: bool = False) -> bool:
+    pack = topup_spec(code)
+    if not pack:
+        await max_send_message(chat_id, "Неизвестный пакет кредитов.", attachments=build_topups_keyboard(), notify=notify)
+        return False
+    text = (
+        f"Пакет: {pack['label']}\n"
+        f"Кредитов: {int(pack['credits'])}\n"
+        f"Стоимость: {int(pack['price_rub'])} ₽\n\n"
+        "Это разовая покупка без автосписаний.\n"
+        "Подтверди покупку кнопкой ниже."
+    )
+    await max_send_message(chat_id, text, attachments=build_topup_consent_keyboard(code), notify=notify)
+    return True
 
 
 async def send_payments(chat_id: int) -> None:
@@ -2844,12 +2887,19 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         row = user_profile(chat_id)
         email, phone = effective_receipt_contact(row)
         if not (email or phone):
-            state.pending_receipt_plan[chat_id] = f"topup:{code}"
+            state.pending_receipt_plan[chat_id] = f"topup_consent:{code}"
             if callback_id:
                 await answer_callback(callback_id, "Нужен контакт для чека")
-            await request_receipt_contact(chat_id, f"topup:{code}", notify=False)
+            await request_receipt_contact(chat_id, f"topup_consent:{code}", notify=False)
             return True
 
+        if callback_id:
+            await answer_callback(callback_id, "Проверь покупку")
+        await send_topup_consent(chat_id, code, notify=False)
+        return True
+
+    if payload.startswith("topup_consent:"):
+        code = payload.split(":", 1)[1].lower().strip()
         if callback_id:
             await answer_callback(callback_id, "Открываю оплату")
         request_id, msg = await create_topup_request_v2(chat_id, code)
@@ -3046,13 +3096,13 @@ async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
     state.pending_receipt_plan.pop(chat_id, None)
     label = email or phone
     await max_send_message(chat_id, f"Контакт для чека сохранен: {label}")
+    if plan.startswith("topup_consent:"):
+        code = plan.split(":", 1)[1].lower().strip()
+        await send_topup_consent(chat_id, code)
+        return True
     if plan.startswith("topup:"):
         code = plan.split(":", 1)[1].lower().strip()
-        request_id, msg = await create_topup_request_v2(chat_id, code)
-        if request_id is None:
-            await max_send_message(chat_id, msg, attachments=build_topups_keyboard())
-            return True
-        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id))
+        await send_topup_consent(chat_id, code)
         return True
     await send_buy_consent(chat_id, plan)
     return True
