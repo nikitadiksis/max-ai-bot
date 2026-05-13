@@ -1579,7 +1579,7 @@ def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) ->
     return True, ""
 
 
-def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
+def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
     row = user_profile(chat_id)
     if row["is_blocked"]:
         return False, "Доступ к боту временно ограничен. Напиши в поддержку."
@@ -1594,14 +1594,29 @@ def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
             gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
             if gpt54_used >= cfg.daily_gpt54_limit:
                 return False, "Лимит GPT-5.4 на сегодня исчерпан. Выбери другую модель."
-        state.user_store.increment_message_usage(chat_id)
-        if str(row.get("selected_model_alias") or "") == "gpt54" and cfg.daily_gpt54_limit > 0:
-            state.user_store.increment_gpt54_usage(chat_id)
         return True, ""
 
     if row["daily_images_used"] >= cfg.daily_images_limit:
         return False, "Лимит генераций картинок на сегодня исчерпан. Открой «Тарифы»."
+    return True, ""
+
+
+def consume_limit(chat_id: int, limit_type: str) -> None:
+    row = user_profile(chat_id)
+    if limit_type == "messages":
+        state.user_store.increment_message_usage(chat_id)
+        cfg = PLAN_CONFIGS[row["plan"]]
+        if str(row.get("selected_model_alias") or "") == "gpt54" and cfg.daily_gpt54_limit > 0:
+            state.user_store.increment_gpt54_usage(chat_id)
+        return
     state.user_store.increment_image_usage(chat_id)
+
+
+def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
+    ok, reason = check_limit_only(chat_id, limit_type)
+    if not ok:
+        return False, reason
+    consume_limit(chat_id, limit_type)
     return True, ""
 
 
@@ -2142,6 +2157,8 @@ async def process_refund_payment_request(request_id: int, source: str, bank_stat
     target = int(payment["chat_id"])
     plan = str(payment.get("plan", ""))
     current_status = str(payment.get("status", "")).lower()
+    if current_status == "refunded":
+        return False, "already refunded"
     if current_status != "refunded":
         state.user_store.set_payment_status(request_id, "refunded")
 
@@ -2765,7 +2782,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             )
             return True
 
-        ok, reason = check_and_consume_limit(chat_id, "images")
+        ok, reason = check_limit_only(chat_id, "images")
         if not ok:
             await max_send_message(chat_id, reason, attachments=build_keyboard())
             return True
@@ -2774,6 +2791,12 @@ async def handle_command(chat_id: int, text: str) -> bool:
         ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
         if not ok_credit:
             await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+            return True
+
+        ok, reason = check_and_consume_limit(chat_id, "images")
+        if not ok:
+            state.user_store.refund_credits(chat_id, img_cost)
+            await max_send_message(chat_id, reason, attachments=build_keyboard())
             return True
 
         await max_send_message(chat_id, "Генерирую картинку, это может занять немного времени...")
@@ -2876,7 +2899,7 @@ async def process_update(update: dict[str, Any]) -> None:
             await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
             return
 
-        ok, reason = check_and_consume_limit(chat_id, "messages")
+        ok, reason = check_limit_only(chat_id, "messages")
         if not ok:
             await max_send_message(chat_id, reason, attachments=build_keyboard())
             return
@@ -2887,6 +2910,12 @@ async def process_update(update: dict[str, Any]) -> None:
         ok_credit, reason_credit = check_and_consume_credits(chat_id, text_cost, f"текст ({model_label})")
         if not ok_credit:
             await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+            return
+
+        ok, reason = check_and_consume_limit(chat_id, "messages")
+        if not ok:
+            state.user_store.refund_credits(chat_id, text_cost)
+            await max_send_message(chat_id, reason, attachments=build_keyboard())
             return
 
         await max_send_message(chat_id, f"Думаю... Модель: {current_model_label(chat_id)}", notify=False)

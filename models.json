@@ -28,7 +28,7 @@
       "version": "2025-06-17",
       "input_price_usd_per_m": "0.30",
       "output_price_usd_per_m": "2.50",
-      "min_plan": "start",
+      "min_plan": "lite",
       "description": "Быстрый workhorse, хорошо подходит для длинных задач.",
       "prompt_style": "Отвечай дружелюбно, по делу и без лишней воды."
     },
