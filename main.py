@@ -1253,10 +1253,22 @@ def build_cancel_subscription_keyboard() -> list[dict[str, Any]]:
     ]
 
 
+def plan_access_human(min_plan: str) -> str:
+    if min_plan == "free":
+        return "free/lite/start/pro"
+    if min_plan == "lite":
+        return "lite/start/pro"
+    if min_plan == "start":
+        return "start/pro"
+    if min_plan == "pro":
+        return "pro"
+    return f"{min_plan}+"
+
+
 def model_line(model: ModelInfo, include_prices: bool) -> str:
     lines = [
         f"{model.alias} — {model.label} ({model.provider})",
-        f"версия: {model.version}, план: {model.min_plan}+",
+        f"версия: {model.version}, доступ: {plan_access_human(model.min_plan)}",
         f"для чего: {model.description}",
     ]
     if model.kind == "text" and model.alias in MODEL_CREDIT_COSTS:
@@ -1269,12 +1281,12 @@ def model_line(model: ModelInfo, include_prices: bool) -> str:
 
 
 def build_models_text(user_plan: str, include_prices: bool = False) -> str:
-    lines = ["Текстовые модели:"]
+    lines = [f"Текстовые модели (твой план: {user_plan}):"]
     for model in TEXT_MODELS.values():
-        prefix = "доступно" if plan_allowed(user_plan, model.min_plan) else f"нужно {model.min_plan}+"
+        prefix = "доступно" if plan_allowed(user_plan, model.min_plan) else f"нужно {plan_access_human(model.min_plan)}"
         lines.append(f"\n[{prefix}]\n{model_line(model, include_prices)}")
     image_model = DEFAULT_IMAGE_MODEL
-    image_prefix = "доступно" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {image_model.min_plan}+"
+    image_prefix = "доступно" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {plan_access_human(image_model.min_plan)}"
     lines.append("\nКартинки:")
     lines.append(f"\n[{image_prefix}]\n{model_line(image_model, include_prices)}")
     return "\n".join(lines)
