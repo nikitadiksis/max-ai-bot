@@ -74,6 +74,8 @@ TBANK_GET_STATE_URL = os.getenv("TBANK_GET_STATE_URL", "https://securepay.tinkof
 TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
 TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
 TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
+SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
+SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -106,7 +108,8 @@ WELCOME_TEXT = (
 
 MENU_TEXT = (
     "Кнопки ниже — основной способ пользоваться ботом.\n"
-    "Если нужен список команд, отправь /help."
+    "Если нужен список команд, отправь /help.\n"
+    "Если проблема с оплатой — нажми «Помощь» или отправь /support."
 )
 
 HELP_TEXT = (
@@ -120,6 +123,7 @@ HELP_TEXT = (
     "/tariffs — тарифы\n"
     "/buy <start|pro> — заявка на подписку\n"
     "/payments — мои заявки\n"
+    "/support — помощь по оплате и работе бота\n"
     "/clear — очистить контекст"
 )
 
@@ -598,6 +602,27 @@ def site_file(name: str) -> Path:
     return path
 
 
+def support_url_value() -> str:
+    if SUPPORT_URL:
+        return SUPPORT_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/support"
+    return "/support"
+
+
+def support_help_text() -> str:
+    return (
+        "Помощь\n\n"
+        "Если не проходит оплата или что-то работает не так:\n"
+        "1. Открой /tariffs и создай новую заявку.\n"
+        "2. После оплаты подожди 1-2 минуты.\n"
+        "3. Проверь /plan.\n\n"
+        f"{SUPPORT_TEXT}\n"
+        f"Ссылка: {support_url_value()}\n\n"
+        "FAQ: /support"
+    )
+
+
 def plan_allowed(plan: str, min_plan: str) -> bool:
     if min_plan not in PLAN_ORDER:
         log.warning("Unknown min_plan=%r in model config; denying access", min_plan)
@@ -681,6 +706,7 @@ def build_keyboard() -> list[dict[str, Any]]:
                     [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Очистить", "payload": "action:clear"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
             },
@@ -704,6 +730,7 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
                     ],
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
             },
@@ -722,6 +749,7 @@ def build_payment_request_keyboard(request_id: int) -> list[dict[str, Any]]:
                     ],
                     [
                         {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
             },
@@ -1507,6 +1535,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await send_menu(chat_id)
         return True
 
+    if payload == "action:support":
+        if callback_id:
+            await answer_callback(callback_id, "Открываю помощь")
+        await max_send_message(chat_id, support_help_text(), attachments=build_keyboard(), notify=False)
+        return True
+
     if payload.startswith("buy:"):
         plan = payload.split(":", 1)[1].lower()
         if plan == "free":
@@ -1621,6 +1655,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/plan":
         await send_plan(chat_id)
+        return True
+
+    if command == "/support":
+        await max_send_message(chat_id, support_help_text(), attachments=build_keyboard())
         return True
 
     if command == "/buy":
@@ -1854,6 +1892,16 @@ async def landing_refund() -> FileResponse:
 @app.get("/contacts", response_class=FileResponse)
 async def landing_contacts() -> FileResponse:
     return FileResponse(site_file("contacts.html"))
+
+
+@app.get("/support", response_class=FileResponse)
+async def landing_support() -> FileResponse:
+    return FileResponse(site_file("support.html"))
+
+
+@app.get("/support/meta")
+async def support_meta() -> dict[str, str]:
+    return {"url": support_url_value(), "text": SUPPORT_TEXT}
 
 
 def payment_status_view(request_id: int | None) -> dict[str, Any]:

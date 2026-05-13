@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Помощь и FAQ</title>
+  <meta name="description" content="Помощь по оплате и работе AI-бота в MAX." />
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <div class="top">
+        <span class="badge">Поддержка</span>
+        <span class="badge">FAQ</span>
+      </div>
+      <h1>Помощь по оплате и боту</h1>
+      <p id="support-text">Если возникли проблемы, напиши нам в поддержку — поможем быстро.</p>
+
+      <div class="actions">
+        <a id="support-link" class="btn btn-primary" href="https://max.ru/" target="_blank" rel="noopener">Написать в поддержку</a>
+        <a class="btn" href="/">На главную</a>
+      </div>
+
+      <h2>Частые вопросы</h2>
+      <article class="tile">
+        <strong>Оплатил, но подписка не активировалась</strong>
+        <p>Обычно подтверждение приходит за 1-2 минуты. Проверь командой <code>/plan</code> в боте. Если не помогло — открой поддержку.</p>
+      </article>
+      <article class="tile">
+        <strong>Нажал «Я оплатил» без оплаты</strong>
+        <p>Ничего страшного. Заявка не активируется без подтверждения банка или админа.</p>
+      </article>
+      <article class="tile">
+        <strong>Ошибка или отказ при оплате</strong>
+        <p>Создай новую заявку через <code>/tariffs</code> и попробуй снова. Если повторяется — отправь скрин в поддержку.</p>
+      </article>
+      <article class="tile">
+        <strong>Хочу возврат</strong>
+        <p>Условия возврата: <a href="/refund">страница возвратов</a>.</p>
+      </article>
+
+      <nav class="nav">
+        <a href="/offer">Публичная оферта</a>
+        <a href="/privacy">Политика конфиденциальности</a>
+        <a href="/contacts">Контакты и реквизиты</a>
+      </nav>
+    </section>
+  </main>
+
+  <script>
+    async function hydrateSupport() {
+      try {
+        const res = await fetch("/support/meta", { cache: "no-store" });
+        const data = await res.json();
+        const link = document.getElementById("support-link");
+        const text = document.getElementById("support-text");
+        if (data && data.url) {
+          link.href = data.url;
+        }
+        if (data && data.text) {
+          text.textContent = data.text;
+        }
+      } catch (_) {}
+    }
+    hydrateSupport();
+  </script>
+</body>
+</html>

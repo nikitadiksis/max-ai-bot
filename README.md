@@ -6,7 +6,7 @@ Production-ready bot for MAX messenger with OpenRouter models, image generation,
 
 - Text models via OpenRouter (`DeepSeek`, `GPT`, `Gemini`, `GPT-5.4`)
 - Image generation
-- Public landing pages (`/`, `/offer`, `/privacy`, `/refund`, `/contacts`)
+- Public landing pages (`/`, `/offer`, `/privacy`, `/refund`, `/contacts`, `/support`)
 - Per-user plans (`free`, `start`, `pro`)
 - Daily limits for text and images
 - Model access by plan
@@ -67,6 +67,8 @@ TBANK_INIT_URL=https://securepay.tinkoff.ru/v2/Init
 TBANK_NOTIFICATION_URL=
 TBANK_SUCCESS_URL=
 TBANK_FAIL_URL=
+SUPPORT_URL=
+SUPPORT_TEXT=Поддержка: напиши нам, поможем быстро.
 ```
 
 ## Commands
@@ -77,6 +79,7 @@ TBANK_FAIL_URL=
 - `/tariffs`
 - `/buy <start|pro>`
 - `/payments`
+- `/support`
 - `/model <alias>`
 - `/gpt`, `/gemini`, `/deepseek`, `/gpt54`
 - `/image <prompt>`
