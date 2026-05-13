@@ -90,6 +90,12 @@ CREDIT_COST_GPTO = int(os.getenv("CREDIT_COST_GPTO", "4"))
 CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
+VAR_CREDITS_PER_1K_DEEPSEEK = int(os.getenv("VAR_CREDITS_PER_1K_DEEPSEEK", "0"))
+VAR_CREDITS_PER_1K_GPT = int(os.getenv("VAR_CREDITS_PER_1K_GPT", "1"))
+VAR_CREDITS_PER_1K_GPTO = int(os.getenv("VAR_CREDITS_PER_1K_GPTO", "1"))
+VAR_CREDITS_PER_1K_GEMINI = int(os.getenv("VAR_CREDITS_PER_1K_GEMINI", "2"))
+VAR_CREDITS_PER_1K_GPT54 = int(os.getenv("VAR_CREDITS_PER_1K_GPT54", "4"))
+MAX_VARIABLE_CREDITS_PER_TEXT = int(os.getenv("MAX_VARIABLE_CREDITS_PER_TEXT", "4"))
 TOPUP_SMALL_PRICE_RUB = int(os.getenv("TOPUP_SMALL_PRICE_RUB", "199"))
 TOPUP_SMALL_CREDITS = int(os.getenv("TOPUP_SMALL_CREDITS", "1500"))
 TOPUP_MEDIUM_PRICE_RUB = int(os.getenv("TOPUP_MEDIUM_PRICE_RUB", "499"))
@@ -273,6 +279,14 @@ MODEL_CREDIT_COSTS = {
     "gpt54": CREDIT_COST_GPT54,
 }
 
+MODEL_VAR_CREDITS_PER_1K = {
+    "deepseek": VAR_CREDITS_PER_1K_DEEPSEEK,
+    "gpt": VAR_CREDITS_PER_1K_GPT,
+    "gpt4o": VAR_CREDITS_PER_1K_GPTO,
+    "gemini": VAR_CREDITS_PER_1K_GEMINI,
+    "gpt54": VAR_CREDITS_PER_1K_GPT54,
+}
+
 MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
         "label": "⚡ Быстро",
@@ -319,6 +333,14 @@ TOPUP_PACKS = {
 class ImageResult:
     image_bytes: bytes
     mime_type: str
+
+
+@dataclass(slots=True)
+class TextAnswerResult:
+    text: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
 
 
 @dataclass(slots=True)
@@ -1184,6 +1206,49 @@ def image_credit_cost() -> int:
     return CREDIT_COST_IMAGE
 
 
+def text_var_credits_per_1k(alias: str) -> int:
+    return int(MODEL_VAR_CREDITS_PER_1K.get(alias, 0))
+
+
+def estimate_tokens_from_messages(messages: list[dict[str, Any]]) -> int:
+    total_chars = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+            continue
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        total_chars += len(text)
+    # Safe-side approximation: 1 token ~= 3 chars for mixed RU/EN chats.
+    return max(1, (total_chars + 2) // 3)
+
+
+def variable_text_credits(alias: str, total_tokens: int) -> int:
+    rate = text_var_credits_per_1k(alias)
+    if rate <= 0 or total_tokens <= 0:
+        return 0
+    value = (total_tokens * rate + 999) // 1000
+    if MAX_VARIABLE_CREDITS_PER_TEXT > 0:
+        value = min(value, MAX_VARIABLE_CREDITS_PER_TEXT)
+    return max(0, value)
+
+
+def parse_usage_tokens(data: dict[str, Any]) -> tuple[int, int, int]:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0, 0
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", 0) or 0)
+    if total_tokens <= 0:
+        total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+    return max(0, prompt_tokens), max(0, completion_tokens), max(0, total_tokens)
+
+
 def build_keyboard() -> list[dict[str, Any]]:
     return [
         {
@@ -1685,6 +1750,8 @@ def build_tariffs_text() -> str:
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
         f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
+        f"Текстовые запросы: фикс + доплата за сложность по фактическим токенам (до {MAX_VARIABLE_CREDITS_PER_TEXT} кредитов за запрос).\n"
+        "Для коротких запросов обычно списывается только фикс или близко к нему.\n"
         "Объем использования измеряется кредитами, а не количеством сообщений/картинок.\n"
         "Для платных тарифов действует автопродление.\n"
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
@@ -2004,17 +2071,21 @@ async def fetch_image_bytes(url: str) -> ImageResult:
         return ImageResult(image_bytes=data, mime_type=mime_type)
 
 
-async def ask_text_model(chat_id: int, user_text: str) -> str:
-    session = await get_session()
+def build_text_request(chat_id: int, user_text: str, selected_alias: str | None = None) -> tuple[str, str, ModelInfo, list[dict[str, Any]]]:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
-    selected_alias = row["selected_model_alias"] or best_default_alias_for_plan(row["plan"])
-    model_info = TEXT_MODELS.get(selected_alias, DEFAULT_TEXT_MODEL)
+    alias = selected_alias or row["selected_model_alias"] or best_default_alias_for_plan(row["plan"])
+    model_info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
     history = trim_history_by_chars(list(state.history(chat_id)), MAX_CONTEXT_CHARS)
-
-    messages: list[dict[str, Any]] = [{"role": "system", "content": f"{SYSTEM_PROMPT_BASE} {STYLE_PROMPTS.get(selected_alias, '')}".strip()}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": f"{SYSTEM_PROMPT_BASE} {STYLE_PROMPTS.get(alias, '')}".strip()}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
+    return plan_name, alias, model_info, messages
+
+
+async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
+    session = await get_session()
+    plan_name, alias, model_info, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
 
     payload = {
         "model": model_info.model,
@@ -2032,7 +2103,19 @@ async def ask_text_model(chat_id: int, user_text: str) -> str:
     answer = truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS)
     state.history(chat_id).append({"role": "user", "content": user_text})
     state.history(chat_id).append({"role": "assistant", "content": answer})
-    return answer
+
+    prompt_tokens, completion_tokens, total_tokens = parse_usage_tokens(data)
+    if total_tokens <= 0:
+        estimated_prompt = estimate_tokens_from_messages(messages)
+        total_tokens = estimated_prompt + max(0, completion_tokens)
+        prompt_tokens = max(prompt_tokens, estimated_prompt)
+
+    return TextAnswerResult(
+        text=answer,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 async def generate_image(prompt: str) -> ImageResult:
@@ -2242,7 +2325,8 @@ async def send_credits(chat_id: int) -> None:
         f"• GPT-4o Mini: {CREDIT_COST_GPTO}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
-        f"• Картинка: {CREDIT_COST_IMAGE}"
+        f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
+        f"Текст: фикс + доплата за сложность по токенам (до {MAX_VARIABLE_CREDITS_PER_TEXT} кредитов/запрос)."
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
@@ -3397,25 +3481,50 @@ async def process_update(update: dict[str, Any]) -> None:
             return
 
         selected_alias = str(user_profile(chat_id).get("selected_model_alias") or DEFAULT_TEXT_MODEL.alias)
-        text_cost = text_credit_cost(selected_alias)
         model_label = TEXT_MODELS.get(selected_alias, DEFAULT_TEXT_MODEL).label
-        ok_credit, reason_credit = check_and_consume_credits(chat_id, text_cost, f"текст ({model_label})")
+        fixed_text_cost = text_credit_cost(selected_alias)
+        plan_name, _, _, estimated_messages = build_text_request(chat_id, text, selected_alias=selected_alias)
+        estimated_prompt_tokens = estimate_tokens_from_messages(estimated_messages)
+        estimated_total_tokens = estimated_prompt_tokens + completion_tokens_for_plan(plan_name)
+        reserved_var_cost = variable_text_credits(selected_alias, estimated_total_tokens)
+        reserved_total_cost = fixed_text_cost + reserved_var_cost
+
+        ok_credit, reason_credit = check_and_consume_credits(
+            chat_id,
+            reserved_total_cost,
+            f"текст ({model_label})",
+        )
         if not ok_credit:
             await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
             return
 
         ok, reason = check_and_consume_limit(chat_id, "messages")
         if not ok:
-            state.user_store.refund_credits(chat_id, text_cost)
+            state.user_store.refund_credits(chat_id, reserved_total_cost)
             await max_send_message(chat_id, reason, attachments=build_keyboard())
             return
 
         await max_send_message(chat_id, f"Думаю... Модель: {current_model_label(chat_id)}", notify=False)
         try:
-            answer = await ask_text_model(chat_id, text)
-            await max_send_message(chat_id, answer)
+            result = await ask_text_model(chat_id, text, selected_alias=selected_alias)
+            actual_var_cost = variable_text_credits(selected_alias, result.total_tokens)
+            if reserved_var_cost > actual_var_cost:
+                state.user_store.refund_credits(chat_id, reserved_var_cost - actual_var_cost)
+            elif actual_var_cost > reserved_var_cost:
+                extra_cost = actual_var_cost - reserved_var_cost
+                ok_extra, _ = check_and_consume_credits(chat_id, extra_cost, f"сложность ({model_label})")
+                if not ok_extra:
+                    log.warning(
+                        "Variable credits under-reserved chat_id=%s alias=%s reserved_var=%s actual_var=%s tokens=%s",
+                        chat_id,
+                        selected_alias,
+                        reserved_var_cost,
+                        actual_var_cost,
+                        result.total_tokens,
+                    )
+            await max_send_message(chat_id, result.text)
         except Exception:
-            state.user_store.refund_credits(chat_id, text_cost)
+            state.user_store.refund_credits(chat_id, reserved_total_cost)
             raise
     except Exception as exc:
         log.exception("Failed to process update")
