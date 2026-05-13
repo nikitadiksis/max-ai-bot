@@ -206,6 +206,7 @@ ADMIN_HELP_TEXT = (
     "/admin sub <chat_id> <lite|start|pro> <days>\n"
     "/admin block <chat_id> <on|off>\n"
     "/admin pay <request_id> <paid|cancel>\n"
+    "/admin kpi [days]\n"
     "/costs — модели и цены"
 )
 
@@ -436,6 +437,22 @@ class UserStore:
                     created_at TEXT NOT NULL DEFAULT '',
                     paid_at TEXT NOT NULL DEFAULT '',
                     activated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    plan TEXT NOT NULL DEFAULT '',
+                    model_alias TEXT NOT NULL DEFAULT '',
+                    credits_spent INTEGER NOT NULL DEFAULT 0,
+                    rub_amount INTEGER NOT NULL DEFAULT 0,
+                    tokens_total INTEGER NOT NULL DEFAULT 0,
+                    details TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -805,6 +822,101 @@ class UserStore:
                 (max(0, int(amount)), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
+
+    def record_usage_event(
+        self,
+        chat_id: int,
+        event_type: str,
+        plan: str = "",
+        model_alias: str = "",
+        credits_spent: int = 0,
+        rub_amount: int = 0,
+        tokens_total: int = 0,
+        details: str = "",
+    ) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_events (
+                    chat_id, event_type, plan, model_alias, credits_spent, rub_amount, tokens_total, details, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(chat_id),
+                    str(event_type),
+                    str(plan),
+                    str(model_alias),
+                    int(credits_spent),
+                    int(rub_amount),
+                    int(tokens_total),
+                    str(details)[:500],
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def kpi_report(self, days: int = 30) -> dict[str, Any]:
+        period_days = max(1, min(int(days), 365))
+        since = (datetime.utcnow() - timedelta(days=period_days)).isoformat()
+        with self._connect() as conn:
+            summary = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS events_total,
+                    COUNT(DISTINCT chat_id) AS active_users,
+                    SUM(CASE WHEN event_type = 'payment' THEN rub_amount ELSE 0 END) AS revenue_rub,
+                    SUM(CASE WHEN event_type = 'refund' THEN rub_amount ELSE 0 END) AS refunds_rub,
+                    SUM(CASE WHEN event_type = 'text_request' THEN 1 ELSE 0 END) AS text_requests,
+                    SUM(CASE WHEN event_type = 'image_request' THEN 1 ELSE 0 END) AS image_requests,
+                    SUM(CASE WHEN event_type = 'text_request' THEN credits_spent ELSE 0 END) AS text_credits,
+                    SUM(CASE WHEN event_type = 'image_request' THEN credits_spent ELSE 0 END) AS image_credits,
+                    SUM(CASE WHEN event_type IN ('text_request','image_request') THEN credits_spent ELSE 0 END) AS total_credits_spent,
+                    SUM(CASE WHEN event_type = 'text_request' THEN tokens_total ELSE 0 END) AS text_tokens
+                FROM usage_events
+                WHERE created_at >= ?
+                """,
+                (since,),
+            ).fetchone()
+
+            payers_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT chat_id) AS payers
+                FROM usage_events
+                WHERE created_at >= ? AND event_type = 'payment' AND rub_amount > 0
+                """,
+                (since,),
+            ).fetchone()
+
+            model_rows = conn.execute(
+                """
+                SELECT model_alias, COUNT(*) AS cnt, SUM(credits_spent) AS credits
+                FROM usage_events
+                WHERE created_at >= ? AND event_type = 'text_request'
+                GROUP BY model_alias
+                ORDER BY cnt DESC
+                LIMIT 10
+                """,
+                (since,),
+            ).fetchall()
+
+            return {
+                "days": period_days,
+                "since": since,
+                "events_total": int((summary["events_total"] or 0) if summary else 0),
+                "active_users": int((summary["active_users"] or 0) if summary else 0),
+                "revenue_rub": int((summary["revenue_rub"] or 0) if summary else 0),
+                "refunds_rub": int((summary["refunds_rub"] or 0) if summary else 0),
+                "text_requests": int((summary["text_requests"] or 0) if summary else 0),
+                "image_requests": int((summary["image_requests"] or 0) if summary else 0),
+                "text_credits": int((summary["text_credits"] or 0) if summary else 0),
+                "image_credits": int((summary["image_credits"] or 0) if summary else 0),
+                "total_credits_spent": int((summary["total_credits_spent"] or 0) if summary else 0),
+                "text_tokens": int((summary["text_tokens"] or 0) if summary else 0),
+                "payers": int((payers_row["payers"] or 0) if payers_row else 0),
+                "models": [dict(row) for row in model_rows],
+            }
 
 
 class BotState:
@@ -1785,6 +1897,53 @@ def build_tariffs_text() -> str:
     )
 
 
+def format_kpi_report(report: dict[str, Any]) -> str:
+    days = int(report.get("days", 30) or 30)
+    active_users = int(report.get("active_users", 0) or 0)
+    payers = int(report.get("payers", 0) or 0)
+    revenue_rub = int(report.get("revenue_rub", 0) or 0)
+    refunds_rub = int(report.get("refunds_rub", 0) or 0)
+    net_rub = revenue_rub + refunds_rub
+    text_requests = int(report.get("text_requests", 0) or 0)
+    image_requests = int(report.get("image_requests", 0) or 0)
+    text_credits = int(report.get("text_credits", 0) or 0)
+    image_credits = int(report.get("image_credits", 0) or 0)
+    total_credits_spent = int(report.get("total_credits_spent", 0) or 0)
+    text_tokens = int(report.get("text_tokens", 0) or 0)
+
+    arpu_active = (net_rub / active_users) if active_users > 0 else 0.0
+    arppu = (net_rub / payers) if payers > 0 else 0.0
+    pay_share = (payers * 100.0 / active_users) if active_users > 0 else 0.0
+    avg_tokens = (text_tokens / text_requests) if text_requests > 0 else 0.0
+
+    lines = [
+        f"📊 KPI за {days} дней",
+        f"• Активные пользователи: {active_users}",
+        f"• Плательщики: {payers} ({pay_share:.1f}%)",
+        f"• Выручка: {revenue_rub} ₽",
+        f"• Возвраты: {refunds_rub} ₽",
+        f"• Чистая выручка: {net_rub} ₽",
+        f"• ARPU (по активным): {arpu_active:.1f} ₽",
+        f"• ARPPU (по плательщикам): {arppu:.1f} ₽",
+        "",
+        f"🧠 Текст: {text_requests} запросов, {text_credits} кредитов, ср. токены/запрос: {avg_tokens:.0f}",
+        f"🎨 Картинки: {image_requests} запросов, {image_credits} кредитов",
+        f"🪙 Всего списано кредитов: {total_credits_spent}",
+    ]
+
+    models = report.get("models") or []
+    if isinstance(models, list) and models:
+        lines.append("")
+        lines.append("Топ моделей по текстовым запросам:")
+        for item in models[:5]:
+            alias = str(item.get("model_alias", "") or "-")
+            cnt = int(item.get("cnt", 0) or 0)
+            credits = int(item.get("credits", 0) or 0)
+            lines.append(f"• {alias}: {cnt} запросов, {credits} кредитов")
+
+    return "\n".join(lines)
+
+
 def recurring_terms_for_plan(plan: str) -> str:
     amount, days = plan_price_and_days(plan)
     return (
@@ -2253,6 +2412,16 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
     try:
         image = await generate_image(request_for_model)
         await send_generated_image(chat_id, request_for_model, image, display_prompt=prompt)
+        final_row = user_profile(chat_id)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="image_request",
+            plan=str(final_row.get("plan", "")),
+            model_alias=DEFAULT_IMAGE_MODEL.alias,
+            credits_spent=img_cost,
+            tokens_total=0,
+            details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+        )
     except Exception:
         state.user_store.refund_credits(chat_id, img_cost)
         raise
@@ -2617,8 +2786,16 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
     target = int(payment["chat_id"])
     plan = str(payment["plan"])
     days = int(payment["days"])
+    amount_rub = int(payment.get("amount_rub", 0) or 0)
     user_profile(target)
     state.user_store.set_payment_status(request_id, "paid")
+    state.user_store.record_usage_event(
+        chat_id=target,
+        event_type="payment",
+        plan=plan,
+        rub_amount=amount_rub,
+        details=f"request_id={request_id};source={source}",
+    )
 
     if is_topup_plan(plan):
         code = topup_code_from_plan(plan)
@@ -2665,11 +2842,19 @@ async def process_refund_payment_request(request_id: int, source: str, bank_stat
 
     target = int(payment["chat_id"])
     plan = str(payment.get("plan", ""))
+    amount_rub = int(payment.get("amount_rub", 0) or 0)
     current_status = str(payment.get("status", "")).lower()
     if current_status == "refunded":
         return False, "already refunded"
     if current_status != "refunded":
         state.user_store.set_payment_status(request_id, "refunded")
+        state.user_store.record_usage_event(
+            chat_id=target,
+            event_type="refund",
+            plan=plan,
+            rub_amount=-abs(amount_rub),
+            details=f"request_id={request_id};source={source};status={bank_status}",
+        )
 
     if is_topup_plan(plan):
         code = topup_code_from_plan(plan)
@@ -2847,7 +3032,8 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             "/admin plan <chat_id> <free|lite|start|pro>\n"
             "/admin sub <chat_id> <lite|start|pro> <days>\n"
             "/admin block <chat_id> <on|off>\n"
-            "/admin pay <request_id> <paid|cancel>",
+            "/admin pay <request_id> <paid|cancel>\n"
+            "/admin kpi [days]",
         )
         return True
 
@@ -2934,6 +3120,14 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             chat_id,
             f"Оплата #{req_id} подтверждена. user={payment['chat_id']} item={payment['plan']} result={info}",
         )
+        return True
+
+    if action == "kpi":
+        days = 30
+        if len(parts) >= 3 and parts[2].isdigit():
+            days = int(parts[2])
+        report = state.user_store.kpi_report(days=days)
+        await max_send_message(chat_id, format_kpi_report(report))
         return True
 
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
@@ -3530,6 +3724,7 @@ async def process_update(update: dict[str, Any]) -> None:
         try:
             result = await ask_text_model(chat_id, text, selected_alias=selected_alias)
             actual_var_cost = variable_text_credits(selected_alias, result.total_tokens)
+            actual_total_cost = fixed_text_cost + actual_var_cost
             if reserved_var_cost > actual_var_cost:
                 state.user_store.refund_credits(chat_id, reserved_var_cost - actual_var_cost)
             elif actual_var_cost > reserved_var_cost:
@@ -3544,6 +3739,16 @@ async def process_update(update: dict[str, Any]) -> None:
                         actual_var_cost,
                         result.total_tokens,
                     )
+            final_row = user_profile(chat_id)
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="text_request",
+                plan=str(final_row.get("plan", "")),
+                model_alias=selected_alias,
+                credits_spent=actual_total_cost,
+                tokens_total=int(result.total_tokens),
+                details=f"prompt={int(result.prompt_tokens)};completion={int(result.completion_tokens)}",
+            )
             await max_send_message(chat_id, result.text)
         except Exception:
             state.user_store.refund_credits(chat_id, reserved_total_cost)
