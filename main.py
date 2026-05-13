@@ -74,6 +74,8 @@ TBANK_GET_STATE_URL = os.getenv("TBANK_GET_STATE_URL", "https://securepay.tinkof
 TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
 TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
 TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
+TBANK_CANCEL_STATUSES = {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}
+TBANK_REFUND_STATUSES = {"REFUNDED", "REVERSED", "PARTIAL_REVERSED", "PARTIAL_REFUNDED", "CHARGEDBACK"}
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
 ADMIN_IDS = {
@@ -672,6 +674,14 @@ def tbank_notification_is_valid(payload: dict[str, Any]) -> bool:
         return False
     expected = tbank_token_from_payload(payload, TBANK_PASSWORD).lower()
     return received == expected
+
+
+def tbank_is_cancel_status(status: str) -> bool:
+    return status.strip().upper() in TBANK_CANCEL_STATUSES
+
+
+def tbank_is_refund_status(status: str) -> bool:
+    return status.strip().upper() in TBANK_REFUND_STATUSES
 
 
 def site_file(name: str) -> Path:
@@ -1536,7 +1546,7 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
         return False, f"payment #{request_id} not found"
 
     status = str(payment.get("status", ""))
-    if status in {"paid", "canceled"}:
+    if status in {"paid", "canceled", "refunded"}:
         return False, f"payment #{request_id} already {status}"
 
     target = int(payment["chat_id"])
@@ -1562,6 +1572,37 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
             attachments=build_keyboard(),
         )
     return True, expires_at
+
+
+async def process_refund_payment_request(request_id: int, source: str, bank_status: str) -> tuple[bool, str]:
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return False, f"payment #{request_id} not found"
+
+    target = int(payment["chat_id"])
+    current_status = str(payment.get("status", "")).lower()
+    if current_status != "refunded":
+        state.user_store.set_payment_status(request_id, "refunded")
+
+    row = user_profile(target)
+    changed = False
+    if row.get("plan") != "free" or recurring_enabled_for_row(row):
+        state.user_store.set_plan(target, "free")
+        state.user_store.set_selected_model(target, best_default_alias_for_plan("free"))
+        changed = True
+
+    if changed:
+        with suppress(Exception):
+            await max_send_message(
+                target,
+                (
+                    f"Возврат подтвержден ({source}, статус {bank_status}).\n"
+                    "Подписка переведена на free, автопродление отключено."
+                ),
+                attachments=build_keyboard(),
+            )
+        return True, "downgraded to free"
+    return False, "already free or already canceled"
 
 
 async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "") -> tuple[int | None, str]:
@@ -2246,12 +2287,14 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
         "claimed": "Проверяем оплату",
         "paid": "Оплата подтверждена",
         "canceled": "Оплата отменена",
+        "refunded": "Оформлен возврат",
     }
     messages = {
         "pending": "Платеж в обработке. Обычно подтверждение приходит в течение 1-2 минут.",
         "claimed": "Банк прислал сигнал, подтверждаем оплату. Обычно это занимает до 1-2 минут.",
         "paid": "Подписка уже активирована. Можно возвращаться в бот.",
         "canceled": "Оплата не была завершена. Вернись в бот и попробуй еще раз.",
+        "refunded": "Возврат подтвержден. Подписка отключена, действует тариф free.",
     }
     return {
         "known": True,
@@ -2270,7 +2313,7 @@ async def payment_status(request_id: int | None = None) -> dict[str, Any]:
     if request_id is None or not view.get("known"):
         return view
 
-    if view["status"] not in {"pending", "claimed"}:
+    if view["status"] not in {"pending", "claimed", "paid"}:
         return view
 
     payment = state.user_store.get_payment(request_id)
@@ -2289,7 +2332,9 @@ async def payment_status(request_id: int | None = None) -> dict[str, Any]:
 
         if bank_success and bank_status == "CONFIRMED":
             await activate_payment_request(request_id, source="T-Bank GetState")
-        elif bank_status in {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}:
+        elif tbank_is_refund_status(bank_status):
+            await process_refund_payment_request(request_id, source="T-Bank GetState", bank_status=bank_status)
+        elif tbank_is_cancel_status(bank_status):
             state.user_store.set_payment_status(request_id, "canceled")
 
         refreshed = payment_status_view(request_id)
@@ -2350,6 +2395,15 @@ async def tbank_webhook(request: Request) -> PlainTextResponse:
             log.info("T-Bank payment activated request_id=%s until=%s", request_id, info)
         else:
             log.info("T-Bank payment skipped request_id=%s reason=%s", request_id, info)
+    elif request_id is not None and tbank_is_refund_status(status):
+        changed, info = await process_refund_payment_request(request_id, source="T-Bank webhook", bank_status=status)
+        if changed:
+            log.info("T-Bank payment refunded request_id=%s result=%s", request_id, info)
+        else:
+            log.info("T-Bank refund ignored request_id=%s reason=%s", request_id, info)
+    elif request_id is not None and tbank_is_cancel_status(status):
+        state.user_store.set_payment_status(request_id, "canceled")
+        log.info("T-Bank payment canceled request_id=%s status=%s", request_id, status)
 
     return PlainTextResponse("OK")
 
