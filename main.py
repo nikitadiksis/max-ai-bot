@@ -234,6 +234,9 @@ class UserStore:
                     is_blocked INTEGER NOT NULL DEFAULT 0,
                     selected_model_alias TEXT NOT NULL DEFAULT '',
                     subscription_expires_at TEXT NOT NULL DEFAULT '',
+                    recurring_enabled INTEGER NOT NULL DEFAULT 0,
+                    recurring_cancel_from TEXT NOT NULL DEFAULT '',
+                    recurring_canceled_at TEXT NOT NULL DEFAULT '',
                     usage_date TEXT NOT NULL DEFAULT '',
                     daily_messages_used INTEGER NOT NULL DEFAULT 0,
                     daily_images_used INTEGER NOT NULL DEFAULT 0,
@@ -260,6 +263,9 @@ class UserStore:
                 """
             )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -322,24 +328,68 @@ class UserStore:
                 )
             else:
                 conn.execute(
-                    "UPDATE users SET plan = ?, subscription_expires_at = ?, updated_at = ? WHERE chat_id = ?",
+                    """
+                    UPDATE users
+                    SET plan = ?, subscription_expires_at = ?, recurring_enabled = 0,
+                        recurring_cancel_from = '', recurring_canceled_at = '', updated_at = ?
+                    WHERE chat_id = ?
+                    """,
                     (plan, expires, datetime.utcnow().isoformat(), chat_id),
                 )
             conn.commit()
 
-    def set_subscription(self, chat_id: int, plan: str, days: int, selected_model_alias: str) -> str:
+    def set_subscription(
+        self,
+        chat_id: int,
+        plan: str,
+        days: int,
+        selected_model_alias: str,
+        recurring_enabled: bool | None = None,
+    ) -> str:
         expires_at = (datetime.utcnow() + timedelta(days=days)).replace(microsecond=0).isoformat()
+        with self._connect() as conn:
+            if recurring_enabled is None:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET plan = ?, subscription_expires_at = ?, selected_model_alias = ?, updated_at = ?
+                    WHERE chat_id = ?
+                    """,
+                    (plan, expires_at, selected_model_alias, datetime.utcnow().isoformat(), chat_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET plan = ?, subscription_expires_at = ?, selected_model_alias = ?,
+                        recurring_enabled = ?, recurring_cancel_from = '', recurring_canceled_at = '',
+                        updated_at = ?
+                    WHERE chat_id = ?
+                    """,
+                    (
+                        plan,
+                        expires_at,
+                        selected_model_alias,
+                        1 if recurring_enabled else 0,
+                        datetime.utcnow().isoformat(),
+                        chat_id,
+                    ),
+                )
+            conn.commit()
+        return expires_at
+
+    def cancel_recurring(self, chat_id: int, cancel_from: str) -> None:
+        now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE users
-                SET plan = ?, subscription_expires_at = ?, selected_model_alias = ?, updated_at = ?
+                SET recurring_enabled = 0, recurring_cancel_from = ?, recurring_canceled_at = ?, updated_at = ?
                 WHERE chat_id = ?
                 """,
-                (plan, expires_at, selected_model_alias, datetime.utcnow().isoformat(), chat_id),
+                (cancel_from, now, now, chat_id),
             )
             conn.commit()
-        return expires_at
 
     def create_payment_request(self, chat_id: int, plan: str, days: int, amount_rub: int) -> int:
         now = datetime.utcnow().isoformat()
@@ -757,6 +807,35 @@ def build_payment_request_keyboard(request_id: int) -> list[dict[str, Any]]:
     ]
 
 
+def build_plan_keyboard(row: dict[str, Any]) -> list[dict[str, Any]]:
+    keyboard = build_keyboard()
+    if row.get("plan") != "free" and recurring_enabled_for_row(row):
+        keyboard[0]["payload"]["buttons"].append(
+            [
+                {"type": "callback", "text": "Отменить подписку", "payload": "sub_cancel:start"},
+            ]
+        )
+    return keyboard
+
+
+def build_cancel_subscription_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "Подтвердить отмену", "payload": "sub_cancel:confirm"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Не отменять", "payload": "sub_cancel:back"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
 def model_line(model: ModelInfo, include_prices: bool) -> str:
     lines = [
         f"{model.alias} — {model.label} ({model.provider})",
@@ -922,6 +1001,38 @@ def usage_text(row: dict[str, Any]) -> str:
         f"Подписка до: {expires_text}\n"
         f"Сегодня сообщений: {row['daily_messages_used']}/{cfg.daily_messages_limit} (осталось {msg_left})\n"
         f"Сегодня картинок: {row['daily_images_used']}/{cfg.daily_images_limit} (осталось {img_left})"
+    )
+
+
+def recurring_enabled_for_row(row: dict[str, Any]) -> bool:
+    return int(row.get("recurring_enabled", 0) or 0) == 1
+
+
+def recurring_status_text(row: dict[str, Any]) -> str:
+    plan_name = str(row.get("plan", "free"))
+    if plan_name == "free":
+        return ""
+
+    expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "")))
+    expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "не задано"
+
+    if recurring_enabled_for_row(row):
+        return (
+            "\n\nАвтопродление: включено.\n"
+            f"Текущий период действует до {expires_text}.\n"
+            "Если хочешь отключить списания — нажми кнопку «Отменить подписку»."
+        )
+
+    canceled_at_raw = str(row.get("recurring_canceled_at", ""))
+    if not canceled_at_raw:
+        return "\n\nАвтопродление: не подключено."
+
+    cancel_from = parse_iso_datetime(str(row.get("recurring_cancel_from", "")))
+    cancel_text = cancel_from.strftime("%Y-%m-%d %H:%M UTC") if cancel_from else expires_text
+    return (
+        "\n\nАвтопродление: отключено.\n"
+        f"Подписка действует до конца оплаченного периода: до {expires_text}.\n"
+        f"Отмена автопродления с {cancel_text}."
     )
 
 
@@ -1162,7 +1273,8 @@ async def send_costs(chat_id: int) -> None:
 
 async def send_plan(chat_id: int) -> None:
     row = user_profile(chat_id)
-    await max_send_message(chat_id, usage_text(row), attachments=build_keyboard())
+    text = f"{usage_text(row)}{recurring_status_text(row)}"
+    await max_send_message(chat_id, text, attachments=build_plan_keyboard(row))
 
 
 async def send_payments(chat_id: int) -> None:
@@ -1318,7 +1430,14 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
     selected = best_default_alias_for_plan(plan)
     user_profile(target)
     state.user_store.set_payment_status(request_id, "paid")
-    expires_at = state.user_store.set_subscription(target, plan, days, selected)
+    recurring_for_user = source.lower().startswith("t-bank")
+    expires_at = state.user_store.set_subscription(
+        target,
+        plan,
+        days,
+        selected,
+        recurring_enabled=recurring_for_user,
+    )
     state.user_store.mark_payment_activated(request_id)
 
     with suppress(Exception):
@@ -1468,10 +1587,17 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         target = int(payment["chat_id"])
         plan = str(payment["plan"])
         days = int(payment["days"])
+        provider_ref = str(payment.get("provider_ref", ""))
         selected = best_default_alias_for_plan(plan)
         user_profile(target)
         state.user_store.set_payment_status(req_id, "paid")
-        expires_at = state.user_store.set_subscription(target, plan, days, selected)
+        expires_at = state.user_store.set_subscription(
+            target,
+            plan,
+            days,
+            selected,
+            recurring_enabled=provider_ref.startswith("tbank:"),
+        )
         state.user_store.mark_payment_activated(req_id)
         await max_send_message(chat_id, f"Оплата #{req_id} подтверждена. user={target} plan={plan} until={expires_at}")
         with suppress(Exception):
@@ -1539,6 +1665,58 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if callback_id:
             await answer_callback(callback_id, "Открываю помощь")
         await max_send_message(chat_id, support_help_text(), attachments=build_keyboard(), notify=False)
+        return True
+
+    if payload == "sub_cancel:start":
+        row = user_profile(chat_id)
+        if row.get("plan") == "free" or not recurring_enabled_for_row(row):
+            if callback_id:
+                await answer_callback(callback_id, "Нечего отменять")
+            await max_send_message(chat_id, "Автопродление уже отключено или подписка не активна.", attachments=build_plan_keyboard(row), notify=False)
+            return True
+
+        expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "")))
+        expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "конца текущего периода"
+        if callback_id:
+            await answer_callback(callback_id, "Подтверди отмену")
+        await max_send_message(
+            chat_id,
+            "Подтвердить отмену автопродления?\n\n"
+            f"Подписка будет работать до {expires_text}.\n"
+            f"Отмена автосписаний вступит в силу с {expires_text}.",
+            attachments=build_cancel_subscription_keyboard(),
+            notify=False,
+        )
+        return True
+
+    if payload == "sub_cancel:confirm":
+        row = user_profile(chat_id)
+        if row.get("plan") == "free" or not recurring_enabled_for_row(row):
+            if callback_id:
+                await answer_callback(callback_id, "Уже отключено")
+            await send_plan(chat_id)
+            return True
+
+        expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "")))
+        cancel_from = expires_at.replace(microsecond=0).isoformat() if expires_at else datetime.utcnow().replace(microsecond=0).isoformat()
+        state.user_store.cancel_recurring(chat_id, cancel_from)
+        row = user_profile(chat_id)
+        cancel_dt = parse_iso_datetime(cancel_from)
+        cancel_text = cancel_dt.strftime("%Y-%m-%d %H:%M UTC") if cancel_dt else cancel_from
+        if callback_id:
+            await answer_callback(callback_id, "Отменено")
+        await max_send_message(
+            chat_id,
+            f"Автопродление отключено.\nПодписка действует до конца оплаченного периода.\nОтмена с {cancel_text}.",
+            attachments=build_plan_keyboard(row),
+            notify=False,
+        )
+        return True
+
+    if payload == "sub_cancel:back":
+        if callback_id:
+            await answer_callback(callback_id, "Без отмены")
+        await send_plan(chat_id)
         return True
 
     if payload.startswith("buy:"):
