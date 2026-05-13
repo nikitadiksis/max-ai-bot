@@ -2461,6 +2461,11 @@ async def support_meta() -> dict[str, str]:
     return {"url": support_url_value(), "text": SUPPORT_TEXT}
 
 
+@app.get("/mailru-domainMB5PESlCeJQEXuoC.html", response_class=FileResponse)
+async def mailru_domain_verify() -> FileResponse:
+    return FileResponse(site_file("mailru-domainMB5PESlCeJQEXuoC.html"))
+
+
 def payment_status_view(request_id: int | None) -> dict[str, Any]:
     if request_id is None:
         return {
