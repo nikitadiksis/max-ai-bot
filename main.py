@@ -179,8 +179,9 @@ HELP_TEXT = (
     "/start или /menu — меню\n"
     "/models — версии и описание моделей\n"
     "/plan — твой тариф и остатки\n"
-    "/model <alias> — выбрать модель\n"
-    "/gpt, /gpt4o, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
+    "/preset <fast|balanced|quality|expert> — выбрать режим\n"
+    "/model <alias> — выбрать модель вручную\n"
+    "/gpt, /gpt4o, /gemini, /deepseek, /gpt54 — быстрый выбор модели\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
     "/topup — пакеты кредитов\n"
@@ -270,6 +271,29 @@ MODEL_CREDIT_COSTS = {
     "gpt4o": CREDIT_COST_GPTO,
     "gemini": CREDIT_COST_GEMINI,
     "gpt54": CREDIT_COST_GPT54,
+}
+
+MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "fast": {
+        "label": "⚡ Быстро",
+        "description": "короткие и быстрые ответы",
+        "aliases": ["deepseek", "gpt"],
+    },
+    "balanced": {
+        "label": "⚖ Баланс",
+        "description": "ежедневные задачи и диалог",
+        "aliases": ["gpt4o", "gpt", "deepseek"],
+    },
+    "quality": {
+        "label": "🧠 Качество",
+        "description": "подробно и аккуратно",
+        "aliases": ["gemini", "gpt4o", "gpt"],
+    },
+    "expert": {
+        "label": "🚀 Эксперт",
+        "description": "максимум качества для сложных задач",
+        "aliases": ["gpt54", "gemini", "gpt4o", "gpt"],
+    },
 }
 
 TOPUP_PACKS = {
@@ -985,6 +1009,40 @@ def best_default_alias_for_plan(plan: str) -> str:
     return DEFAULT_TEXT_MODEL.alias
 
 
+def resolve_preset_alias_for_plan(plan: str, preset: str) -> str:
+    preset_cfg = MODEL_PRESETS.get(preset)
+    if not preset_cfg:
+        return best_default_alias_for_plan(plan)
+    for alias in preset_cfg.get("aliases", []):
+        info = TEXT_MODELS.get(alias)
+        if info and plan_allowed(plan, info.min_plan):
+            return alias
+    return best_default_alias_for_plan(plan)
+
+
+def resolve_preset_alias_for_chat(chat_id: int, preset: str) -> str:
+    plan = str(user_profile(chat_id).get("plan", "free"))
+    return resolve_preset_alias_for_plan(plan, preset)
+
+
+def build_preset_block(plan: str) -> str:
+    lines = ["🎛 Режимы ответов:"]
+    for key in ("fast", "balanced", "quality", "expert"):
+        cfg = MODEL_PRESETS[key]
+        aliases = list(cfg.get("aliases", []))
+        primary_alias = str(aliases[0]) if aliases else ""
+        primary_info = TEXT_MODELS.get(primary_alias)
+        alias = resolve_preset_alias_for_plan(plan, key)
+        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
+        if primary_info and not plan_allowed(plan, primary_info.min_plan):
+            lines.append(
+                f"• {cfg['label']} — {cfg['description']} (сейчас: {label}; полная версия с {primary_info.min_plan})"
+            )
+            continue
+        lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
+    return "\n".join(lines)
+
+
 def normalize_text_content(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -1094,9 +1152,12 @@ def build_keyboard() -> list[dict[str, Any]]:
             "payload": {
                 "buttons": [
                     [
-                        {"type": "callback", "text": "GPT", "payload": "set_model:gpt"},
-                        {"type": "callback", "text": "Gemini", "payload": "set_model:gemini"},
-                        {"type": "callback", "text": "DeepSeek", "payload": "set_model:deepseek"},
+                        {"type": "callback", "text": "⚡ Быстро", "payload": "set_preset:fast"},
+                        {"type": "callback", "text": "⚖ Баланс", "payload": "set_preset:balanced"},
+                    ],
+                    [
+                        {"type": "callback", "text": "🧠 Качество", "payload": "set_preset:quality"},
+                        {"type": "callback", "text": "🚀 Эксперт", "payload": "set_preset:expert"},
                     ],
                     [
                         {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
@@ -2025,6 +2086,8 @@ async def send_help(chat_id: int) -> None:
 
 
 async def send_menu(chat_id: int) -> None:
+    row = user_profile(chat_id)
+    preset_block = build_preset_block(str(row.get("plan", "free")))
     capabilities = (
         "Что умею:\n"
         "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
@@ -2034,9 +2097,10 @@ async def send_menu(chat_id: int) -> None:
     text = (
         "Привет. Это твой AI-бот в MAX.\n\n"
         f"{capabilities}\n\n"
+        f"{preset_block}\n\n"
         "Выбери действие кнопками или просто напиши вопрос.\n\n"
         f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
-        f"{usage_text(user_profile(chat_id))}\n\n"
+        f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
@@ -2673,6 +2737,30 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if chat_id is None or not payload:
         return False
 
+    if payload.startswith("set_preset:"):
+        preset = payload.split(":", 1)[1].strip().lower()
+        preset_cfg = MODEL_PRESETS.get(preset)
+        if not preset_cfg:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный режим")
+            return True
+        try:
+            alias = resolve_preset_alias_for_chat(chat_id, preset)
+            label = await set_user_model(chat_id, alias)
+            if callback_id:
+                await answer_callback(callback_id, f"{preset_cfg['label']} → {label}")
+            await max_send_message(
+                chat_id,
+                f"Режим: {preset_cfg['label']}\nМодель: {label}",
+                attachments=build_keyboard(),
+                notify=False,
+            )
+        except Exception as exc:
+            if callback_id:
+                await answer_callback(callback_id, str(exc)[:120])
+            await max_send_message(chat_id, f"Ошибка: {exc}", attachments=build_keyboard(), notify=False)
+        return True
+
     if payload.startswith("set_model:"):
         alias = payload.split(":", 1)[1]
         try:
@@ -3041,6 +3129,32 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Для пользователей команда скрыта. Используй кнопки в разделе «Тарифы».", attachments=build_tariffs_keyboard_pricing())
             return True
         await send_payments(chat_id)
+        return True
+
+    if command == "/preset":
+        if not arg:
+            await max_send_message(
+                chat_id,
+                "Выбери режим: /preset fast|balanced|quality|expert",
+                attachments=build_keyboard(),
+            )
+            return True
+        preset = arg.lower().strip()
+        preset_cfg = MODEL_PRESETS.get(preset)
+        if not preset_cfg:
+            await max_send_message(
+                chat_id,
+                "Неизвестный режим. Доступно: fast, balanced, quality, expert.",
+                attachments=build_keyboard(),
+            )
+            return True
+        alias = resolve_preset_alias_for_chat(chat_id, preset)
+        label = await set_user_model(chat_id, alias)
+        await max_send_message(
+            chat_id,
+            f"Режим: {preset_cfg['label']}\nМодель: {label}",
+            attachments=build_keyboard(),
+        )
         return True
 
     if command == "/model":
