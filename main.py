@@ -85,6 +85,7 @@ START_PLAN_CREDITS = int(os.getenv("START_PLAN_CREDITS", "9000"))
 PRO_PLAN_CREDITS = int(os.getenv("PRO_PLAN_CREDITS", "30000"))
 CREDIT_COST_DEEPSEEK = int(os.getenv("CREDIT_COST_DEEPSEEK", "1"))
 CREDIT_COST_GPT = int(os.getenv("CREDIT_COST_GPT", "3"))
+CREDIT_COST_GPTO = int(os.getenv("CREDIT_COST_GPTO", "4"))
 CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
@@ -133,6 +134,7 @@ SYSTEM_PROMPT_BASE = (
 
 STYLE_PROMPTS = {
     "gpt": "Стиль: четко структурируй ответ, хорошо объясняй шаги и варианты.",
+    "gpt4o": "Стиль: отвечай живо, понятно и по делу, с хорошими примерами.",
     "gemini": "Стиль: отвечай быстро, дружелюбно и с упором на практический результат.",
     "deepseek": "Стиль: делай упор на рассуждение, анализ и техническую точность.",
     "gpt54": "Стиль: отвечай как эксперт-консультант, глубоко и обоснованно.",
@@ -177,7 +179,7 @@ HELP_TEXT = (
     "/models — версии и описание моделей\n"
     "/plan — твой тариф и остатки\n"
     "/model <alias> — выбрать модель\n"
-    "/gpt, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
+    "/gpt, /gpt4o, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
     "/topup — пакеты кредитов\n"
@@ -205,8 +207,8 @@ TARIFFS_TEXT = (
     "• start: 400 сообщений/день, 12 картинок/день\n"
     "• pro: 2500 сообщений/день, 80 картинок/день\n\n"
     "Модели по тарифам:\n"
-    "• free: DeepSeek V4 Flash, GPT-4.1 Mini\n"
-    "• start: + Gemini 2.5 Flash\n"
+    "• free: DeepSeek V4 Flash, GPT-4.1 Nano\n"
+    "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
     "• pro: + GPT-5.4"
 )
 
@@ -265,6 +267,7 @@ PLAN_CREDITS = {
 MODEL_CREDIT_COSTS = {
     "deepseek": CREDIT_COST_DEEPSEEK,
     "gpt": CREDIT_COST_GPT,
+    "gpt4o": CREDIT_COST_GPTO,
     "gemini": CREDIT_COST_GEMINI,
     "gpt54": CREDIT_COST_GPT54,
 }
@@ -958,7 +961,7 @@ def is_admin(chat_id: int) -> bool:
 
 
 def best_default_alias_for_plan(plan: str) -> str:
-    preferred = [DEFAULT_TEXT_MODEL.alias, "gpt", "deepseek"]
+    preferred = ["gpt4o", DEFAULT_TEXT_MODEL.alias, "gpt", "deepseek"]
     for alias in preferred:
         info = TEXT_MODELS.get(alias)
         if info and plan_allowed(plan, info.min_plan):
@@ -1546,7 +1549,8 @@ def build_tariffs_text() -> str:
         f"• 🚀 pro: {pro_cfg.daily_messages_limit} сообщений/день, {pro_cfg.daily_images_limit} картинок/день{pro_gpt54_line} — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней ({credits_for_plan('pro')} кредитов)\n\n"
         "🪙 Списания кредитов:\n"
         f"• DeepSeek: {CREDIT_COST_DEEPSEEK}\n"
-        f"• GPT-4.1 Mini: {CREDIT_COST_GPT}\n"
+        f"• GPT-4.1 Nano: {CREDIT_COST_GPT}\n"
+        f"• GPT-4o Mini: {CREDIT_COST_GPTO}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
         f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
@@ -1554,8 +1558,8 @@ def build_tariffs_text() -> str:
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
         "Отменить автопродление можно в разделе «Мой план».\n\n"
         "Модели по тарифам:\n"
-        "• free/lite: DeepSeek V4 Flash, GPT-4.1 Mini\n"
-        "• start: + Gemini 2.5 Flash\n"
+        "• free: DeepSeek V4 Flash, GPT-4.1 Nano\n"
+        "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
         "• pro: + GPT-5.4"
     )
 
@@ -2042,7 +2046,8 @@ async def send_credits(chat_id: int) -> None:
         f"🪙 Твой баланс: {int(row.get('credits_balance', 0) or 0)} кредитов.\n\n"
         f"Списания:\n"
         f"• DeepSeek: {CREDIT_COST_DEEPSEEK}\n"
-        f"• GPT-4.1 Mini: {CREDIT_COST_GPT}\n"
+        f"• GPT-4.1 Nano: {CREDIT_COST_GPT}\n"
+        f"• GPT-4o Mini: {CREDIT_COST_GPTO}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
         f"• Картинка: {CREDIT_COST_IMAGE}"
@@ -2916,10 +2921,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
     command = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if lowered in {"gpt", "gemini", "deepseek", "gpt54"}:
+    if lowered in {"gpt", "gpt4o", "gemini", "deepseek", "gpt54"}:
         command = "/model"
         arg = lowered
-    elif command in {"/gpt", "/gemini", "/deepseek", "/gpt54"}:
+    elif command in {"/gpt", "/gpt4o", "/gemini", "/deepseek", "/gpt54"}:
         command = "/model"
         arg = command[1:]
 
@@ -2990,7 +2995,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/model":
         if not arg:
-            await max_send_message(chat_id, "Укажи модель: /model deepseek|gpt|gemini|gpt54", attachments=build_keyboard())
+            await max_send_message(chat_id, "Укажи модель: /model deepseek|gpt|gpt4o|gemini|gpt54", attachments=build_keyboard())
             return True
         label = await set_user_model(chat_id, arg)
         await max_send_message(chat_id, f"Выбрана модель: {label}", attachments=build_keyboard())
