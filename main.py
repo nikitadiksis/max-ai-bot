@@ -453,14 +453,15 @@ class UserStore:
                         chat_id, plan, is_blocked, selected_model_alias, usage_date,
                         daily_messages_used, daily_images_used, daily_gpt54_used, credits_balance, credits_spent_total,
                         created_at, updated_at
-                    ) VALUES (?, 'free', 0, ?, ?, 0, 0, 0, 0, 0, ?, ?)
+                    ) VALUES (?, 'free', 0, ?, ?, 0, 0, 0, ?, 0, ?, ?)
                     """,
-                    (chat_id, default_model_alias, today, now, now),
+                    (chat_id, default_model_alias, today, FREE_DAILY_CREDITS, now, now),
                 )
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
-            if row["usage_date"] != today:
+            day_changed = row["usage_date"] != today
+            if day_changed:
                 conn.execute(
                     """
                     UPDATE users
@@ -472,7 +473,8 @@ class UserStore:
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
-            if row["plan"] == "free" and int(row["credits_balance"] or 0) < FREE_DAILY_CREDITS:
+            # Daily free bonus should be topped up only once per day.
+            if day_changed and row["plan"] == "free" and int(row["credits_balance"] or 0) < FREE_DAILY_CREDITS:
                 conn.execute(
                     """
                     UPDATE users
