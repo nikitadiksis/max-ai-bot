@@ -6,6 +6,10 @@ on:
       - master
   workflow_dispatch:
 
+concurrency:
+  group: max-ai-bot-deploy
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -20,6 +24,13 @@ jobs:
           script: |
             set -e
             export DEBIAN_FRONTEND=noninteractive
+
+            # Prevent overlapping deploy sessions on the VPS itself.
+            exec 9>/var/lock/max_ai_agent_deploy.lock
+            if ! flock -n 9; then
+              echo "Another deploy is already running. Exiting."
+              exit 0
+            fi
 
             if ! command -v git >/dev/null 2>&1; then
               apt-get update -y
