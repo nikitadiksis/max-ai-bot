@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sqlite3
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from dotenv import load_dotenv
@@ -69,6 +70,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 TBANK_TERMINAL_KEY = os.getenv("TBANK_TERMINAL_KEY", "").strip()
 TBANK_PASSWORD = os.getenv("TBANK_PASSWORD", "").strip()
 TBANK_INIT_URL = os.getenv("TBANK_INIT_URL", "https://securepay.tinkoff.ru/v2/Init").strip()
+TBANK_GET_STATE_URL = os.getenv("TBANK_GET_STATE_URL", "https://securepay.tinkoff.ru/v2/GetState").strip()
 TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
 TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
 TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
@@ -525,6 +527,32 @@ def parse_request_id_from_order_id(order_id: str) -> int | None:
         return None
     suffix = value.split("-", 1)[1]
     return int(suffix) if suffix.isdigit() else None
+
+
+def add_request_id_to_url(url: str, request_id: int) -> str:
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["request_id"] = str(request_id)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
+def tbank_payment_id_from_provider_ref(provider_ref: str) -> str:
+    value = provider_ref.strip()
+    if not value:
+        return ""
+    if value.startswith("tbank:"):
+        return value.split(":", 1)[1].strip()
+    return value
 
 
 def scalar_string(value: Any) -> str:
@@ -1171,7 +1199,7 @@ def resolve_tbank_success_url() -> str:
     if TBANK_SUCCESS_URL:
         return TBANK_SUCCESS_URL
     if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/health"
+        return f"{PUBLIC_BASE_URL}/payment/success"
     return ""
 
 
@@ -1179,7 +1207,7 @@ def resolve_tbank_fail_url() -> str:
     if TBANK_FAIL_URL:
         return TBANK_FAIL_URL
     if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/health"
+        return f"{PUBLIC_BASE_URL}/payment/fail"
     return ""
 
 
@@ -1202,10 +1230,10 @@ async def tbank_init_payment(
     notification_url = resolve_tbank_notification_url()
     if notification_url:
         payload["NotificationURL"] = notification_url
-    success_url = resolve_tbank_success_url()
+    success_url = add_request_id_to_url(resolve_tbank_success_url(), request_id)
     if success_url:
         payload["SuccessURL"] = success_url
-    fail_url = resolve_tbank_fail_url()
+    fail_url = add_request_id_to_url(resolve_tbank_fail_url(), request_id)
     if fail_url:
         payload["FailURL"] = fail_url
 
@@ -1224,6 +1252,27 @@ async def tbank_init_payment(
     if not isinstance(payment_url, str) or not payment_url:
         raise RuntimeError(f"T-Bank Init missing PaymentURL: {data}")
     return payment_url, scalar_string(payment_id)
+
+
+async def tbank_get_state(payment_id: str) -> dict[str, Any]:
+    if not tbank_enabled():
+        raise RuntimeError("T-Bank credentials are not configured.")
+    if not payment_id:
+        raise RuntimeError("Empty PaymentId.")
+
+    payload: dict[str, Any] = {
+        "TerminalKey": TBANK_TERMINAL_KEY,
+        "PaymentId": payment_id,
+    }
+    payload["Token"] = tbank_token_from_payload(payload, TBANK_PASSWORD)
+    session = await get_session()
+    async with session.post(TBANK_GET_STATE_URL, json=payload) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status >= 400:
+            raise RuntimeError(f"T-Bank GetState HTTP {resp.status}: {data}")
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid T-Bank GetState response.")
+    return data
 
 
 async def activate_payment_request(request_id: int, source: str) -> tuple[bool, str]:
@@ -1805,6 +1854,95 @@ async def landing_refund() -> FileResponse:
 @app.get("/contacts", response_class=FileResponse)
 async def landing_contacts() -> FileResponse:
     return FileResponse(site_file("contacts.html"))
+
+
+def payment_status_view(request_id: int | None) -> dict[str, Any]:
+    if request_id is None:
+        return {
+            "known": False,
+            "status": "unknown",
+            "title": "Заявка не найдена",
+            "message": "Не удалось определить номер заявки. Вернись в бот и нажми «Тарифы».",
+        }
+
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return {
+            "known": False,
+            "request_id": request_id,
+            "status": "unknown",
+            "title": "Заявка не найдена",
+            "message": "Такой заявки нет. Создай новую оплату в боте.",
+        }
+
+    status = str(payment.get("status", "pending")).lower()
+    titles = {
+        "pending": "Платеж создан",
+        "claimed": "Проверяем оплату",
+        "paid": "Оплата подтверждена",
+        "canceled": "Оплата отменена",
+    }
+    messages = {
+        "pending": "Платеж в обработке. Обычно подтверждение приходит в течение 1-2 минут.",
+        "claimed": "Банк прислал сигнал, подтверждаем оплату. Обычно это занимает до 1-2 минут.",
+        "paid": "Подписка уже активирована. Можно возвращаться в бот.",
+        "canceled": "Оплата не была завершена. Вернись в бот и попробуй еще раз.",
+    }
+    return {
+        "known": True,
+        "request_id": request_id,
+        "status": status,
+        "title": titles.get(status, "Статус обновляется"),
+        "message": messages.get(status, "Подожди немного и обнови страницу."),
+        "plan": str(payment.get("plan", "")),
+        "amount_rub": int(payment.get("amount_rub", 0)),
+    }
+
+
+@app.get("/payment/status")
+async def payment_status(request_id: int | None = None) -> dict[str, Any]:
+    view = payment_status_view(request_id)
+    if request_id is None or not view.get("known"):
+        return view
+
+    if view["status"] not in {"pending", "claimed"}:
+        return view
+
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return payment_status_view(request_id)
+
+    payment_id = tbank_payment_id_from_provider_ref(str(payment.get("provider_ref", "")))
+    if not payment_id or not tbank_enabled():
+        return view
+
+    try:
+        state_payload = await tbank_get_state(payment_id)
+        bank_status = scalar_string(state_payload.get("Status")).upper()
+        bank_success_raw = state_payload.get("Success")
+        bank_success = bank_success_raw is True or scalar_string(bank_success_raw).lower() == "true"
+
+        if bank_success and bank_status == "CONFIRMED":
+            await activate_payment_request(request_id, source="T-Bank GetState")
+        elif bank_status in {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}:
+            state.user_store.set_payment_status(request_id, "canceled")
+
+        refreshed = payment_status_view(request_id)
+        refreshed["bank_status"] = bank_status.lower() if bank_status else ""
+        return refreshed
+    except Exception:
+        log.exception("T-Bank GetState failed for request_id=%s", request_id)
+        return view
+
+
+@app.get("/payment/success", response_class=FileResponse)
+async def payment_success_page() -> FileResponse:
+    return FileResponse(site_file("payment_success.html"))
+
+
+@app.get("/payment/fail", response_class=FileResponse)
+async def payment_fail_page() -> FileResponse:
+    return FileResponse(site_file("payment_fail.html"))
 
 
 @app.post("/webhook/max")

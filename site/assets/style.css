@@ -144,3 +144,38 @@ code {
   border-radius: 8px;
   padding: 2px 6px;
 }
+
+.payment-card {
+  max-width: 700px;
+  margin: 20px auto 0;
+}
+
+.status-pill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: #eef3ff;
+  color: #20439a;
+}
+
+.status-pill.paid {
+  background: #e7f8f1;
+  border-color: #b8ead4;
+  color: #0b7a53;
+}
+
+.status-pill.pending,
+.status-pill.claimed {
+  background: #eef3ff;
+  border-color: #d4e2ff;
+  color: #1e4fc8;
+}
+
+.status-pill.canceled,
+.status-pill.unknown {
+  background: #fff0f1;
+  border-color: #ffd1d5;
+  color: #b82b3d;
+}

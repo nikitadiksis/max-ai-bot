@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Оплата принята</title>
+  <meta name="description" content="Статус оплаты подписки AI-бота в MAX." />
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <section class="card payment-card">
+      <div class="top">
+        <span class="badge">Оплата подписки</span>
+        <span class="badge">T-Банк</span>
+      </div>
+      <h1 id="status-title">Платеж отправлен</h1>
+      <p id="status-message">Проверяем подтверждение от банка. Обычно это занимает до 1-2 минут.</p>
+
+      <article class="tile">
+        <strong>Детали</strong>
+        <p>Заявка: <code id="request-id">—</code></p>
+        <p>Статус: <span id="status-badge" class="status-pill pending">pending</span></p>
+      </article>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="https://max.ru/" target="_blank" rel="noopener">Открыть MAX</a>
+        <a class="btn" href="/">На главную</a>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const requestId = params.get("request_id");
+    const titleEl = document.getElementById("status-title");
+    const messageEl = document.getElementById("status-message");
+    const requestEl = document.getElementById("request-id");
+    const badgeEl = document.getElementById("status-badge");
+    requestEl.textContent = requestId || "не передан";
+
+    function paintStatus(status) {
+      badgeEl.className = "status-pill " + (status || "unknown");
+      badgeEl.textContent = status || "unknown";
+    }
+
+    async function refreshStatus() {
+      const qs = requestId ? ("?request_id=" + encodeURIComponent(requestId)) : "";
+      try {
+        const resp = await fetch("/payment/status" + qs, { cache: "no-store" });
+        const data = await resp.json();
+        titleEl.textContent = data.title || "Статус оплаты";
+        messageEl.textContent = data.message || "Проверяем оплату.";
+        paintStatus(data.status);
+      } catch (_) {
+        titleEl.textContent = "Проверяем оплату";
+        messageEl.textContent = "Связь нестабильна. Обнови страницу через 10-20 секунд.";
+        paintStatus("unknown");
+      }
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus, 4000);
+  </script>
+</body>
+</html>
