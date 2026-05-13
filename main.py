@@ -794,7 +794,7 @@ def build_keyboard() -> list[dict[str, Any]]:
                     ],
                     [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                        {"type": "callback", "text": "Очистить", "payload": "action:clear"},
+                        {"type": "callback", "text": "Сброс", "payload": "action:clear"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
