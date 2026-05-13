@@ -840,6 +840,28 @@ def require_env() -> None:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
+def validate_pricing_sanity() -> None:
+    if PRO_PLAN_PRICE_RUB <= 0 or credits_for_plan("pro") <= 0:
+        log.warning("Pricing sanity skipped: invalid Pro plan price/credits.")
+        return
+
+    pro_ratio = credits_for_plan("pro") / float(PRO_PLAN_PRICE_RUB)
+    for code, pack in TOPUP_PACKS.items():
+        price = int(pack.get("price_rub", 0) or 0)
+        credits = int(pack.get("credits", 0) or 0)
+        if price <= 0 or credits <= 0:
+            log.warning("Top-up pack %s has invalid config: price=%s credits=%s", code, price, credits)
+            continue
+        ratio = credits / float(price)
+        if ratio >= pro_ratio:
+            log.warning(
+                "Top-up pack %s is too generous: %.4f credits/RUB >= Pro %.4f credits/RUB",
+                code,
+                ratio,
+                pro_ratio,
+            )
+
+
 def load_model_registry() -> tuple[dict[str, ModelInfo], dict[str, ModelInfo]]:
     with CONFIG_PATH.open("r", encoding="utf-8") as fh:
         raw = json.load(fh)
@@ -3577,6 +3599,7 @@ async def polling_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     require_env()
+    validate_pricing_sanity()
     await get_session()
     if RUN_MODE == "polling":
         state.polling_task = asyncio.create_task(polling_loop())
