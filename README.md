@@ -132,6 +132,8 @@ Admin (`ADMIN_IDS` only):
 - `/admin sub <chat_id> <lite|start|pro> <days>`
 - `/admin block <chat_id> <on|off>`
 - `/admin pay <request_id> <paid|cancel>`
+- `/admin templates`
+- `/admin kpi [days]`
 - `/costs`
 
 ## Deploy (Docker)

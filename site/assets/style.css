@@ -166,6 +166,12 @@ code {
   color: #0b7a53;
 }
 
+.status-pill.refunded {
+  background: #f2efff;
+  border-color: #d7cdfc;
+  color: #5e44c6;
+}
+
 .status-pill.pending,
 .status-pill.claimed {
   background: #eef3ff;

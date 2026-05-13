@@ -20,7 +20,8 @@
       <article class="tile">
         <strong>Детали</strong>
         <p>Заявка: <code id="request-id">—</code></p>
-        <p>Статус: <span id="status-badge" class="status-pill canceled">canceled</span></p>
+        <p>Статус: <span id="status-badge" class="status-pill canceled">Отменено</span></p>
+        <p id="bank-status-row" hidden>Статус банка: <span id="bank-status">—</span></p>
       </article>
 
       <div class="actions">
@@ -38,11 +39,23 @@
     const messageEl = document.getElementById("status-message");
     const requestEl = document.getElementById("request-id");
     const badgeEl = document.getElementById("status-badge");
+    const bankStatusRowEl = document.getElementById("bank-status-row");
+    const bankStatusEl = document.getElementById("bank-status");
     requestEl.textContent = requestId || "не передан";
 
-    function paintStatus(status) {
+    function paintStatus(status, statusLabel) {
       badgeEl.className = "status-pill " + (status || "unknown");
-      badgeEl.textContent = status || "unknown";
+      badgeEl.textContent = statusLabel || status || "Статус обновляется";
+    }
+
+    function paintBankStatus(bankStatus) {
+      if (!bankStatus) {
+        bankStatusRowEl.hidden = true;
+        bankStatusEl.textContent = "—";
+        return;
+      }
+      bankStatusRowEl.hidden = false;
+      bankStatusEl.textContent = bankStatus;
     }
 
     async function refreshStatus() {
@@ -52,11 +65,13 @@
         const data = await resp.json();
         titleEl.textContent = data.title || "Статус оплаты";
         messageEl.textContent = data.message || "Проверяем оплату.";
-        paintStatus(data.status);
+        paintStatus(data.status, data.status_label);
+        paintBankStatus(data.bank_status || "");
       } catch (_) {
         titleEl.textContent = "Статус оплаты";
         messageEl.textContent = "Не удалось получить статус. Проверь в боте раздел «Мой план».";
-        paintStatus("unknown");
+        paintStatus("unknown", "Неизвестно");
+        paintBankStatus("");
       }
     }
 

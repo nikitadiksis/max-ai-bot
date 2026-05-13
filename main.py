@@ -123,6 +123,16 @@ TBANK_RECEIPT_PAYMENT_OBJECT = os.getenv("TBANK_RECEIPT_PAYMENT_OBJECT", "servic
 TBANK_RECEIPT_FFD_VERSION = os.getenv("TBANK_RECEIPT_FFD_VERSION", "1.05").strip()
 TBANK_CANCEL_STATUSES = {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}
 TBANK_REFUND_STATUSES = {"REFUNDED", "REVERSED", "PARTIAL_REVERSED", "PARTIAL_REFUNDED", "CHARGEDBACK"}
+TBANK_SUCCESS_STATUSES = {"CONFIRMED"}
+PAYMENT_FINAL_STATUSES = {"paid", "canceled", "refunded"}
+PAYMENT_STATUS_LABELS = {
+    "pending": "Ожидает оплату",
+    "claimed": "Проверка оплаты",
+    "paid": "Оплачено",
+    "canceled": "Отменено",
+    "refunded": "Возврат",
+    "unknown": "Неизвестно",
+}
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip()
@@ -206,6 +216,7 @@ ADMIN_HELP_TEXT = (
     "/admin sub <chat_id> <lite|start|pro> <days>\n"
     "/admin block <chat_id> <on|off>\n"
     "/admin pay <request_id> <paid|cancel>\n"
+    "/admin templates\n"
     "/admin kpi [days]\n"
     "/costs — модели и цены"
 )
@@ -1175,7 +1186,55 @@ def support_help_text() -> str:
         "3. Открой «Мой план» и проверь статус.\n\n"
         f"{SUPPORT_TEXT}\n"
         f"Ссылка: {support_url_value()}\n\n"
-        "FAQ: страница «Помощь»"
+        "FAQ: страница «Помощь»\n\n"
+        "Шаблоны для обращения в поддержку:\n"
+        "• «Оплатил, но доступ не открылся. Номер заявки: #123. Время оплаты: 14:32 МСК. Приложил скрин.»\n"
+        "• «Платеж не проходит. Номер заявки: #123. Банк пишет: <текст ошибки>.»\n"
+        "• «Прошу оформить возврат по заявке #123. Причина: <кратко>.»"
+    )
+
+
+def support_admin_templates_text() -> str:
+    return (
+        "Шаблоны для спорных кейсов\n\n"
+        "1) Оплата есть, доступа нет:\n"
+        "«Проверили оплату по заявке #{request_id}. Статус в банке: {bank_status}. "
+        "Доступ обновлен, проверь раздел “Мой план”. Если не обновилось — напишите нам, проверим вручную.»\n\n"
+        "2) Оплата не прошла:\n"
+        "«По заявке #{request_id} банк вернул статус {bank_status}. Оплата не завершена. "
+        "Создайте новую заявку в разделе “Тарифы” и повторите оплату.»\n\n"
+        "3) Возврат подтвержден:\n"
+        "«По заявке #{request_id} оформлен возврат. Подписка переведена на free, автопродление отключено. "
+        "Срок зачисления средств зависит от банка-эмитента.»\n\n"
+        "4) Чарджбэк/спор:\n"
+        "«Получили запрос на оспаривание платежа по заявке #{request_id}. "
+        "Для проверки пришлите дату/время оплаты и скрин подтверждения операции.»"
+    )
+
+
+def payment_status_label(status: str) -> str:
+    return PAYMENT_STATUS_LABELS.get(status.strip().lower(), "Статус обновляется")
+
+
+def payment_status_title_message(status: str) -> tuple[str, str]:
+    key = status.strip().lower()
+    titles = {
+        "pending": "Платеж создан",
+        "claimed": "Проверяем оплату",
+        "paid": "Оплата подтверждена",
+        "canceled": "Оплата не завершена",
+        "refunded": "Оформлен возврат",
+    }
+    messages = {
+        "pending": "Платеж в обработке. Обычно подтверждение приходит в течение 1-2 минут.",
+        "claimed": "Банк прислал сигнал, подтверждаем оплату. Обычно это занимает до 1-2 минут.",
+        "paid": "Подписка уже активирована. Можно возвращаться в бот.",
+        "canceled": "Оплата не была завершена. Вернись в бот и попробуй еще раз.",
+        "refunded": "Возврат подтвержден. Подписка отключена, действует тариф free.",
+    }
+    return (
+        titles.get(key, "Статус обновляется"),
+        messages.get(key, "Подожди немного и обнови страницу."),
     )
 
 
@@ -2566,8 +2625,10 @@ async def send_payments(chat_id: int) -> None:
         return
     lines = ["Твои последние заявки:"]
     for item in rows:
+        status = str(item["status"]).lower()
+        status_human = payment_status_label(status)
         lines.append(
-            f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {item['status']} | {item['created_at'][:19]}"
+            f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
         )
     await max_send_message(chat_id, "\n".join(lines), attachments=build_keyboard())
 
@@ -2772,6 +2833,42 @@ async def tbank_get_state(payment_id: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError("Invalid T-Bank GetState response.")
     return data
+
+
+def cancel_payment_if_open(request_id: int) -> tuple[bool, str]:
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return False, "not found"
+    current_status = str(payment.get("status", "")).lower()
+    if current_status in PAYMENT_FINAL_STATUSES:
+        return False, f"already {current_status}"
+    state.user_store.set_payment_status(request_id, "canceled")
+    return True, "canceled"
+
+
+async def refresh_payment_from_tbank(request_id: int, source: str) -> tuple[dict[str, Any] | None, str]:
+    payment = state.user_store.get_payment(request_id)
+    if not payment:
+        return None, ""
+
+    provider_ref = str(payment.get("provider_ref", ""))
+    payment_id = tbank_payment_id_from_provider_ref(provider_ref)
+    if not payment_id or not tbank_enabled():
+        return payment, ""
+
+    payload = await tbank_get_state(payment_id)
+    bank_status = scalar_string(payload.get("Status")).upper()
+    bank_success_raw = payload.get("Success")
+    bank_success = bank_success_raw is True or scalar_string(bank_success_raw).lower() == "true"
+
+    if bank_success and bank_status in TBANK_SUCCESS_STATUSES:
+        await activate_payment_request(request_id, source=source)
+    elif tbank_is_refund_status(bank_status):
+        await process_refund_payment_request(request_id, source=source, bank_status=bank_status)
+    elif tbank_is_cancel_status(bank_status):
+        cancel_payment_if_open(request_id)
+
+    return state.user_store.get_payment(request_id), bank_status
 
 
 async def activate_payment_request(request_id: int, source: str) -> tuple[bool, str]:
@@ -3033,6 +3130,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             "/admin sub <chat_id> <lite|start|pro> <days>\n"
             "/admin block <chat_id> <on|off>\n"
             "/admin pay <request_id> <paid|cancel>\n"
+            "/admin templates\n"
             "/admin kpi [days]",
         )
         return True
@@ -3128,6 +3226,10 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             days = int(parts[2])
         report = state.user_store.kpi_report(days=days)
         await max_send_message(chat_id, format_kpi_report(report))
+        return True
+
+    if action == "templates":
+        await max_send_message(chat_id, support_admin_templates_text())
         return True
 
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
@@ -3431,14 +3533,56 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Заявка не найдена")
             await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        status = str(payment["status"])
+        status = str(payment["status"]).lower()
         provider_ref = str(payment.get("provider_ref", ""))
         if provider_ref.startswith("tbank:") and status == "pending":
+            try:
+                payment, bank_status = await refresh_payment_from_tbank(request_id, source="T-Bank GetState (user button)")
+            except Exception:
+                log.exception("T-Bank GetState failed from paid button for request_id=%s", request_id)
+                if callback_id:
+                    await answer_callback(callback_id, "проверка банка")
+                await max_send_message(
+                    chat_id,
+                    (
+                        "Не удалось мгновенно получить ответ от банка.\n"
+                        "Платеж продолжает проверяться автоматически, обычно до 1-2 минут."
+                    ),
+                    attachments=build_tariffs_keyboard_pricing(),
+                    notify=False,
+                )
+                return True
+
+            refreshed_status = str((payment or {}).get("status", "pending")).lower()
+            if refreshed_status == "paid":
+                if callback_id:
+                    await answer_callback(callback_id, "Оплата подтверждена")
+                await max_send_message(chat_id, "Оплата подтверждена. Подписка уже активирована.", attachments=build_keyboard(), notify=False)
+                return True
+            if refreshed_status == "refunded":
+                if callback_id:
+                    await answer_callback(callback_id, "Возврат")
+                await max_send_message(chat_id, "Банк отметил возврат по этой заявке.", attachments=build_keyboard(), notify=False)
+                return True
+            if refreshed_status == "canceled":
+                if callback_id:
+                    await answer_callback(callback_id, "Оплата отменена")
+                await max_send_message(
+                    chat_id,
+                    "Оплата по этой заявке не завершена. Создай новую заявку в «Тарифы».",
+                    attachments=build_tariffs_keyboard_pricing(),
+                    notify=False,
+                )
+                return True
             if callback_id:
                 await answer_callback(callback_id, "ожидаем банк")
             await max_send_message(
                 chat_id,
-                "Платеж проверяется автоматически через Т-Банк. Обычно это занимает до 1-2 минут.",
+                (
+                    "Платеж еще в обработке банка.\n"
+                    f"Текущий статус банка: {bank_status or 'pending'}.\n"
+                    "Обычно подтверждение приходит в течение 1-2 минут."
+                ),
                 attachments=build_tariffs_keyboard_pricing(),
                 notify=False,
             )
@@ -3883,6 +4027,7 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
         return {
             "known": False,
             "status": "unknown",
+            "status_label": payment_status_label("unknown"),
             "title": "Заявка не найдена",
             "message": "Не удалось определить номер заявки. Вернись в бот и нажми «Тарифы».",
         }
@@ -3893,31 +4038,20 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
             "known": False,
             "request_id": request_id,
             "status": "unknown",
+            "status_label": payment_status_label("unknown"),
             "title": "Заявка не найдена",
             "message": "Такой заявки нет. Создай новую оплату в боте.",
         }
 
     status = str(payment.get("status", "pending")).lower()
-    titles = {
-        "pending": "Платеж создан",
-        "claimed": "Проверяем оплату",
-        "paid": "Оплата подтверждена",
-        "canceled": "Оплата отменена",
-        "refunded": "Оформлен возврат",
-    }
-    messages = {
-        "pending": "Платеж в обработке. Обычно подтверждение приходит в течение 1-2 минут.",
-        "claimed": "Банк прислал сигнал, подтверждаем оплату. Обычно это занимает до 1-2 минут.",
-        "paid": "Подписка уже активирована. Можно возвращаться в бот.",
-        "canceled": "Оплата не была завершена. Вернись в бот и попробуй еще раз.",
-        "refunded": "Возврат подтвержден. Подписка отключена, действует тариф free.",
-    }
+    title, message = payment_status_title_message(status)
     return {
         "known": True,
         "request_id": request_id,
         "status": status,
-        "title": titles.get(status, "Статус обновляется"),
-        "message": messages.get(status, "Подожди немного и обнови страницу."),
+        "status_label": payment_status_label(status),
+        "title": title,
+        "message": message,
         "plan": str(payment.get("plan", "")),
         "amount_rub": int(payment.get("amount_rub", 0)),
     }
@@ -3932,29 +4066,10 @@ async def payment_status(request_id: int | None = None) -> dict[str, Any]:
     if view["status"] not in {"pending", "claimed", "paid"}:
         return view
 
-    payment = state.user_store.get_payment(request_id)
-    if not payment:
-        return payment_status_view(request_id)
-
-    payment_id = tbank_payment_id_from_provider_ref(str(payment.get("provider_ref", "")))
-    if not payment_id or not tbank_enabled():
-        return view
-
     try:
-        state_payload = await tbank_get_state(payment_id)
-        bank_status = scalar_string(state_payload.get("Status")).upper()
-        bank_success_raw = state_payload.get("Success")
-        bank_success = bank_success_raw is True or scalar_string(bank_success_raw).lower() == "true"
-
-        if bank_success and bank_status == "CONFIRMED":
-            await activate_payment_request(request_id, source="T-Bank GetState")
-        elif tbank_is_refund_status(bank_status):
-            await process_refund_payment_request(request_id, source="T-Bank GetState", bank_status=bank_status)
-        elif tbank_is_cancel_status(bank_status):
-            state.user_store.set_payment_status(request_id, "canceled")
-
+        _, bank_status = await refresh_payment_from_tbank(request_id, source="T-Bank GetState")
         refreshed = payment_status_view(request_id)
-        refreshed["bank_status"] = bank_status.lower() if bank_status else ""
+        refreshed["bank_status"] = bank_status
         return refreshed
     except Exception:
         log.exception("T-Bank GetState failed for request_id=%s", request_id)
@@ -4018,8 +4133,11 @@ async def tbank_webhook(request: Request) -> PlainTextResponse:
         else:
             log.info("T-Bank refund ignored request_id=%s reason=%s", request_id, info)
     elif request_id is not None and tbank_is_cancel_status(status):
-        state.user_store.set_payment_status(request_id, "canceled")
-        log.info("T-Bank payment canceled request_id=%s status=%s", request_id, status)
+        changed, info = cancel_payment_if_open(request_id)
+        if changed:
+            log.info("T-Bank payment canceled request_id=%s status=%s", request_id, status)
+        else:
+            log.info("T-Bank cancel ignored request_id=%s reason=%s", request_id, info)
 
     return PlainTextResponse("OK")
 
