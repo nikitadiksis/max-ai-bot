@@ -1550,7 +1550,14 @@ async def tbank_init_payment(
     if not isinstance(data, dict):
         raise RuntimeError("Invalid T-Bank Init response.")
     if not data.get("Success"):
-        raise RuntimeError(f"T-Bank Init failed: {data.get('Message') or data.get('Details') or data}")
+        error_code = scalar_string(data.get("ErrorCode"))
+        message = scalar_string(data.get("Message"))
+        details = scalar_string(data.get("Details"))
+        parts = [part for part in [error_code and f"code={error_code}", message, details] if part]
+        reason = " | ".join(parts) if parts else str(data)
+        if error_code == "251":
+            reason = f"{reason} | Сумма ниже минимальной для терминала."
+        raise RuntimeError(f"T-Bank Init failed: {reason}")
     payment_url = data.get("PaymentURL")
     payment_id = data.get("PaymentId")
     if not isinstance(payment_url, str) or not payment_url:
