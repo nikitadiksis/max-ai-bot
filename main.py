@@ -141,6 +141,19 @@ STYLE_PROMPTS = {
 PLAN_ORDER = {"free": 0, "lite": 1, "start": 2, "pro": 3}
 PAID_PLANS = {"lite", "start", "pro"}
 BUYABLE_PLANS = {"lite", "start", "pro"}
+IMAGE_STYLE_OPTIONS: dict[str, tuple[str, str]] = {
+    "auto": ("Авто", ""),
+    "photo": ("Фото", "photorealistic style, natural lighting"),
+    "anime": ("Аниме", "anime style, clean line art"),
+    "art": ("Арт", "digital art illustration, cinematic composition"),
+}
+IMAGE_ASPECT_OPTIONS: dict[str, tuple[str, str]] = {
+    "square": ("1:1", "square composition"),
+    "portrait": ("9:16", "vertical composition"),
+    "landscape": ("16:9", "horizontal composition"),
+}
+DEFAULT_IMAGE_STYLE = "auto"
+DEFAULT_IMAGE_ASPECT = "square"
 
 WELCOME_TEXT = (
     "Привет. Это твой AI-бот в MAX.\n\n"
@@ -153,6 +166,7 @@ WELCOME_TEXT = (
 
 MENU_TEXT = (
     "Кнопки ниже — основной способ пользоваться ботом.\n"
+    "Для генерации картинки нажми «🎨 Картинка».\n"
     "Если нужен список команд, отправь /help.\n"
     "Если проблема с оплатой — нажми «Помощь» или отправь /support."
 )
@@ -696,6 +710,8 @@ class BotState:
     def __init__(self) -> None:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
         self.pending_receipt_plan: dict[int, str] = {}
+        self.pending_image_prompt: set[int] = set()
+        self.image_request_prefs: dict[int, dict[str, str]] = {}
         self.processed_updates: deque[str] = deque()
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
@@ -1076,10 +1092,98 @@ def build_keyboard() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "Сброс", "payload": "action:clear"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
+                    [
+                        {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+                    ],
                 ]
             },
         }
     ]
+
+
+def get_image_prefs(chat_id: int) -> dict[str, str]:
+    prefs = state.image_request_prefs.get(chat_id)
+    if not isinstance(prefs, dict):
+        prefs = {}
+    style = str(prefs.get("style", DEFAULT_IMAGE_STYLE)).strip().lower()
+    aspect = str(prefs.get("aspect", DEFAULT_IMAGE_ASPECT)).strip().lower()
+    if style not in IMAGE_STYLE_OPTIONS:
+        style = DEFAULT_IMAGE_STYLE
+    if aspect not in IMAGE_ASPECT_OPTIONS:
+        aspect = DEFAULT_IMAGE_ASPECT
+    normalized = {"style": style, "aspect": aspect}
+    state.image_request_prefs[chat_id] = normalized
+    return normalized
+
+
+def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
+    prefs = get_image_prefs(chat_id)
+    current_style = prefs["style"]
+    current_aspect = prefs["aspect"]
+
+    style_buttons: list[dict[str, Any]] = []
+    for key in ("auto", "photo", "anime", "art"):
+        label = IMAGE_STYLE_OPTIONS[key][0]
+        prefix = "● " if key == current_style else ""
+        style_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_style:{key}"})
+
+    aspect_buttons: list[dict[str, Any]] = []
+    for key in ("square", "portrait", "landscape"):
+        label = IMAGE_ASPECT_OPTIONS[key][0]
+        prefix = "● " if key == current_aspect else ""
+        aspect_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_aspect:{key}"})
+
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    style_buttons[:2],
+                    style_buttons[2:],
+                    aspect_buttons,
+                    [
+                        {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_image_prompt_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "Отмена", "payload": "image_prompt:cancel"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def image_params_summary(chat_id: int) -> str:
+    prefs = get_image_prefs(chat_id)
+    style_label = IMAGE_STYLE_OPTIONS[prefs["style"]][0]
+    aspect_label = IMAGE_ASPECT_OPTIONS[prefs["aspect"]][0]
+    return f"Стиль: {style_label}\nФормат: {aspect_label}"
+
+
+def build_image_prompt(user_text: str, chat_id: int) -> str:
+    prefs = get_image_prefs(chat_id)
+    style_instruction = IMAGE_STYLE_OPTIONS[prefs["style"]][1]
+    aspect_instruction = IMAGE_ASPECT_OPTIONS[prefs["aspect"]][1]
+    instructions = [part for part in (style_instruction, aspect_instruction) if part]
+    if not instructions:
+        return user_text
+    return f"{user_text}\n\nStyle constraints: {', '.join(instructions)}."
 
 
 def build_tariffs_keyboard() -> list[dict[str, Any]]:
@@ -1709,10 +1813,11 @@ async def upload_image_to_max(image_bytes: bytes, mime_type: str) -> dict[str, A
         return body
 
 
-async def send_generated_image(chat_id: int, prompt: str, image: ImageResult) -> None:
+async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, display_prompt: str | None = None) -> None:
     attachment_payload = await upload_image_to_max(image.image_bytes, image.mime_type)
     attachment = {"type": "image", "payload": attachment_payload}
-    await max_send_message(chat_id, f"Готово. Вот картинка по запросу:\n{prompt}", attachments=[attachment])
+    shown_prompt = display_prompt or prompt
+    await max_send_message(chat_id, f"Готово. Вот картинка по запросу:\n{shown_prompt}", attachments=[attachment])
 
 
 async def fetch_image_bytes(url: str) -> ImageResult:
@@ -1790,6 +1895,90 @@ def current_model_label(chat_id: int) -> str:
     selected = row["selected_model_alias"] or best_default_alias_for_plan(row["plan"])
     model = TEXT_MODELS.get(selected, DEFAULT_TEXT_MODEL)
     return model.label
+
+
+async def send_image_menu(chat_id: int, notify: bool = False) -> None:
+    text = (
+        "Генерация картинки\n\n"
+        f"{image_params_summary(chat_id)}\n\n"
+        "Выбери стиль и формат, затем нажми «Сгенерировать»."
+    )
+    await max_send_message(chat_id, text, attachments=build_image_menu_keyboard(chat_id), notify=notify)
+
+
+async def process_image_generation(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
+    prompt = user_prompt.strip()
+    if not prompt:
+        await max_send_message(chat_id, "Опиши, что нужно сгенерировать.", attachments=build_image_prompt_keyboard())
+        return True
+    if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+        await max_send_message(
+            chat_id,
+            f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.",
+            attachments=build_keyboard(),
+        )
+        return True
+
+    ok_cd, reason_cd = check_cooldown(chat_id, "image")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+
+    row = user_profile(chat_id)
+    if not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+        await max_send_message(
+            chat_id,
+            f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+            attachments=build_tariffs_keyboard_pricing(),
+        )
+        return True
+
+    ok, reason = check_limit_only(chat_id, "images")
+    if not ok:
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+
+    img_cost = image_credit_cost()
+    ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
+    if not ok_credit:
+        await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+        return True
+
+    ok, reason = check_and_consume_limit(chat_id, "images")
+    if not ok:
+        state.user_store.refund_credits(chat_id, img_cost)
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+
+    await max_send_message(chat_id, "Генерирую картинку, это может занять немного времени...")
+    request_for_model = model_prompt or prompt
+    try:
+        image = await generate_image(request_for_model)
+        await send_generated_image(chat_id, request_for_model, image, display_prompt=prompt)
+    except Exception:
+        state.user_store.refund_credits(chat_id, img_cost)
+        raise
+    return True
+
+
+async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
+    if chat_id not in state.pending_image_prompt:
+        return False
+
+    lowered = text.strip().lower()
+    if lowered in {"отмена", "cancel", "/cancel", "стоп", "/stop"}:
+        state.pending_image_prompt.discard(chat_id)
+        await max_send_message(chat_id, "Ок, генерацию отменил.", attachments=build_image_menu_keyboard(chat_id))
+        return True
+
+    if text.strip().startswith("/"):
+        state.pending_image_prompt.discard(chat_id)
+        return False
+
+    state.pending_image_prompt.discard(chat_id)
+    prepared_prompt = build_image_prompt(text.strip(), chat_id)
+    await process_image_generation(chat_id, text.strip(), model_prompt=prepared_prompt)
+    return True
 
 
 async def send_help(chat_id: int) -> None:
@@ -2492,6 +2681,61 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await max_send_message(chat_id, support_help_text(), attachments=build_keyboard(), notify=False)
         return True
 
+    if payload == "action:image_menu":
+        if callback_id:
+            await answer_callback(callback_id, "Параметры картинки")
+        await send_image_menu(chat_id)
+        return True
+
+    if payload.startswith("image_style:"):
+        style = payload.split(":", 1)[1].strip().lower()
+        if style not in IMAGE_STYLE_OPTIONS:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный стиль")
+            return True
+        prefs = get_image_prefs(chat_id)
+        prefs["style"] = style
+        state.image_request_prefs[chat_id] = prefs
+        if callback_id:
+            await answer_callback(callback_id, f"Стиль: {IMAGE_STYLE_OPTIONS[style][0]}")
+        await send_image_menu(chat_id)
+        return True
+
+    if payload.startswith("image_aspect:"):
+        aspect = payload.split(":", 1)[1].strip().lower()
+        if aspect not in IMAGE_ASPECT_OPTIONS:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный формат")
+            return True
+        prefs = get_image_prefs(chat_id)
+        prefs["aspect"] = aspect
+        state.image_request_prefs[chat_id] = prefs
+        if callback_id:
+            await answer_callback(callback_id, f"Формат: {IMAGE_ASPECT_OPTIONS[aspect][0]}")
+        await send_image_menu(chat_id)
+        return True
+
+    if payload == "image_prompt:start":
+        state.pending_image_prompt.add(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Жду описание")
+        await max_send_message(
+            chat_id,
+            "Напиши, что нарисовать одним сообщением.\n\n"
+            f"{image_params_summary(chat_id)}\n"
+            "Чтобы отменить — нажми «Отмена» или отправь /cancel.",
+            attachments=build_image_prompt_keyboard(),
+            notify=False,
+        )
+        return True
+
+    if payload == "image_prompt:cancel":
+        state.pending_image_prompt.discard(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Отменено")
+        await send_image_menu(chat_id)
+        return True
+
     if payload == "sub_cancel:start":
         row = user_profile(chat_id)
         if row.get("plan") == "free" or not recurring_enabled_for_row(row):
@@ -2759,54 +3003,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/image":
         if not arg:
-            await max_send_message(chat_id, "Пример: /image неоновый город под дождем", attachments=build_keyboard())
+            await send_image_menu(chat_id)
             return True
-        if len(arg) > MAX_IMAGE_PROMPT_CHARS:
-            await max_send_message(
-                chat_id,
-                f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.",
-                attachments=build_keyboard(),
-            )
-            return True
-        ok_cd, reason_cd = check_cooldown(chat_id, "image")
-        if not ok_cd:
-            await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
-            return True
-
-        row = user_profile(chat_id)
-        if not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
-            await max_send_message(
-                chat_id,
-                f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
-                attachments=build_keyboard(),
-            )
-            return True
-
-        ok, reason = check_limit_only(chat_id, "images")
-        if not ok:
-            await max_send_message(chat_id, reason, attachments=build_keyboard())
-            return True
-
-        img_cost = image_credit_cost()
-        ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
-        if not ok_credit:
-            await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
-            return True
-
-        ok, reason = check_and_consume_limit(chat_id, "images")
-        if not ok:
-            state.user_store.refund_credits(chat_id, img_cost)
-            await max_send_message(chat_id, reason, attachments=build_keyboard())
-            return True
-
-        await max_send_message(chat_id, "Генерирую картинку, это может занять немного времени...")
-        try:
-            image = await generate_image(arg)
-            await send_generated_image(chat_id, arg, image)
-        except Exception:
-            state.user_store.refund_credits(chat_id, img_cost)
-            raise
-        return True
+        prepared_prompt = build_image_prompt(arg, chat_id)
+        return await process_image_generation(chat_id, arg, model_prompt=prepared_prompt)
 
     if command.startswith("/admin"):
         return await handle_admin(chat_id, text)
@@ -2882,6 +3082,8 @@ async def process_update(update: dict[str, Any]) -> None:
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
     try:
         if await handle_pending_receipt_input(chat_id, text):
+            return
+        if await handle_pending_image_prompt_input(chat_id, text):
             return
         if await handle_command(chat_id, text):
             return
