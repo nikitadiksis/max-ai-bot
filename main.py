@@ -765,7 +765,7 @@ def build_keyboard() -> list[dict[str, Any]]:
 
 
 def build_tariffs_keyboard() -> list[dict[str, Any]]:
-    return build_tariffs_keyboard_v2()
+    return build_tariffs_keyboard_pricing()
 
 
 def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
@@ -799,6 +799,26 @@ def build_payment_request_keyboard(request_id: int) -> list[dict[str, Any]]:
                     ],
                     [
                         {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": f"Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
+                        {"type": "callback", "text": f"Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -958,6 +978,19 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
     if plan == "pro":
         return PRO_PLAN_PRICE_RUB, PRO_PLAN_DAYS
     return 0, 0
+
+
+def build_tariffs_text() -> str:
+    return (
+        "Тарифы:\n"
+        "• free: 40 сообщений/день, 0 картинок/день — бесплатно\n"
+        f"• start: 400 сообщений/день, 12 картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней\n"
+        f"• pro: 2500 сообщений/день, 80 картинок/день — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней\n\n"
+        "Модели по тарифам:\n"
+        "• free: DeepSeek V4 Flash, GPT-4.1 Mini\n"
+        "• start: + Gemini 2.5 Flash\n"
+        "• pro: + GPT-5.4"
+    )
 
 
 async def get_session() -> aiohttp.ClientSession:
@@ -1652,7 +1685,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "action:tariffs":
         if callback_id:
             await answer_callback(callback_id, "Показываю тарифы")
-        await max_send_message(chat_id, TARIFFS_TEXT, attachments=build_tariffs_keyboard_v2(), notify=False)
+        await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), notify=False)
         return True
 
     if payload == "action:menu":
@@ -1727,14 +1760,14 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             state.user_store.set_selected_model(chat_id, best_default_alias_for_plan("free"))
             if callback_id:
                 await answer_callback(callback_id, "Переключено на Free")
-            await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_v2(), notify=False)
+            await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
 
         request_id, msg = await create_buy_request_v2(chat_id, plan)
         if callback_id:
             await answer_callback(callback_id, "Заявка создана")
         if request_id is None:
-            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_v2(), notify=False)
+            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
         return True
@@ -1750,7 +1783,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if not payment or int(payment["chat_id"]) != chat_id:
             if callback_id:
                 await answer_callback(callback_id, "Заявка не найдена")
-            await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_v2(), notify=False)
+            await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         status = str(payment["status"])
         provider_ref = str(payment.get("provider_ref", ""))
@@ -1760,7 +1793,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await max_send_message(
                 chat_id,
                 "Платеж проверяется автоматически через Т-Банк. Обычно это занимает до 1-2 минут.",
-                attachments=build_tariffs_keyboard_v2(),
+                attachments=build_tariffs_keyboard_pricing(),
                 notify=False,
             )
             return True
@@ -1772,12 +1805,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if status == "claimed":
             if callback_id:
                 await answer_callback(callback_id, "already sent")
-            await max_send_message(chat_id, "Заявка уже отправлена админу на проверку.", attachments=build_tariffs_keyboard_v2(), notify=False)
+            await max_send_message(chat_id, "Заявка уже отправлена админу на проверку.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         if status == "canceled":
             if callback_id:
                 await answer_callback(callback_id, "Заявка отменена")
-            await max_send_message(chat_id, "Эта заявка уже отменена.", attachments=build_tariffs_keyboard_v2(), notify=False)
+            await max_send_message(chat_id, "Эта заявка уже отменена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         state.user_store.set_payment_status(request_id, "claimed")
         payment = state.user_store.get_payment(request_id) or payment
@@ -1787,7 +1820,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await max_send_message(
             chat_id,
             "Отметили оплату. Админ проверит платеж и активирует тариф.",
-            attachments=build_tariffs_keyboard_v2(),
+            attachments=build_tariffs_keyboard_pricing(),
             notify=False,
         )
         return True
@@ -1828,7 +1861,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         return True
 
     if command == "/tariffs":
-        await max_send_message(chat_id, TARIFFS_TEXT, attachments=build_tariffs_keyboard_v2())
+        await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing())
         return True
 
     if command == "/plan":
@@ -1841,28 +1874,28 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/buy":
         if not arg:
-            await max_send_message(chat_id, "Выбери тариф кнопками ниже.", attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, "Выбери тариф кнопками ниже.", attachments=build_tariffs_keyboard_pricing())
             return True
         plan = arg.lower().strip()
         if plan == "free":
             user_profile(chat_id)
             state.user_store.set_plan(chat_id, "free")
             state.user_store.set_selected_model(chat_id, best_default_alias_for_plan("free"))
-            await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing())
             return True
         if plan not in {"start", "pro"}:
-            await max_send_message(chat_id, "Доступно: /buy start или /buy pro", attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, "Доступно: /buy start или /buy pro", attachments=build_tariffs_keyboard_pricing())
             return True
         request_id, msg = await create_buy_request_v2(chat_id, plan)
         if request_id is None:
-            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing())
             return True
         await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id))
         return True
 
     if command == "/payments":
         if not is_admin(chat_id):
-            await max_send_message(chat_id, "Для пользователей команда скрыта. Используй кнопки в разделе «Тарифы».", attachments=build_tariffs_keyboard_v2())
+            await max_send_message(chat_id, "Для пользователей команда скрыта. Используй кнопки в разделе «Тарифы».", attachments=build_tariffs_keyboard_pricing())
             return True
         await send_payments(chat_id)
         return True
