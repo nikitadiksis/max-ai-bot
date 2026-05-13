@@ -1112,11 +1112,11 @@ def build_consent_keyboard(plan: str) -> list[dict[str, Any]]:
 
 def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
     buy_row_1: list[dict[str, Any]] = [
-        {"type": "callback", "text": f"Купить Lite — {LITE_PLAN_PRICE_RUB}₽", "payload": "buy:lite"},
-        {"type": "callback", "text": f"Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
+        {"type": "callback", "text": f"🍬 Купить Lite — {LITE_PLAN_PRICE_RUB}₽", "payload": "buy:lite"},
+        {"type": "callback", "text": f"👌 Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
     ]
     buy_row_2: list[dict[str, Any]] = [
-        {"type": "callback", "text": f"Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
+        {"type": "callback", "text": f"🚀 Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
     ]
     return [
         {
@@ -1334,12 +1334,12 @@ def build_tariffs_text() -> str:
     if pro_cfg.daily_gpt54_limit > 0:
         pro_gpt54_line = f", GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день"
     return (
-        "Тарифы:\n"
-        f"• free: {free_cfg.daily_messages_limit} сообщений/день, {free_cfg.daily_images_limit} картинок/день — бесплатно\n"
-        f"• lite: {lite_cfg.daily_messages_limit} сообщений/день, {lite_cfg.daily_images_limit} картинок/день — {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней ({credits_for_plan('lite')} кредитов)\n"
-        f"• start: {start_cfg.daily_messages_limit} сообщений/день, {start_cfg.daily_images_limit} картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней ({credits_for_plan('start')} кредитов)\n"
-        f"• pro: {pro_cfg.daily_messages_limit} сообщений/день, {pro_cfg.daily_images_limit} картинок/день{pro_gpt54_line} — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней ({credits_for_plan('pro')} кредитов)\n\n"
-        "Кредиты в месяц:\n"
+        "💠 Тарифы:\n"
+        f"• 🆓 free: {free_cfg.daily_messages_limit} сообщений/день, {free_cfg.daily_images_limit} картинок/день — бесплатно\n"
+        f"• 🍬 lite: {lite_cfg.daily_messages_limit} сообщений/день, {lite_cfg.daily_images_limit} картинок/день — {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней ({credits_for_plan('lite')} кредитов)\n"
+        f"• 👌 start: {start_cfg.daily_messages_limit} сообщений/день, {start_cfg.daily_images_limit} картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней ({credits_for_plan('start')} кредитов)\n"
+        f"• 🚀 pro: {pro_cfg.daily_messages_limit} сообщений/день, {pro_cfg.daily_images_limit} картинок/день{pro_gpt54_line} — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней ({credits_for_plan('pro')} кредитов)\n\n"
+        "🪙 Списания кредитов:\n"
         f"• DeepSeek: {CREDIT_COST_DEEPSEEK}\n"
         f"• GPT-4.1 Mini: {CREDIT_COST_GPT}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
@@ -1692,9 +1692,9 @@ async def send_help(chat_id: int) -> None:
 async def send_menu(chat_id: int) -> None:
     capabilities = (
         "Что умею:\n"
-        "• ответы через GPT, Gemini и DeepSeek\n"
-        f"{image_capability_line()}\n"
-        "• сохранение контекста диалога"
+        "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
+        f"• 🎨 {image_capability_line().replace('• ', '')}\n"
+        "• 🧠 сохранение контекста диалога"
     )
     text = (
         "Привет. Это твой AI-бот в MAX.\n\n"
@@ -1729,12 +1729,12 @@ async def send_credits(chat_id: int) -> None:
     if plan_name not in PAID_PLANS:
         await max_send_message(
             chat_id,
-            "На free кредиты не списываются. Для расширенного режима и картинок открой «Тарифы».",
+            "🆓 На free кредиты не списываются. Для расширенного режима и картинок открой «Тарифы».",
             attachments=build_tariffs_keyboard_pricing(),
         )
         return
     text = (
-        f"Твой баланс: {int(row.get('credits_balance', 0) or 0)} кредитов.\n\n"
+        f"🪙 Твой баланс: {int(row.get('credits_balance', 0) or 0)} кредитов.\n\n"
         f"Списания:\n"
         f"• DeepSeek: {CREDIT_COST_DEEPSEEK}\n"
         f"• GPT-4.1 Mini: {CREDIT_COST_GPT}\n"
