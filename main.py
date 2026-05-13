@@ -62,6 +62,9 @@ START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "499"))
 PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "1490"))
 START_PLAN_DAYS = int(os.getenv("START_PLAN_DAYS", "30"))
 PRO_PLAN_DAYS = int(os.getenv("PRO_PLAN_DAYS", "30"))
+TEST_PLAN_PRICE_RUB = int(os.getenv("TEST_PLAN_PRICE_RUB", "50"))
+TEST_PLAN_DAYS = int(os.getenv("TEST_PLAN_DAYS", "7"))
+TEST_PLAN_ENABLED = os.getenv("TEST_PLAN_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -97,7 +100,7 @@ STYLE_PROMPTS = {
     "gpt54": "Стиль: отвечай как эксперт-консультант, глубоко и обоснованно.",
 }
 
-PLAN_ORDER = {"free": 0, "start": 1, "pro": 2}
+PLAN_ORDER = {"free": 0, "test": 1, "start": 2, "pro": 3}
 
 WELCOME_TEXT = (
     "Привет. Это твой AI-бот в MAX.\n\n"
@@ -123,7 +126,7 @@ HELP_TEXT = (
     "/gpt, /gemini, /deepseek, /gpt54 — быстрый выбор\n"
     "/image <описание> — сгенерировать картинку\n"
     "/tariffs — тарифы\n"
-    "/buy <start|pro> — заявка на подписку\n"
+    "/buy <test|start|pro> — заявка на подписку\n"
     "/payments — мои заявки\n"
     "/support — помощь по оплате и работе бота\n"
     "/clear — очистить контекст"
@@ -133,8 +136,8 @@ ADMIN_HELP_TEXT = (
     "\n\nАдмин:\n"
     "/admin help\n"
     "/admin user <chat_id>\n"
-    "/admin plan <chat_id> <free|start|pro>\n"
-    "/admin sub <chat_id> <start|pro> <days>\n"
+    "/admin plan <chat_id> <free|test|start|pro>\n"
+    "/admin sub <chat_id> <test|start|pro> <days>\n"
     "/admin block <chat_id> <on|off>\n"
     "/admin pay <request_id> <paid|cancel>\n"
     "/costs — модели и цены"
@@ -153,6 +156,7 @@ TARIFFS_TEXT = (
 
 BUY_TEXT = (
     "Покупка (пока в ручном режиме):\n"
+    "/buy test — заявка на Test\n"
     "/buy start — заявка на Start\n"
     "/buy pro — заявка на Pro\n"
     "/payments — мои заявки\n\n"
@@ -169,9 +173,22 @@ class PlanInfo:
 
 PLAN_CONFIGS = {
     "free": PlanInfo(name="free", daily_messages_limit=40, daily_images_limit=0),
+    "test": PlanInfo(name="test", daily_messages_limit=120, daily_images_limit=2),
     "start": PlanInfo(name="start", daily_messages_limit=400, daily_images_limit=12),
     "pro": PlanInfo(name="pro", daily_messages_limit=2500, daily_images_limit=80),
 }
+
+
+def available_buy_plans() -> tuple[str, ...]:
+    plans: list[str] = []
+    if TEST_PLAN_ENABLED:
+        plans.append("test")
+    plans.extend(["start", "pro"])
+    return tuple(plans)
+
+
+def is_paid_plan(plan: str) -> bool:
+    return plan in available_buy_plans()
 
 
 @dataclass(slots=True)
@@ -808,15 +825,21 @@ def build_tariffs_keyboard() -> list[dict[str, Any]]:
 
 
 def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
+    buy_row: list[dict[str, Any]] = []
+    if TEST_PLAN_ENABLED:
+        buy_row.append({"type": "callback", "text": "Купить Test", "payload": "buy:test"})
+    buy_row.extend(
+        [
+            {"type": "callback", "text": "Купить Start", "payload": "buy:start"},
+            {"type": "callback", "text": "Купить Pro", "payload": "buy:pro"},
+        ]
+    )
     return [
         {
             "type": "inline_keyboard",
             "payload": {
                 "buttons": [
-                    [
-                        {"type": "callback", "text": "Купить Start", "payload": "buy:start"},
-                        {"type": "callback", "text": "Купить Pro", "payload": "buy:pro"},
-                    ],
+                    buy_row,
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
@@ -870,15 +893,21 @@ def build_consent_keyboard(plan: str) -> list[dict[str, Any]]:
 
 
 def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
+    buy_row: list[dict[str, Any]] = []
+    if TEST_PLAN_ENABLED:
+        buy_row.append({"type": "callback", "text": f"Купить Test — {TEST_PLAN_PRICE_RUB}₽", "payload": "buy:test"})
+    buy_row.extend(
+        [
+            {"type": "callback", "text": f"Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
+            {"type": "callback", "text": f"Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
+        ]
+    )
     return [
         {
             "type": "inline_keyboard",
             "payload": {
                 "buttons": [
-                    [
-                        {"type": "callback", "text": f"Купить Start — {START_PLAN_PRICE_RUB}₽", "payload": "buy:start"},
-                        {"type": "callback", "text": f"Купить Pro — {PRO_PLAN_PRICE_RUB}₽", "payload": "buy:pro"},
-                    ],
+                    buy_row,
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
@@ -1035,6 +1064,8 @@ def parse_iso_datetime(value: str) -> datetime | None:
 
 
 def plan_price_and_days(plan: str) -> tuple[int, int]:
+    if plan == "test":
+        return TEST_PLAN_PRICE_RUB, TEST_PLAN_DAYS
     if plan == "start":
         return START_PLAN_PRICE_RUB, START_PLAN_DAYS
     if plan == "pro":
@@ -1043,19 +1074,28 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
 
 
 def build_tariffs_text() -> str:
-    return (
-        "Тарифы:\n"
-        "• free: 40 сообщений/день, 0 картинок/день — бесплатно\n"
-        f"• start: 400 сообщений/день, 12 картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней\n"
-        f"• pro: 2500 сообщений/день, 80 картинок/день — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней\n\n"
-        "Для start/pro действует автопродление.\n"
-        "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
-        "Отменить автопродление можно в разделе «Мой план».\n\n"
-        "Модели по тарифам:\n"
-        "• free: DeepSeek V4 Flash, GPT-4.1 Mini\n"
-        "• start: + Gemini 2.5 Flash\n"
-        "• pro: + GPT-5.4"
+    lines = [
+        "Тарифы:",
+        "• free: 40 сообщений/день, 0 картинок/день — бесплатно",
+    ]
+    if TEST_PLAN_ENABLED:
+        lines.append(f"• test: 120 сообщений/день, 2 картинки/день — {TEST_PLAN_PRICE_RUB} ₽ / {TEST_PLAN_DAYS} дней")
+    lines.extend(
+        [
+            f"• start: 400 сообщений/день, 12 картинок/день — {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней",
+            f"• pro: 2500 сообщений/день, 80 картинок/день — {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней",
+            "",
+            "Для платных тарифов действует автопродление.",
+            "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.",
+            "Отменить автопродление можно в разделе «Мой план».",
+            "",
+            "Модели по тарифам:",
+            "• free/test: DeepSeek V4 Flash, GPT-4.1 Mini",
+            "• start: + Gemini 2.5 Flash",
+            "• pro: + GPT-5.4",
+        ]
     )
+    return "\n".join(lines)
 
 
 def recurring_terms_for_plan(plan: str) -> str:
@@ -1387,7 +1427,7 @@ async def send_plan(chat_id: int) -> None:
 async def send_payments(chat_id: int) -> None:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
-        await max_send_message(chat_id, "Заявок пока нет. Используй /buy start или /buy pro.", attachments=build_keyboard())
+        await max_send_message(chat_id, "Заявок пока нет. Используй кнопку «Тарифы».", attachments=build_keyboard())
         return
     lines = ["Твои последние заявки:"]
     for item in rows:
@@ -1398,8 +1438,9 @@ async def send_payments(chat_id: int) -> None:
 
 
 async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> bool:
-    if plan not in {"start", "pro"}:
-        await max_send_message(chat_id, "Доступно: start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
+    if not is_paid_plan(plan):
+        available = ", ".join(available_buy_plans())
+        await max_send_message(chat_id, f"Доступно: {available}.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
         return False
 
     amount, days = plan_price_and_days(plan)
@@ -1417,8 +1458,8 @@ async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> boo
 
 
 async def create_buy_request(chat_id: int, plan: str) -> str:
-    if plan not in {"start", "pro"}:
-        return "Доступно: start или pro."
+    if not is_paid_plan(plan):
+        return f"Доступно: {', '.join(available_buy_plans())}."
     amount, days = plan_price_and_days(plan)
     request_id = state.user_store.create_payment_request(chat_id, plan, days, amount)
     return (
@@ -1604,8 +1645,8 @@ async def process_refund_payment_request(request_id: int, source: str, bank_stat
 
 
 async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "") -> tuple[int | None, str]:
-    if plan not in {"start", "pro"}:
-        return None, "Доступно: start или pro."
+    if not is_paid_plan(plan):
+        return None, f"Доступно: {', '.join(available_buy_plans())}."
     amount, days = plan_price_and_days(plan)
     request_id = state.user_store.create_payment_request(
         chat_id,
@@ -1668,8 +1709,8 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             chat_id,
             "Админ-команды:\n"
             "/admin user <chat_id>\n"
-            "/admin plan <chat_id> <free|start|pro>\n"
-            "/admin sub <chat_id> <start|pro> <days>\n"
+            "/admin plan <chat_id> <free|test|start|pro>\n"
+            "/admin sub <chat_id> <test|start|pro> <days>\n"
             "/admin block <chat_id> <on|off>\n"
             "/admin pay <request_id> <paid|cancel>",
         )
@@ -1689,7 +1730,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         target = parse_admin_target(parts[2])
         new_plan = parts[3].lower()
         if target is None or new_plan not in PLAN_CONFIGS:
-            await max_send_message(chat_id, "Используй: /admin plan <chat_id> <free|start|pro>")
+            await max_send_message(chat_id, "Используй: /admin plan <chat_id> <free|test|start|pro>")
             return True
         user_profile(target)
         state.user_store.set_plan(target, new_plan)
@@ -1702,8 +1743,8 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         target = parse_admin_target(parts[2])
         plan = parts[3].lower()
         days_raw = parts[4]
-        if target is None or plan not in {"start", "pro"} or not days_raw.isdigit():
-            await max_send_message(chat_id, "Используй: /admin sub <chat_id> <start|pro> <days>")
+        if target is None or not is_paid_plan(plan) or not days_raw.isdigit():
+            await max_send_message(chat_id, "Используй: /admin sub <chat_id> <test|start|pro> <days>")
             return True
         days = int(days_raw)
         if days <= 0 or days > 365:
@@ -1882,7 +1923,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload.startswith("buy_consent:"):
         plan = payload.split(":", 1)[1].lower().strip()
-        if plan not in {"start", "pro"}:
+        if not is_paid_plan(plan):
             if callback_id:
                 await answer_callback(callback_id, "Неверный тариф")
             return True
@@ -1907,10 +1948,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
 
-        if plan not in {"start", "pro"}:
+        if not is_paid_plan(plan):
             if callback_id:
                 await answer_callback(callback_id, "Неверный тариф")
-            await max_send_message(chat_id, "Доступно: Start или Pro.", attachments=build_tariffs_keyboard_pricing(), notify=False)
+            await max_send_message(chat_id, f"Доступно: {', '.join(available_buy_plans())}.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         if callback_id:
             await answer_callback(callback_id, "Проверь условия")
@@ -2030,8 +2071,8 @@ async def handle_command(chat_id: int, text: str) -> bool:
             state.user_store.set_selected_model(chat_id, best_default_alias_for_plan("free"))
             await max_send_message(chat_id, "Тариф переключен на free.", attachments=build_tariffs_keyboard_pricing())
             return True
-        if plan not in {"start", "pro"}:
-            await max_send_message(chat_id, "Доступно: Start или Pro.", attachments=build_tariffs_keyboard_pricing())
+        if not is_paid_plan(plan):
+            await max_send_message(chat_id, f"Доступно: {', '.join(available_buy_plans())}.", attachments=build_tariffs_keyboard_pricing())
             return True
         ok = await send_buy_consent(chat_id, plan)
         if not ok:
