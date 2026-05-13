@@ -77,6 +77,13 @@ TBANK_GET_STATE_URL = os.getenv("TBANK_GET_STATE_URL", "https://securepay.tinkof
 TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
 TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
 TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
+TBANK_RECEIPT_EMAIL = os.getenv("TBANK_RECEIPT_EMAIL", "").strip()
+TBANK_RECEIPT_PHONE = os.getenv("TBANK_RECEIPT_PHONE", "").strip()
+TBANK_RECEIPT_TAXATION = os.getenv("TBANK_RECEIPT_TAXATION", "usn_income").strip()
+TBANK_RECEIPT_TAX = os.getenv("TBANK_RECEIPT_TAX", "none").strip()
+TBANK_RECEIPT_PAYMENT_METHOD = os.getenv("TBANK_RECEIPT_PAYMENT_METHOD", "full_prepayment").strip()
+TBANK_RECEIPT_PAYMENT_OBJECT = os.getenv("TBANK_RECEIPT_PAYMENT_OBJECT", "service").strip()
+TBANK_RECEIPT_FFD_VERSION = os.getenv("TBANK_RECEIPT_FFD_VERSION", "1.05").strip()
 TBANK_CANCEL_STATUSES = {"REJECTED", "CANCELED", "DEADLINE_EXPIRED"}
 TBANK_REFUND_STATUSES = {"REFUNDED", "REVERSED", "PARTIAL_REVERSED", "PARTIAL_REFUNDED", "CHARGEDBACK"}
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
@@ -655,6 +662,32 @@ def tbank_payment_id_from_provider_ref(provider_ref: str) -> str:
     if value.startswith("tbank:"):
         return value.split(":", 1)[1].strip()
     return value
+
+
+def build_tbank_receipt(amount_rub: int, description: str) -> dict[str, Any]:
+    amount_kop = int(amount_rub) * 100
+    item_name = (description or "Подписка").strip()[:128] or "Подписка"
+    receipt: dict[str, Any] = {
+        "Taxation": TBANK_RECEIPT_TAXATION or "usn_income",
+        "Items": [
+            {
+                "Name": item_name,
+                "Price": amount_kop,
+                "Quantity": 1,
+                "Amount": amount_kop,
+                "Tax": TBANK_RECEIPT_TAX or "none",
+                "PaymentMethod": TBANK_RECEIPT_PAYMENT_METHOD or "full_prepayment",
+                "PaymentObject": TBANK_RECEIPT_PAYMENT_OBJECT or "service",
+            }
+        ],
+    }
+    if TBANK_RECEIPT_FFD_VERSION:
+        receipt["FfdVersion"] = TBANK_RECEIPT_FFD_VERSION
+    if TBANK_RECEIPT_EMAIL:
+        receipt["Email"] = TBANK_RECEIPT_EMAIL
+    if TBANK_RECEIPT_PHONE:
+        receipt["Phone"] = TBANK_RECEIPT_PHONE
+    return receipt
 
 
 def scalar_string(value: Any) -> str:
@@ -1531,6 +1564,11 @@ async def tbank_init_payment(
         "Description": description[:140],
         "PayType": "O",
     }
+    if not (TBANK_RECEIPT_EMAIL or TBANK_RECEIPT_PHONE):
+        raise RuntimeError(
+            "T-Bank Receipt required: set TBANK_RECEIPT_EMAIL or TBANK_RECEIPT_PHONE in .env"
+        )
+    payload["Receipt"] = build_tbank_receipt(amount_rub=amount_rub, description=description)
     notification_url = resolve_tbank_notification_url()
     if notification_url:
         payload["NotificationURL"] = notification_url
