@@ -56,17 +56,30 @@ MAX_CONTEXT_CHARS=7000
 MESSAGE_COOLDOWN_SECONDS=1
 IMAGE_COOLDOWN_SECONDS=20
 FREE_DAILY_MESSAGES_LIMIT=40
+LITE_DAILY_MESSAGES_LIMIT=80
 START_DAILY_MESSAGES_LIMIT=120
 PRO_DAILY_MESSAGES_LIMIT=300
 FREE_DAILY_IMAGES_LIMIT=0
+LITE_DAILY_IMAGES_LIMIT=1
 START_DAILY_IMAGES_LIMIT=3
 PRO_DAILY_IMAGES_LIMIT=8
 PRO_DAILY_GPT54_LIMIT=8
 MAX_COMPLETION_TOKENS_FREE=500
+MAX_COMPLETION_TOKENS_LITE=550
 MAX_COMPLETION_TOKENS_START=650
 MAX_COMPLETION_TOKENS_PRO=800
+LITE_PLAN_CREDITS=3500
+START_PLAN_CREDITS=9000
+PRO_PLAN_CREDITS=30000
+CREDIT_COST_DEEPSEEK=1
+CREDIT_COST_GPT=3
+CREDIT_COST_GEMINI=5
+CREDIT_COST_GPT54=20
+CREDIT_COST_IMAGE=35
+LITE_PLAN_PRICE_RUB=390
 START_PLAN_PRICE_RUB=990
 PRO_PLAN_PRICE_RUB=2990
+LITE_PLAN_DAYS=30
 START_PLAN_DAYS=30
 PRO_PLAN_DAYS=30
 
@@ -89,7 +102,8 @@ SUPPORT_TEXT=Поддержка: напиши нам, поможем быстр�
 - `/models`
 - `/plan`
 - `/tariffs`
-- `/buy <start|pro>`
+- `/buy <lite|start|pro>`
+- `/credits`
 - `/payments`
 - `/support`
 - `/model <alias>`
@@ -100,8 +114,8 @@ SUPPORT_TEXT=Поддержка: напиши нам, поможем быстр�
 Admin (`ADMIN_IDS` only):
 - `/admin help`
 - `/admin user <chat_id>`
-- `/admin plan <chat_id> <free|start|pro>`
-- `/admin sub <chat_id> <start|pro> <days>`
+- `/admin plan <chat_id> <free|lite|start|pro>`
+- `/admin sub <chat_id> <lite|start|pro> <days>`
 - `/admin block <chat_id> <on|off>`
 - `/admin pay <request_id> <paid|cancel>`
 - `/costs`
