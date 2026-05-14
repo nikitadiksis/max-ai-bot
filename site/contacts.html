@@ -30,7 +30,7 @@
       <p id="support-text">Если есть вопросы по оплате или работе бота, напиши в поддержку.</p>
       <p>
         Email: <span id="contact-email">не указан</span><br />
-        Телефон: <span id="contact-phone">не указан</span><br />
+        Телефон: <span id="contact-phone">—</span><br />
         Ссылка: <a id="support-link" href="/support">страница помощи</a>
       </p>
 
@@ -55,7 +55,11 @@
         const linkEl = document.getElementById("support-link");
 
         if (data && data.email) emailEl.textContent = data.email;
-        if (data && data.phone) phoneEl.textContent = data.phone;
+        if (data && data.phone) {
+          phoneEl.textContent = data.phone;
+        } else {
+          phoneEl.textContent = "—";
+        }
         if (data && data.support_text) textEl.textContent = data.support_text;
         if (data && data.support_url) linkEl.href = data.support_url;
       } catch (_) {}

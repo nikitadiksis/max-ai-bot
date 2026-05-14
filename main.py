@@ -140,7 +140,7 @@ PAYMENT_STATUS_LABELS = {
 }
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
-CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip()
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
@@ -1670,6 +1670,7 @@ def support_help_text() -> str:
         "2. После оплаты подожди 1-2 минуты.\n"
         "3. Открой «Мой план» и проверь статус.\n\n"
         f"{SUPPORT_TEXT}\n"
+        f"Email: {CONTACT_EMAIL}\n"
         f"Ссылка: {support_url_value()}\n\n"
         "FAQ: страница «Помощь»\n\n"
         "Шаблоны для обращения в поддержку:\n"
@@ -5892,7 +5893,7 @@ async def landing_support() -> FileResponse:
 
 @app.get("/support/meta")
 async def support_meta() -> dict[str, str]:
-    return {"url": support_url_value(), "text": SUPPORT_TEXT}
+    return {"url": support_url_value(), "text": SUPPORT_TEXT, "email": CONTACT_EMAIL}
 
 
 @app.get("/mailru-domainMB5PESlCeJQEXuoC.html", response_class=FileResponse)

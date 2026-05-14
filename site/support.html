@@ -22,6 +22,10 @@
         <a class="btn" href="/">На главную</a>
       </div>
 
+      <p>
+        Email: <a id="support-email" href="mailto:support@aimaxbots.ru">support@aimaxbots.ru</a>
+      </p>
+
       <h2>Частые вопросы</h2>
       <article class="tile">
         <strong>Оплатил, но подписка не активировалась</strong>
@@ -55,11 +59,16 @@
         const data = await res.json();
         const link = document.getElementById("support-link");
         const text = document.getElementById("support-text");
+        const email = document.getElementById("support-email");
         if (data && data.url) {
           link.href = data.url;
         }
         if (data && data.text) {
           text.textContent = data.text;
+        }
+        if (data && data.email) {
+          email.textContent = data.email;
+          email.href = `mailto:${data.email}`;
         }
       } catch (_) {}
     }
