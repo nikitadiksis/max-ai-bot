@@ -92,6 +92,7 @@ CREDIT_COST_GPTO = int(os.getenv("CREDIT_COST_GPTO", "4"))
 CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
+CREDIT_COST_IMAGE_EDIT = int(os.getenv("CREDIT_COST_IMAGE_EDIT", "55"))
 VAR_CREDITS_PER_1K_DEEPSEEK = int(os.getenv("VAR_CREDITS_PER_1K_DEEPSEEK", "0"))
 VAR_CREDITS_PER_1K_GPT = int(os.getenv("VAR_CREDITS_PER_1K_GPT", "1"))
 VAR_CREDITS_PER_1K_GPTO = int(os.getenv("VAR_CREDITS_PER_1K_GPTO", "1"))
@@ -151,6 +152,7 @@ REENGAGE_DORMANT_DAYS = int(os.getenv("REENGAGE_DORMANT_DAYS", "5"))
 REENGAGE_BATCH_LIMIT = int(os.getenv("REENGAGE_BATCH_LIMIT", "30"))
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", "production").strip() or "production"
+REFERENCE_IMAGE_TTL_MINUTES = int(os.getenv("REFERENCE_IMAGE_TTL_MINUTES", "180"))
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -214,6 +216,7 @@ HELP_TEXT = (
     "/model <alias> — выбрать модель вручную\n"
     "/gpt, /gpt4o, /gemini, /deepseek, /gpt54 — быстрый выбор модели\n"
     "/image <описание> — сгенерировать картинку\n"
+    "/image_ref <описание> — сгенерировать по последнему фото\n"
     "/tariffs — тарифы\n"
     "/topup — пакеты кредитов\n"
     "/buy <lite|start|pro> — заявка на подписку\n"
@@ -1213,9 +1216,12 @@ class BotState:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
         self.pending_receipt_plan: dict[int, str] = {}
         self.pending_image_prompt: set[int] = set()
+        self.pending_image_ref_prompt: set[int] = set()
         self.pending_promo_code_input: set[int] = set()
         self.pending_referral_code_input: set[int] = set()
         self.image_request_prefs: dict[int, dict[str, str]] = {}
+        self.last_reference_image_data_url: dict[int, str] = {}
+        self.last_reference_image_at: dict[int, datetime] = {}
         self.processed_updates: deque[str] = deque()
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
@@ -1920,6 +1926,9 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
                         {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
                     ],
                     [
+                        {"type": "callback", "text": "🖼 По фото", "payload": "image_ref:start"},
+                    ],
+                    [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
@@ -2171,7 +2180,10 @@ def model_line(model: ModelInfo, include_prices: bool) -> str:
     if model.kind == "text" and model.alias in MODEL_CREDIT_COSTS:
         lines.append(f"списание: {MODEL_CREDIT_COSTS[model.alias]} кредитов/запрос")
     if model.kind == "image":
-        lines.append(f"списание: {CREDIT_COST_IMAGE} кредитов/картинка")
+        lines.append(
+            f"списание: {CREDIT_COST_IMAGE} кредитов/картинка, "
+            f"{CREDIT_COST_IMAGE_EDIT} кредитов/картинка по фото"
+        )
     if include_prices:
         lines.append(f"цена: in ${model.input_price_usd_per_m}/M, out ${model.output_price_usd_per_m}/M")
     return "\n".join(lines)
@@ -2228,6 +2240,11 @@ def decode_data_url(data_url: str) -> ImageResult:
     return ImageResult(image_bytes=base64.b64decode(encoded), mime_type=mime_type)
 
 
+def encode_data_url(image: ImageResult) -> str:
+    encoded = base64.b64encode(image.image_bytes).decode("ascii")
+    return f"data:{image.mime_type};base64,{encoded}"
+
+
 def parse_incoming_text(update: dict[str, Any]) -> tuple[int | None, str]:
     message = update.get("message") or {}
     recipient = message.get("recipient") or {}
@@ -2241,6 +2258,58 @@ def parse_incoming_text(update: dict[str, Any]) -> tuple[int | None, str]:
     if not isinstance(text, str):
         return chat_id, ""
     return chat_id, text.strip()
+
+
+def _walk_for_image_urls(node: Any, found: list[str]) -> None:
+    if isinstance(node, dict):
+        node_type = str(node.get("type", "")).lower()
+        payload = node.get("payload")
+        if node_type in {"image", "photo"} and isinstance(payload, dict):
+            for key in ("url", "image_url", "imageUrl", "file_url", "src"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    found.append(value)
+            return
+
+        # Explicit image fields in alternative schemas.
+        for key in ("image_url", "imageUrl", "photo_url"):
+            value = node.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                found.append(value)
+                return
+
+        attachments = node.get("attachments")
+        if isinstance(attachments, list):
+            for item in attachments:
+                _walk_for_image_urls(item, found)
+            return
+
+        # Fallback for nested image payloads only.
+        if "photo" in node:
+            _walk_for_image_urls(node.get("photo"), found)
+            return
+
+        if "image" in node:
+            _walk_for_image_urls(node.get("image"), found)
+            return
+    elif isinstance(node, list):
+        for item in node:
+            _walk_for_image_urls(item, found)
+
+
+def parse_incoming_image_url(update: dict[str, Any]) -> str:
+    found: list[str] = []
+    message = update.get("message") if isinstance(update, dict) else None
+    if isinstance(message, dict):
+        _walk_for_image_urls(message.get("body"), found)
+        _walk_for_image_urls(message.get("attachments"), found)
+    else:
+        _walk_for_image_urls(update, found)
+    for url in found:
+        low = url.lower()
+        if any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp", "/image", "content-type=image")):
+            return url
+    return found[0] if found else ""
 
 
 def parse_callback_payload(update: dict[str, Any]) -> tuple[int | None, str | None, str | None]:
@@ -2343,7 +2412,8 @@ def build_tariffs_text() -> str:
         f"• GPT-4o Mini: {CREDIT_COST_GPTO}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
-        f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
+        f"• Картинка: {CREDIT_COST_IMAGE}\n"
+        f"• По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT}\n\n"
         f"Текстовые запросы: фикс + доплата за сложность по фактическим токенам (до {MAX_VARIABLE_CREDITS_PER_TEXT} кредитов за запрос).\n"
         "Для коротких запросов обычно списывается только фикс или близко к нему.\n"
         "Объем использования измеряется кредитами, а не количеством сообщений/картинок.\n"
@@ -2703,14 +2773,42 @@ async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, di
     await max_send_message(chat_id, f"Готово. Вот картинка по запросу:\n{shown_prompt}", attachments=[attachment])
 
 
-async def fetch_image_bytes(url: str) -> ImageResult:
+async def fetch_image_bytes(url: str, use_max_auth: bool = False) -> ImageResult:
     session = await get_session()
-    async with session.get(url) as resp:
+    headers = max_headers() if use_max_auth else None
+    async with session.get(url, headers=headers) as resp:
         data = await resp.read()
         if resp.status >= 400:
             raise RuntimeError(f"Image fetch error {resp.status}")
         mime_type = resp.headers.get("Content-Type", "image/png").split(";", 1)[0]
         return ImageResult(image_bytes=data, mime_type=mime_type)
+
+
+def remember_reference_image(chat_id: int, data_url: str) -> None:
+    state.last_reference_image_data_url[chat_id] = data_url
+    state.last_reference_image_at[chat_id] = datetime.utcnow()
+
+
+def get_recent_reference_image(chat_id: int) -> str:
+    data_url = state.last_reference_image_data_url.get(chat_id, "")
+    ts = state.last_reference_image_at.get(chat_id)
+    if not data_url or not ts:
+        return ""
+    age = datetime.utcnow() - ts
+    if age > timedelta(minutes=max(1, REFERENCE_IMAGE_TTL_MINUTES)):
+        state.last_reference_image_data_url.pop(chat_id, None)
+        state.last_reference_image_at.pop(chat_id, None)
+        return ""
+    return data_url
+
+
+def looks_like_image_ref_request(text: str) -> bool:
+    value = text.strip().lower()
+    if not value:
+        return False
+    verb = re.search(r"\b(нарисуй|перерисуй|сделай|измени|отрисуй|сгенерируй)\b", value)
+    ref = re.search(r"\b(фото|фотк|картинк|из нее|из неё|ее|её|эту|этого человека)\b", value)
+    return bool(verb and ref)
 
 
 def build_text_request(chat_id: int, user_text: str, selected_alias: str | None = None) -> tuple[str, str, ModelInfo, list[dict[str, Any]]]:
@@ -2789,6 +2887,43 @@ async def generate_image(prompt: str) -> ImageResult:
     raise RuntimeError("Image was not returned by the selected model.")
 
 
+async def generate_image_from_reference(prompt: str, reference_image_data_url: str) -> ImageResult:
+    session = await get_session()
+    payload = {
+        "model": DEFAULT_IMAGE_MODEL.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": reference_image_data_url}},
+                ],
+            }
+        ],
+        "modalities": ["image", "text"],
+    }
+
+    async with session.post(OPENROUTER_CHAT_API, headers=openrouter_headers(), json=payload) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status >= 400:
+            message = data.get("error", {}).get("message", "Unknown OpenRouter error")
+            raise RuntimeError(message)
+
+    message = data["choices"][0]["message"]
+    images = message.get("images") or []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        image_url = image.get("image_url") or image.get("imageUrl") or {}
+        if isinstance(image_url, dict):
+            url = image_url.get("url")
+            if isinstance(url, str) and url.startswith("data:"):
+                return decode_data_url(url)
+            if isinstance(url, str) and url.startswith("http"):
+                return await fetch_image_bytes(url)
+    raise RuntimeError("Edited image was not returned by the selected model.")
+
+
 def current_model_label(chat_id: int) -> str:
     row = user_profile(chat_id)
     selected = row["selected_model_alias"] or best_default_alias_for_plan(row["plan"])
@@ -2819,7 +2954,8 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
         f"{image_params_summary(chat_id)}\n\n"
         f"{availability_line}\n"
         f"Стоимость: {CREDIT_COST_IMAGE} кредитов за 1 генерацию.\n\n"
-        "Выбери стиль и формат, затем нажми «Сгенерировать»."
+        f"По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT} кредитов (с тарифа {DEFAULT_IMAGE_MODEL.min_plan}).\n\n"
+        "Выбери стиль и формат, затем нажми «Сгенерировать» или «По фото»."
     )
     await max_send_message(chat_id, text, attachments=build_image_menu_keyboard(chat_id), notify=notify)
 
@@ -2889,6 +3025,71 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
     return True
 
 
+async def process_image_edit_generation(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
+    prompt = user_prompt.strip()
+    if not prompt:
+        await max_send_message(chat_id, "Опиши, что изменить на фото.", attachments=build_image_prompt_keyboard())
+        return True
+    if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+        await max_send_message(
+            chat_id,
+            f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.",
+            attachments=build_keyboard(),
+        )
+        return True
+
+    row = user_profile(chat_id)
+    if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+        await max_send_message(
+            chat_id,
+            f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+            attachments=build_tariffs_keyboard_pricing(),
+        )
+        return True
+
+    ok_cd, reason_cd = check_cooldown(chat_id, "image")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+
+    ok, reason = check_limit_only(chat_id, "images")
+    if not ok:
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+
+    edit_cost = max(CREDIT_COST_IMAGE_EDIT, CREDIT_COST_IMAGE + 1)
+    ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
+    if not ok_credit:
+        await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+        return True
+
+    ok, reason = check_and_consume_limit(chat_id, "images")
+    if not ok:
+        state.user_store.refund_credits(chat_id, edit_cost)
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+
+    await max_send_message(chat_id, "Обрабатываю фото и генерирую вариант, это может занять немного времени...")
+    prepared_prompt = build_image_prompt(prompt, chat_id)
+    try:
+        image = await generate_image_from_reference(prepared_prompt, reference_image_data_url)
+        await send_generated_image(chat_id, prepared_prompt, image, display_prompt=prompt)
+        final_row = user_profile(chat_id)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="image_request",
+            plan=str(final_row.get("plan", "")),
+            model_alias=f"{DEFAULT_IMAGE_MODEL.alias}:edit",
+            credits_spent=edit_cost,
+            tokens_total=0,
+            details=f"mode=image_edit;style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+        )
+    except Exception:
+        state.user_store.refund_credits(chat_id, edit_cost)
+        raise
+    return True
+
+
 async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
     if chat_id not in state.pending_image_prompt:
         return False
@@ -2906,6 +3107,34 @@ async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
     state.pending_image_prompt.discard(chat_id)
     prepared_prompt = build_image_prompt(text.strip(), chat_id)
     await process_image_generation(chat_id, text.strip(), model_prompt=prepared_prompt)
+    return True
+
+
+async def handle_pending_image_ref_prompt_input(chat_id: int, text: str) -> bool:
+    if chat_id not in state.pending_image_ref_prompt:
+        return False
+
+    lowered = text.strip().lower()
+    if lowered in {"отмена", "cancel", "/cancel", "стоп", "/stop"}:
+        state.pending_image_ref_prompt.discard(chat_id)
+        await max_send_message(chat_id, "Ок, режим «по фото» отменил.", attachments=build_image_menu_keyboard(chat_id))
+        return True
+
+    if text.strip().startswith("/"):
+        state.pending_image_ref_prompt.discard(chat_id)
+        return False
+
+    reference = get_recent_reference_image(chat_id)
+    if not reference:
+        await max_send_message(
+            chat_id,
+            "Сначала отправь фото, потом напиши, что с ним сделать.",
+            attachments=build_image_menu_keyboard(chat_id),
+        )
+        return True
+
+    state.pending_image_ref_prompt.discard(chat_id)
+    await process_image_edit_generation(chat_id, text.strip(), reference)
     return True
 
 
@@ -3050,7 +3279,8 @@ async def send_credits(chat_id: int) -> None:
         f"• GPT-4o Mini: {CREDIT_COST_GPTO}\n"
         f"• Gemini 2.5 Flash: {CREDIT_COST_GEMINI}\n"
         f"• GPT-5.4: {CREDIT_COST_GPT54}\n"
-        f"• Картинка: {CREDIT_COST_IMAGE}\n\n"
+        f"• Картинка: {CREDIT_COST_IMAGE}\n"
+        f"• По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT}\n\n"
         f"Текст: фикс + доплата за сложность по токенам (до {MAX_VARIABLE_CREDITS_PER_TEXT} кредитов/запрос)."
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
@@ -3996,8 +4226,36 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         )
         return True
 
+    if payload == "image_ref:start":
+        row = user_profile(chat_id)
+        if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+            if callback_id:
+                await answer_callback(callback_id, "Недоступно на текущем тарифе")
+            await max_send_message(
+                chat_id,
+                f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+                attachments=build_tariffs_keyboard_pricing(),
+                notify=False,
+            )
+            return True
+        state.pending_image_ref_prompt.add(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Жду фото")
+        await max_send_message(
+            chat_id,
+            (
+                "Пришли фото и коротко опиши, что сделать.\n"
+                f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+                "Если фото уже отправлено — просто напиши описание (например: «нарисуй её в стиле аниме»)."
+            ),
+            attachments=build_image_prompt_keyboard(),
+            notify=False,
+        )
+        return True
+
     if payload == "image_prompt:cancel":
         state.pending_image_prompt.discard(chat_id)
+        state.pending_image_ref_prompt.discard(chat_id)
         if callback_id:
             await answer_callback(callback_id, "Отменено")
         await send_image_menu(chat_id)
@@ -4409,6 +4667,34 @@ async def handle_command(chat_id: int, text: str) -> bool:
         prepared_prompt = build_image_prompt(arg, chat_id)
         return await process_image_generation(chat_id, arg, model_prompt=prepared_prompt)
 
+    if command == "/image_ref":
+        row = user_profile(chat_id)
+        if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+            await max_send_message(
+                chat_id,
+                f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+                attachments=build_tariffs_keyboard_pricing(),
+            )
+            return True
+        reference = get_recent_reference_image(chat_id)
+        if not reference:
+            state.pending_image_ref_prompt.add(chat_id)
+            await max_send_message(
+                chat_id,
+                f"Сначала отправь фото. Стоимость режима «по фото»: {CREDIT_COST_IMAGE_EDIT} кредитов.",
+                attachments=build_image_prompt_keyboard(),
+            )
+            return True
+        if not arg:
+            state.pending_image_ref_prompt.add(chat_id)
+            await max_send_message(
+                chat_id,
+                "Опиши, что сделать с фото (например: «нарисуй её в стиле киберпанк»).",
+                attachments=build_image_prompt_keyboard(),
+            )
+            return True
+        return await process_image_edit_generation(chat_id, arg, reference)
+
     if command.startswith("/admin"):
         return await handle_admin(chat_id, text)
 
@@ -4526,6 +4812,7 @@ async def process_update(update: dict[str, Any]) -> None:
         return
 
     chat_id, text = parse_incoming_text(update)
+    incoming_image_url = parse_incoming_image_url(update)
     if chat_id is None:
         return
 
@@ -4533,6 +4820,37 @@ async def process_update(update: dict[str, Any]) -> None:
     state.user_store.touch_last_active(chat_id)
     if row["is_blocked"]:
         return
+
+    if incoming_image_url:
+        try:
+            try:
+                incoming_image = await fetch_image_bytes(incoming_image_url, use_max_auth=True)
+            except Exception:
+                incoming_image = await fetch_image_bytes(incoming_image_url, use_max_auth=False)
+            remember_reference_image(chat_id, encode_data_url(incoming_image))
+        except Exception as exc:
+            log.exception("Failed to save incoming reference image for chat_id=%s", chat_id)
+            with suppress(Exception):
+                await max_send_message(chat_id, f"Не удалось обработать фото: {exc}", attachments=build_image_menu_keyboard(chat_id))
+            return
+
+        if text and (chat_id in state.pending_image_ref_prompt or looks_like_image_ref_request(text)):
+            state.pending_image_ref_prompt.discard(chat_id)
+            await process_image_edit_generation(chat_id, text, get_recent_reference_image(chat_id))
+            return
+
+        if not text:
+            state.pending_image_ref_prompt.add(chat_id)
+            await max_send_message(
+                chat_id,
+                (
+                    "Фото получил ✅\n"
+                    "Теперь напиши, что с ним сделать (например: «нарисуй её в стиле аниме»).\n"
+                    f"Стоимость режима «по фото»: {CREDIT_COST_IMAGE_EDIT} кредитов."
+                ),
+                attachments=build_image_prompt_keyboard(),
+            )
+            return
 
     if update_type in {"bot_started", "user_added", "bot_added"} and not text:
         if int(row.get("onboarding_done", 0) or 0) == 0:
@@ -4553,7 +4871,13 @@ async def process_update(update: dict[str, Any]) -> None:
             return
         if await handle_pending_receipt_input(chat_id, text):
             return
+        if await handle_pending_image_ref_prompt_input(chat_id, text):
+            return
         if await handle_pending_image_prompt_input(chat_id, text):
+            return
+        recent_reference = get_recent_reference_image(chat_id)
+        if recent_reference and looks_like_image_ref_request(text) and not text.strip().startswith("/"):
+            await process_image_edit_generation(chat_id, text, recent_reference)
             return
         if await handle_command(chat_id, text):
             return
