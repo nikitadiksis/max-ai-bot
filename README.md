@@ -107,6 +107,18 @@ TBANK_SUCCESS_URL=
 TBANK_FAIL_URL=
 SUPPORT_URL=
 SUPPORT_TEXT=Поддержка: напиши нам, поможем быстро.
+CHANNEL_URL=https://max.ru/id231128398751_biz
+REFERRAL_BONUS_CREDITS=120
+PROMO_WELCOME_CREDITS=80
+PROMO_CODES=WELCOME:80
+ADMIN_PANEL_TOKEN=change_me_strong_token
+BACKUP_KEEP_FILES=12
+ERROR_ALERT_COOLDOWN_SEC=120
+ERROR_ALERTS_ENABLED=1
+REENGAGE_DORMANT_DAYS=5
+REENGAGE_BATCH_LIMIT=30
+SENTRY_DSN=
+SENTRY_ENVIRONMENT=production
 ```
 
 ## Commands
@@ -119,6 +131,9 @@ SUPPORT_TEXT=Поддержка: напиши нам, поможем быстр�
 - `/buy <lite|start|pro>`
 - `/credits`
 - `/payments`
+- `/ref [code]`
+- `/promo <code>`
+- `/channel`
 - `/support`
 - `/model <alias>`
 - `/gpt`, `/gemini`, `/deepseek`, `/gpt54`
@@ -133,6 +148,9 @@ Admin (`ADMIN_IDS` only):
 - `/admin block <chat_id> <on|off>`
 - `/admin pay <request_id> <paid|cancel>`
 - `/admin templates`
+- `/admin backup`
+- `/admin nudge [days] [limit]`
+- `/admin panel`
 - `/admin kpi [days]`
 - `/costs`
 

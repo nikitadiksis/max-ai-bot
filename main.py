@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
+import html
 from io import BytesIO
 import json
 import logging
@@ -24,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 import uvicorn
 
 load_dotenv()
@@ -137,6 +139,18 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
+REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
+PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "80"))
+PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
+ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+BACKUP_KEEP_FILES = int(os.getenv("BACKUP_KEEP_FILES", "12"))
+ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("ERROR_ALERT_COOLDOWN_SEC", "120"))
+ERROR_ALERTS_ENABLED = os.getenv("ERROR_ALERTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+REENGAGE_DORMANT_DAYS = int(os.getenv("REENGAGE_DORMANT_DAYS", "5"))
+REENGAGE_BATCH_LIMIT = int(os.getenv("REENGAGE_BATCH_LIMIT", "30"))
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", "production").strip() or "production"
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -187,7 +201,8 @@ MENU_TEXT = (
     "Кнопки ниже — основной способ пользоваться ботом.\n"
     "Для генерации картинки нажми «🎨 Картинка».\n"
     "Если нужен список команд, отправь /help.\n"
-    "Если проблема с оплатой — нажми «Помощь» или отправь /support."
+    "Если проблема с оплатой — нажми «Помощь» или отправь /support.\n"
+    "Новости и обновления: /channel"
 )
 
 HELP_TEXT = (
@@ -203,6 +218,9 @@ HELP_TEXT = (
     "/topup — пакеты кредитов\n"
     "/buy <lite|start|pro> — заявка на подписку\n"
     "/payments — мои заявки\n"
+    "/ref [код] — реферальный код и активация\n"
+    "/promo <код> — активировать промокод\n"
+    "/channel — наш канал\n"
     "/credits — остаток кредитов\n"
     "/support — помощь по оплате и работе бота\n"
     "/clear — очистить контекст"
@@ -217,7 +235,10 @@ ADMIN_HELP_TEXT = (
     "/admin block <chat_id> <on|off>\n"
     "/admin pay <request_id> <paid|cancel>\n"
     "/admin templates\n"
+    "/admin backup\n"
+    "/admin nudge [days] [limit]\n"
     "/admin kpi [days]\n"
+    "/admin panel\n"
     "/costs — модели и цены"
 )
 
@@ -391,6 +412,48 @@ def configure_logging() -> logging.Logger:
 log = configure_logging()
 
 
+def to_base36(value: int) -> str:
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if value <= 0:
+        return "0"
+    out: list[str] = []
+    n = value
+    while n:
+        n, rem = divmod(n, 36)
+        out.append(alphabet[rem])
+    return "".join(reversed(out))
+
+
+def referral_code_for_chat(chat_id: int) -> str:
+    return f"RF{to_base36(chat_id).zfill(6)}"
+
+
+def normalize_referral_code(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", value.strip().upper())
+
+
+def promo_catalog() -> dict[str, int]:
+    catalog: dict[str, int] = {"WELCOME": max(0, PROMO_WELCOME_CREDITS)}
+    raw = PROMO_CODES_RAW
+    if not raw:
+        return {k: v for k, v in catalog.items() if v > 0}
+    for chunk in raw.split(","):
+        part = chunk.strip()
+        if not part or ":" not in part:
+            continue
+        key_raw, val_raw = part.split(":", 1)
+        key = normalize_referral_code(key_raw)
+        if not key:
+            continue
+        try:
+            value = int(val_raw.strip())
+        except Exception:
+            continue
+        if value > 0:
+            catalog[key] = value
+    return {k: v for k, v in catalog.items() if v > 0}
+
+
 class UserStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -409,6 +472,10 @@ class UserStore:
                     chat_id INTEGER PRIMARY KEY,
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
+                    onboarding_done INTEGER NOT NULL DEFAULT 0,
+                    referral_code TEXT NOT NULL DEFAULT '',
+                    referred_by_chat_id INTEGER NOT NULL DEFAULT 0,
+                    referrals_invited INTEGER NOT NULL DEFAULT 0,
                     receipt_email TEXT NOT NULL DEFAULT '',
                     receipt_phone TEXT NOT NULL DEFAULT '',
                     selected_model_alias TEXT NOT NULL DEFAULT '',
@@ -424,6 +491,7 @@ class UserStore:
                     free_image_week_used INTEGER NOT NULL DEFAULT 0,
                     credits_balance INTEGER NOT NULL DEFAULT 0,
                     credits_spent_total INTEGER NOT NULL DEFAULT 0,
+                    last_active_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT ''
                 )
@@ -467,12 +535,29 @@ class UserStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promo_activations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    promo_code TEXT NOT NULL,
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(chat_id, promo_code)
+                )
+                """
+            )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "onboarding_done", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "referral_code", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "referred_by_chat_id", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "referrals_invited", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "last_active_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "daily_gpt54_used", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "free_image_week_key", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "free_image_week_used", "INTEGER NOT NULL DEFAULT 0")
@@ -483,6 +568,9 @@ class UserStore:
             self._ensure_column(conn, "payment_requests", "recurring_consent_text", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "receipt_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_activations_unique ON promo_activations(chat_id, promo_code)"
+            )
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -507,17 +595,30 @@ class UserStore:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
             if row is None:
+                referral_code = referral_code_for_chat(chat_id)
                 conn.execute(
                     """
                     INSERT INTO users (
-                        chat_id, plan, is_blocked, selected_model_alias, usage_date,
+                        chat_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
+                        selected_model_alias, usage_date,
                         daily_messages_used, daily_images_used, daily_gpt54_used,
                         free_image_week_key, free_image_week_used,
                         credits_balance, credits_spent_total,
+                        last_active_at,
                         created_at, updated_at
-                    ) VALUES (?, 'free', 0, ?, ?, 0, 0, 0, ?, 0, ?, 0, ?, ?)
+                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, ?, 0, 0, 0, ?, 0, ?, 0, ?, ?, ?)
                     """,
-                    (chat_id, default_model_alias, today, week_key, FREE_DAILY_CREDITS, now, now),
+                    (
+                        chat_id,
+                        referral_code,
+                        default_model_alias,
+                        today,
+                        week_key,
+                        FREE_DAILY_CREDITS,
+                        now,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -560,6 +661,14 @@ class UserStore:
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
+            if not str(row["referral_code"] or "").strip():
+                conn.execute(
+                    "UPDATE users SET referral_code = ?, updated_at = ? WHERE chat_id = ?",
+                    (referral_code_for_chat(chat_id), now, chat_id),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+
             return dict(row)
 
     def set_selected_model(self, chat_id: int, alias: str) -> None:
@@ -577,6 +686,175 @@ class UserStore:
                 (email.strip(), phone.strip(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
+
+    def touch_last_active(self, chat_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET last_active_at = ?, updated_at = ? WHERE chat_id = ?",
+                (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def set_onboarding_done(self, chat_id: int, done: bool = True) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET onboarding_done = ?, updated_at = ? WHERE chat_id = ?",
+                (1 if done else 0, datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def apply_referral_code(self, chat_id: int, referral_code: str, bonus_credits: int) -> tuple[bool, str]:
+        code = normalize_referral_code(referral_code)
+        if not code:
+            return False, "Пустой реферальный код."
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            if not user:
+                conn.rollback()
+                return False, "Пользователь не найден."
+            if int(user["referred_by_chat_id"] or 0) > 0:
+                conn.rollback()
+                return False, "Реферальный код уже был использован."
+            owner = conn.execute("SELECT * FROM users WHERE referral_code = ? LIMIT 1", (code,)).fetchone()
+            if not owner:
+                conn.rollback()
+                return False, "Такого реферального кода нет."
+            owner_chat_id = int(owner["chat_id"])
+            if owner_chat_id == int(chat_id):
+                conn.rollback()
+                return False, "Нельзя активировать свой код."
+
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                """
+                UPDATE users
+                SET referred_by_chat_id = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (owner_chat_id, now, chat_id),
+            )
+            conn.execute(
+                """
+                UPDATE users
+                SET referrals_invited = referrals_invited + 1, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (now, owner_chat_id),
+            )
+            if bonus_credits > 0:
+                conn.execute(
+                    "UPDATE users SET credits_balance = credits_balance + ?, updated_at = ? WHERE chat_id = ?",
+                    (bonus_credits, now, chat_id),
+                )
+                conn.execute(
+                    "UPDATE users SET credits_balance = credits_balance + ?, updated_at = ? WHERE chat_id = ?",
+                    (bonus_credits, now, owner_chat_id),
+                )
+            conn.commit()
+            return True, str(owner_chat_id)
+
+    def redeem_promo_code(self, chat_id: int, promo_code: str, credits: int) -> tuple[bool, str]:
+        code = normalize_referral_code(promo_code)
+        if not code:
+            return False, "Пустой промокод."
+        if credits <= 0:
+            return False, "Промокод сейчас недоступен."
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO promo_activations (chat_id, promo_code, credits, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (chat_id, code, credits, now),
+                )
+            except sqlite3.IntegrityError:
+                return False, "Этот промокод уже активирован."
+            conn.execute(
+                "UPDATE users SET credits_balance = credits_balance + ?, updated_at = ? WHERE chat_id = ?",
+                (credits, now, chat_id),
+            )
+            conn.commit()
+        return True, str(credits)
+
+    def list_recent_users(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chat_id, plan, is_blocked, onboarding_done, credits_balance,
+                       daily_messages_used, daily_images_used, last_active_at, updated_at
+                FROM users
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_user(self, chat_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_recent_payments(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, chat_id, plan, amount_rub, status, provider_ref, created_at, paid_at, activated_at
+                FROM payment_requests
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def adjust_credits(self, chat_id: int, delta: int) -> int:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET credits_balance = credits_balance + ?, updated_at = ? WHERE chat_id = ?",
+                (delta, now, chat_id),
+            )
+            conn.commit()
+            row = conn.execute("SELECT credits_balance FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            return int((row["credits_balance"] if row else 0) or 0)
+
+    def reset_daily_counters(self, chat_id: int) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET daily_messages_used = 0, daily_images_used = 0, daily_gpt54_used = 0, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (now, chat_id),
+            )
+            conn.commit()
+
+    def list_reengage_candidates(self, dormant_days: int, limit: int) -> list[dict[str, Any]]:
+        if dormant_days <= 0:
+            dormant_days = 1
+        if limit <= 0:
+            limit = 1
+        cutoff = (datetime.utcnow() - timedelta(days=dormant_days)).replace(microsecond=0).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chat_id, plan, free_image_week_used, last_active_at, credits_balance
+                FROM users
+                WHERE plan = 'free'
+                  AND (last_active_at = '' OR last_active_at <= ?)
+                  AND free_image_week_used = 0
+                ORDER BY last_active_at ASC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def set_plan(self, chat_id: int, plan: str) -> None:
         expires = "" if plan == "free" else None
@@ -935,11 +1213,14 @@ class BotState:
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
         self.pending_receipt_plan: dict[int, str] = {}
         self.pending_image_prompt: set[int] = set()
+        self.pending_promo_code_input: set[int] = set()
+        self.pending_referral_code_input: set[int] = set()
         self.image_request_prefs: dict[int, dict[str, str]] = {}
         self.processed_updates: deque[str] = deque()
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
         self.last_image_at: dict[int, datetime] = {}
+        self.error_alert_last_at: dict[str, datetime] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.user_store = UserStore(DB_PATH)
@@ -951,6 +1232,46 @@ class BotState:
 
 
 state = BotState()
+
+
+def init_sentry_if_enabled() -> None:
+    if not SENTRY_DSN:
+        return
+    try:
+        import sentry_sdk  # type: ignore
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=SENTRY_ENVIRONMENT,
+            traces_sample_rate=0.0,
+        )
+        log.info("Sentry initialized")
+    except Exception:
+        log.exception("Failed to initialize Sentry")
+
+
+def capture_exception_safe(exc: Exception) -> None:
+    if not SENTRY_DSN:
+        return
+    try:
+        import sentry_sdk  # type: ignore
+
+        sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
+
+
+async def notify_admin_alert(key: str, text: str) -> None:
+    if not ERROR_ALERTS_ENABLED or not ADMIN_IDS:
+        return
+    now = datetime.utcnow()
+    last = state.error_alert_last_at.get(key)
+    if last and (now - last).total_seconds() < max(10, ERROR_ALERT_COOLDOWN_SEC):
+        return
+    state.error_alert_last_at[key] = now
+    for admin_id in ADMIN_IDS:
+        with suppress(Exception):
+            await max_send_message(admin_id, f"⚠️ ALERT [{key}]\n{text}", notify=False)
 
 
 def require_env() -> None:
@@ -1194,6 +1515,10 @@ def support_help_text() -> str:
     )
 
 
+def channel_url_value() -> str:
+    return CHANNEL_URL or "https://max.ru/id231128398751_biz"
+
+
 def support_admin_templates_text() -> str:
     return (
         "Шаблоны для спорных кейсов\n\n"
@@ -1210,6 +1535,34 @@ def support_admin_templates_text() -> str:
         "«Получили запрос на оспаривание платежа по заявке #{request_id}. "
         "Для проверки пришлите дату/время оплаты и скрин подтверждения операции.»"
     )
+
+
+def admin_panel_enabled() -> bool:
+    return bool(ADMIN_PANEL_TOKEN)
+
+
+def admin_panel_authorized(token: str) -> bool:
+    return bool(ADMIN_PANEL_TOKEN) and token.strip() == ADMIN_PANEL_TOKEN
+
+
+def backups_dir() -> Path:
+    path = DATA_DIR / "backups"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def create_db_backup() -> Path:
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    target = backups_dir() / f"bot-{stamp}.sqlite3"
+    with sqlite3.connect(DB_PATH) as src, sqlite3.connect(target) as dst:
+        src.backup(dst)
+    files = sorted(backups_dir().glob("bot-*.sqlite3"))
+    keep = max(3, BACKUP_KEEP_FILES)
+    if len(files) > keep:
+        for old in files[: len(files) - keep]:
+            with suppress(Exception):
+                old.unlink()
+    return target
 
 
 def payment_status_label(status: str) -> str:
@@ -1462,17 +1815,65 @@ def build_keyboard() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "Модели", "payload": "action:models"},
                     ],
                     [
+                        {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+                        {"type": "callback", "text": "🎁 Бонусы", "payload": "action:growth"},
+                    ],
+                    [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Сброс", "payload": "action:clear"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                     [
-                        {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+                        {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
                     ],
                 ]
             },
         }
     ]
+
+
+def build_growth_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "👥 Мой реф-код", "payload": "growth:ref_show"},
+                        {"type": "callback", "text": "🎟 Ввести реф-код", "payload": "growth:ref_enter"},
+                    ],
+                    [
+                        {"type": "callback", "text": "🎁 Промокод", "payload": "growth:promo_enter"},
+                        {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_onboarding_keyboard(step: int) -> list[dict[str, Any]]:
+    if step == 1:
+        buttons = [
+            [{"type": "callback", "text": "Дальше", "payload": "onboard:2"}],
+            [{"type": "callback", "text": "Пропустить", "payload": "onboard:skip"}],
+        ]
+    elif step == 2:
+        buttons = [
+            [{"type": "callback", "text": "💬 Задать вопрос", "payload": "onboard:scenario:text"}],
+            [{"type": "callback", "text": "🎨 Генерировать картинку", "payload": "onboard:scenario:image"}],
+            [{"type": "callback", "text": "💎 Выбрать тариф", "payload": "onboard:scenario:tariff"}],
+            [{"type": "callback", "text": "Дальше", "payload": "onboard:3"}],
+        ]
+    else:
+        buttons = [
+            [{"type": "callback", "text": "Готово, начать", "payload": "onboard:done"}],
+            [{"type": "callback", "text": "📣 Канал с обновлениями", "payload": "action:channel"}],
+        ]
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
 def get_image_prefs(chat_id: int) -> dict[str, str]:
@@ -2541,6 +2942,79 @@ async def send_menu(chat_id: int) -> None:
     await max_send_message(chat_id, text, attachments=build_keyboard())
 
 
+async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
+    row = user_profile(chat_id)
+    if step <= 1:
+        text = (
+            "👋 Добро пожаловать!\n\n"
+            "Это AI-бот в MAX:\n"
+            "• ответы через GPT, Gemini и DeepSeek\n"
+            "• генерация картинок\n"
+            "• кредиты и прозрачные лимиты\n\n"
+            "Давай за 3 коротких шага покажу как пользоваться."
+        )
+    elif step == 2:
+        text = (
+            "⚡ Шаг 2/3: выбери быстрый сценарий\n\n"
+            "• вопрос/текст\n"
+            "• картинка\n"
+            "• выбор тарифа\n\n"
+            "Можно нажать кнопку ниже или просто написать сообщение."
+        )
+    else:
+        text = (
+            "✅ Шаг 3/3: всё готово\n\n"
+            f"Сейчас модель: {current_model_label(chat_id)}\n"
+            f"{usage_text(row)}\n\n"
+            "Нажми «Готово, начать», и открою основное меню."
+        )
+    await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=notify)
+
+
+async def send_growth_menu(chat_id: int) -> None:
+    row = user_profile(chat_id)
+    referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+    text = (
+        "🎁 Бонусы и рост\n\n"
+        f"Твой реф-код: {referral_code}\n"
+        f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
+        "Друг активирует код командой: /ref <код>\n\n"
+        f"Промокод welcome: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+        "Обновления и кейсы: в нашем канале."
+    )
+    await max_send_message(chat_id, text, attachments=build_growth_keyboard())
+
+
+async def send_channel(chat_id: int) -> None:
+    await max_send_message(
+        chat_id,
+        f"📣 Канал проекта:\n{channel_url_value()}",
+        attachments=build_keyboard(),
+    )
+
+
+async def send_reengage_nudges(days: int, limit: int) -> tuple[int, int]:
+    targets = state.user_store.list_reengage_candidates(days, limit)
+    sent = 0
+    total = len(targets)
+    for item in targets:
+        target = int(item.get("chat_id", 0) or 0)
+        if target <= 0:
+            continue
+        with suppress(Exception):
+            await max_send_message(
+                target,
+                (
+                    "👋 Возвращайся, у тебя доступна 1 бесплатная картинка недели.\n"
+                    "Нажми «🎨 Картинка» и отправь идею."
+                ),
+                attachments=build_keyboard(),
+                notify=False,
+            )
+            sent += 1
+    return sent, total
+
+
 async def send_models(chat_id: int) -> None:
     row = user_profile(chat_id)
     await max_send_message(chat_id, build_models_text(row["plan"], include_prices=False), attachments=build_keyboard())
@@ -3131,7 +3605,10 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             "/admin block <chat_id> <on|off>\n"
             "/admin pay <request_id> <paid|cancel>\n"
             "/admin templates\n"
-            "/admin kpi [days]",
+            "/admin backup\n"
+            "/admin nudge [days] [limit]\n"
+            "/admin kpi [days]\n"
+            "/admin panel",
         )
         return True
 
@@ -3232,6 +3709,36 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         await max_send_message(chat_id, support_admin_templates_text())
         return True
 
+    if action == "backup":
+        try:
+            backup_file = create_db_backup()
+            await max_send_message(chat_id, f"Бэкап создан: {backup_file}")
+        except Exception as exc:
+            capture_exception_safe(exc)
+            await max_send_message(chat_id, f"Не удалось создать бэкап: {exc}")
+        return True
+
+    if action == "nudge":
+        days = REENGAGE_DORMANT_DAYS
+        limit = REENGAGE_BATCH_LIMIT
+        if len(parts) >= 3 and parts[2].isdigit():
+            days = max(1, int(parts[2]))
+        if len(parts) >= 4 and parts[3].isdigit():
+            limit = max(1, int(parts[3]))
+        sent, total = await send_reengage_nudges(days=days, limit=limit)
+        await max_send_message(chat_id, f"Реактивация: отправлено {sent}/{total} (dormant_days={days}, limit={limit})")
+        return True
+
+    if action == "panel":
+        if not admin_panel_enabled():
+            await max_send_message(chat_id, "ADMIN_PANEL_TOKEN не задан. Панель выключена.")
+            return True
+        if not PUBLIC_BASE_URL:
+            await max_send_message(chat_id, "PUBLIC_BASE_URL не задан, ссылку на панель сформировать нельзя.")
+            return True
+        await max_send_message(chat_id, f"Панель: {PUBLIC_BASE_URL}/admin/panel?token={ADMIN_PANEL_TOKEN}")
+        return True
+
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
     return True
 
@@ -3315,10 +3822,110 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await send_menu(chat_id)
         return True
 
+    if payload == "action:growth":
+        if callback_id:
+            await answer_callback(callback_id, "Бонусы")
+        await send_growth_menu(chat_id)
+        return True
+
+    if payload == "action:channel":
+        if callback_id:
+            await answer_callback(callback_id, "Канал")
+        await send_channel(chat_id)
+        return True
+
     if payload == "action:support":
         if callback_id:
             await answer_callback(callback_id, "Открываю помощь")
         await max_send_message(chat_id, support_help_text(), attachments=build_keyboard(), notify=False)
+        return True
+
+    if payload == "growth:ref_show":
+        if callback_id:
+            await answer_callback(callback_id, "Твой реф-код")
+        row = user_profile(chat_id)
+        code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        await max_send_message(
+            chat_id,
+            (
+                f"👥 Твой реф-код: {code}\n\n"
+                f"Пригласи друга: он вводит /ref {code}\n"
+                f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
+            ),
+            attachments=build_growth_keyboard(),
+            notify=False,
+        )
+        return True
+
+    if payload == "growth:ref_enter":
+        state.pending_referral_code_input.add(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Жду код")
+        await max_send_message(
+            chat_id,
+            "Введи реферальный код одним сообщением (пример: RFABC123). Для отмены отправь «отмена».",
+            attachments=build_growth_keyboard(),
+            notify=False,
+        )
+        return True
+
+    if payload == "growth:promo_enter":
+        state.pending_promo_code_input.add(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Жду промокод")
+        await max_send_message(
+            chat_id,
+            "Введи промокод одним сообщением (пример: WELCOME). Для отмены отправь «отмена».",
+            attachments=build_growth_keyboard(),
+            notify=False,
+        )
+        return True
+
+    if payload == "onboard:skip":
+        state.user_store.set_onboarding_done(chat_id, True)
+        if callback_id:
+            await answer_callback(callback_id, "Ок")
+        await send_menu(chat_id)
+        return True
+
+    if payload == "onboard:2":
+        if callback_id:
+            await answer_callback(callback_id, "Шаг 2")
+        await send_onboarding(chat_id, step=2, notify=False)
+        return True
+
+    if payload == "onboard:3":
+        if callback_id:
+            await answer_callback(callback_id, "Шаг 3")
+        await send_onboarding(chat_id, step=3, notify=False)
+        return True
+
+    if payload == "onboard:done":
+        state.user_store.set_onboarding_done(chat_id, True)
+        if callback_id:
+            await answer_callback(callback_id, "Погнали")
+        await send_menu(chat_id)
+        return True
+
+    if payload == "onboard:scenario:text":
+        state.user_store.set_onboarding_done(chat_id, True)
+        if callback_id:
+            await answer_callback(callback_id, "Текст")
+        await max_send_message(chat_id, "Супер, просто напиши вопрос в чат — отвечу сразу.", attachments=build_keyboard(), notify=False)
+        return True
+
+    if payload == "onboard:scenario:image":
+        state.user_store.set_onboarding_done(chat_id, True)
+        if callback_id:
+            await answer_callback(callback_id, "Картинка")
+        await send_image_menu(chat_id)
+        return True
+
+    if payload == "onboard:scenario:tariff":
+        state.user_store.set_onboarding_done(chat_id, True)
+        if callback_id:
+            await answer_callback(callback_id, "Тарифы")
+        await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), notify=False)
         return True
 
     if payload == "action:image_menu":
@@ -3632,6 +4239,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
         arg = command[1:]
 
     if command in {"/start", "/menu"}:
+        row = user_profile(chat_id)
+        if command == "/start" and int(row.get("onboarding_done", 0) or 0) == 0:
+            await send_onboarding(chat_id, step=1)
+            return True
         await send_menu(chat_id)
         return True
 
@@ -3670,6 +4281,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
         await max_send_message(chat_id, support_help_text(), attachments=build_keyboard())
         return True
 
+    if command == "/channel":
+        await send_channel(chat_id)
+        return True
+
     if command == "/buy":
         if not arg:
             await max_send_message(chat_id, "Выбери тариф кнопками ниже.", attachments=build_tariffs_keyboard_pricing())
@@ -3694,6 +4309,57 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Для пользователей команда скрыта. Используй кнопки в разделе «Тарифы».", attachments=build_tariffs_keyboard_pricing())
             return True
         await send_payments(chat_id)
+        return True
+
+    if command == "/ref":
+        row = user_profile(chat_id)
+        if not arg:
+            code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+            await max_send_message(
+                chat_id,
+                (
+                    f"👥 Твой реф-код: {code}\n"
+                    f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
+                    f"Другу нужно отправить: /ref {code}"
+                ),
+                attachments=build_growth_keyboard(),
+            )
+            return True
+
+        ok, info = state.user_store.apply_referral_code(chat_id, arg, REFERRAL_BONUS_CREDITS)
+        if not ok:
+            await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+            return True
+        owner_chat_id = int(info)
+        await max_send_message(
+            chat_id,
+            f"Готово! Реферальный код принят. Тебе начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+            attachments=build_growth_keyboard(),
+        )
+        with suppress(Exception):
+            await max_send_message(
+                owner_chat_id,
+                f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+                attachments=build_keyboard(),
+                notify=False,
+            )
+        return True
+
+    if command == "/promo":
+        if not arg:
+            state.pending_promo_code_input.add(chat_id)
+            await max_send_message(chat_id, "Введи промокод одним сообщением.", attachments=build_growth_keyboard())
+            return True
+        code = normalize_referral_code(arg)
+        credits = promo_catalog().get(code, 0)
+        if credits <= 0:
+            await max_send_message(chat_id, "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+            return True
+        ok, info = state.user_store.redeem_promo_code(chat_id, code, credits)
+        if not ok:
+            await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+            return True
+        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.", attachments=build_growth_keyboard())
         return True
 
     if command == "/preset":
@@ -3787,6 +4453,65 @@ async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
     return True
 
 
+async def handle_pending_referral_input(chat_id: int, text: str) -> bool:
+    if chat_id not in state.pending_referral_code_input:
+        return False
+    lowered = text.strip().lower()
+    if lowered in {"отмена", "cancel", "/cancel"}:
+        state.pending_referral_code_input.discard(chat_id)
+        await max_send_message(chat_id, "Ок, отменил ввод реферального кода.", attachments=build_growth_keyboard())
+        return True
+    if text.strip().startswith("/"):
+        state.pending_referral_code_input.discard(chat_id)
+        return False
+
+    state.pending_referral_code_input.discard(chat_id)
+    ok, info = state.user_store.apply_referral_code(chat_id, text, REFERRAL_BONUS_CREDITS)
+    if not ok:
+        await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+        return True
+    owner_chat_id = int(info)
+    await max_send_message(
+        chat_id,
+        f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+        attachments=build_growth_keyboard(),
+    )
+    with suppress(Exception):
+        await max_send_message(
+            owner_chat_id,
+            f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+            attachments=build_keyboard(),
+            notify=False,
+        )
+    return True
+
+
+async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
+    if chat_id not in state.pending_promo_code_input:
+        return False
+    lowered = text.strip().lower()
+    if lowered in {"отмена", "cancel", "/cancel"}:
+        state.pending_promo_code_input.discard(chat_id)
+        await max_send_message(chat_id, "Ок, отменил ввод промокода.", attachments=build_growth_keyboard())
+        return True
+    if text.strip().startswith("/"):
+        state.pending_promo_code_input.discard(chat_id)
+        return False
+    state.pending_promo_code_input.discard(chat_id)
+
+    code = normalize_referral_code(text)
+    credits = promo_catalog().get(code, 0)
+    if credits <= 0:
+        await max_send_message(chat_id, "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+        return True
+    ok, info = state.user_store.redeem_promo_code(chat_id, code, credits)
+    if not ok:
+        await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+        return True
+    await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.", attachments=build_growth_keyboard())
+    return True
+
+
 async def process_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict) or not is_supported_update(update):
         return
@@ -3804,17 +4529,27 @@ async def process_update(update: dict[str, Any]) -> None:
         return
 
     row = user_profile(chat_id)
+    state.user_store.touch_last_active(chat_id)
     if row["is_blocked"]:
         return
 
     if update_type in {"bot_started", "user_added", "bot_added"} and not text:
-        await send_menu(chat_id)
+        if int(row.get("onboarding_done", 0) or 0) == 0:
+            await send_onboarding(chat_id, step=1)
+        else:
+            await send_menu(chat_id)
         return
     if not text:
         return
 
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
+    if int(row.get("onboarding_done", 0) or 0) == 0 and text.strip().lower() not in {"/start"}:
+        state.user_store.set_onboarding_done(chat_id, True)
     try:
+        if await handle_pending_referral_input(chat_id, text):
+            return
+        if await handle_pending_promo_input(chat_id, text):
+            return
         if await handle_pending_receipt_input(chat_id, text):
             return
         if await handle_pending_image_prompt_input(chat_id, text):
@@ -3899,6 +4634,8 @@ async def process_update(update: dict[str, Any]) -> None:
             raise
     except Exception as exc:
         log.exception("Failed to process update")
+        capture_exception_safe(exc)
+        await notify_admin_alert("process_update", f"chat_id={chat_id}\nerror={exc}")
         with suppress(Exception):
             await max_send_message(chat_id, f"Ошибка: {exc}")
 
@@ -3940,8 +4677,10 @@ async def polling_loop() -> None:
                 await process_update(update)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("Polling loop error")
+            capture_exception_safe(exc)
+            await notify_admin_alert("polling_loop", f"Polling loop error: {exc}")
             await asyncio.sleep(3)
 
 
@@ -3949,6 +4688,7 @@ async def polling_loop() -> None:
 async def lifespan(_: FastAPI):
     require_env()
     validate_pricing_sanity()
+    init_sentry_if_enabled()
     await get_session()
     if RUN_MODE == "polling":
         state.polling_task = asyncio.create_task(polling_loop())
@@ -4022,6 +4762,67 @@ async def mailru_domain_verify() -> FileResponse:
     return FileResponse(site_file("mailru-domainMB5PESlCeJQEXuoC.html"))
 
 
+@app.get("/admin/panel", response_class=HTMLResponse)
+async def admin_panel(token: str = "", chat_id: int | None = None, request_id: int | None = None) -> HTMLResponse:
+    if not admin_panel_authorized(token):
+        raise HTTPException(status_code=403, detail="forbidden")
+    return HTMLResponse(render_admin_panel_html(token=token, chat_id=chat_id, request_id=request_id))
+
+
+@app.get("/admin/panel/action", response_class=HTMLResponse)
+async def admin_panel_action(
+    token: str = "",
+    type: str = "",
+    chat_id: int | None = None,
+    request_id: int | None = None,
+    plan: str = "",
+    amount: int = 0,
+    value: str = "",
+) -> HTMLResponse:
+    if not admin_panel_authorized(token):
+        raise HTTPException(status_code=403, detail="forbidden")
+    message = "Готово"
+    action = type.strip().lower()
+    try:
+        if action == "backup":
+            backup_file = create_db_backup()
+            message = f"Бэкап создан: {backup_file}"
+        elif action == "nudge":
+            sent, total = await send_reengage_nudges(days=REENGAGE_DORMANT_DAYS, limit=REENGAGE_BATCH_LIMIT)
+            message = f"Реактивация: отправлено {sent}/{total}"
+        elif action == "set_plan" and chat_id is not None and plan in PLAN_CONFIGS:
+            user_profile(chat_id)
+            state.user_store.set_plan(chat_id, plan)
+            state.user_store.set_selected_model(chat_id, best_default_alias_for_plan(plan))
+            if plan in PAID_PLANS:
+                state.user_store.set_credits(chat_id, credits_for_plan(plan))
+            message = f"План пользователя {chat_id} -> {plan}"
+        elif action == "add_credits" and chat_id is not None and amount != 0:
+            user_profile(chat_id)
+            balance = state.user_store.adjust_credits(chat_id, amount)
+            message = f"Баланс пользователя {chat_id}: {balance}"
+        elif action == "reset_daily" and chat_id is not None:
+            state.user_store.reset_daily_counters(chat_id)
+            message = f"Дневные лимиты пользователя {chat_id} сброшены"
+        elif action == "block" and chat_id is not None and value in {"on", "off"}:
+            state.user_store.set_blocked(chat_id, value == "on")
+            message = f"Пользователь {chat_id}: block={value}"
+        elif action == "payment" and request_id is not None and value in {"paid", "cancel"}:
+            if value == "paid":
+                ok, info = await activate_payment_request(request_id, source="admin panel")
+                message = f"Платеж #{request_id}: {info}" if ok else f"Платеж #{request_id}: {info}"
+            else:
+                changed, info = cancel_payment_if_open(request_id)
+                message = f"Платеж #{request_id}: {'отменен' if changed else info}"
+        else:
+            message = "Некорректные параметры действия."
+    except Exception as exc:
+        capture_exception_safe(exc)
+        message = f"Ошибка: {exc}"
+
+    return HTMLResponse(render_admin_panel_html(token=token, chat_id=chat_id, request_id=request_id, message=message))
+
+
 def payment_status_view(request_id: int | None) -> dict[str, Any]:
     if request_id is None:
         return {
@@ -4055,6 +4856,117 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
         "plan": str(payment.get("plan", "")),
         "amount_rub": int(payment.get("amount_rub", 0)),
     }
+
+
+def render_admin_panel_html(
+    token: str,
+    chat_id: int | None = None,
+    request_id: int | None = None,
+    message: str = "",
+) -> str:
+    users = state.user_store.list_recent_users(limit=25)
+    payments = state.user_store.list_recent_payments(limit=25)
+    selected_user = state.user_store.get_user(chat_id) if chat_id else None
+    selected_payment = state.user_store.get_payment(request_id) if request_id else None
+    esc = html.escape
+    info_block = ""
+    if message:
+        info_block += f"<p style='padding:10px;border:1px solid #dbe3f0;border-radius:8px;background:#f8fbff'>{esc(message)}</p>"
+    if selected_user:
+        info_block += (
+            "<h3>Пользователь</h3>"
+            f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
+        )
+    if selected_payment:
+        info_block += (
+            "<h3>Платеж</h3>"
+            f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
+        )
+
+    user_rows = []
+    for row in users:
+        cid = int(row.get("chat_id", 0) or 0)
+        user_rows.append(
+            "<tr>"
+            f"<td>{cid}</td><td>{esc(str(row.get('plan', '')))}</td>"
+            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
+            f"<td>{int(row.get('daily_messages_used', 0) or 0)}/{int(row.get('daily_images_used', 0) or 0)}</td>"
+            f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
+            f"<td><a href='/admin/panel?token={esc(token)}&chat_id={cid}'>Открыть</a></td>"
+            "</tr>"
+        )
+
+    payment_rows = []
+    for row in payments:
+        rid = int(row.get("id", 0) or 0)
+        payment_rows.append(
+            "<tr>"
+            f"<td>{rid}</td><td>{int(row.get('chat_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('plan', '')))}</td>"
+            f"<td>{int(row.get('amount_rub', 0) or 0)}</td>"
+            f"<td>{esc(payment_status_label(str(row.get('status', ''))))}</td>"
+            f"<td><a href='/admin/panel?token={esc(token)}&request_id={rid}'>Открыть</a></td>"
+            "</tr>"
+        )
+
+    action_block = ""
+    if selected_user:
+        cid = int(selected_user["chat_id"])
+        action_block = (
+            "<h3>Ручная корректировка</h3>"
+            "<p>"
+            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=free'>План free</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=lite'>План lite</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=start'>План start</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=pro'>План pro</a>"
+            "</p>"
+            "<p>"
+            f"<a href='/admin/panel/action?token={esc(token)}&type=add_credits&chat_id={cid}&amount=500'>+500 кредитов</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=add_credits&chat_id={cid}&amount=-500'>-500 кредитов</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=reset_daily&chat_id={cid}'>Сброс дневных лимитов</a>"
+            "</p>"
+            "<p>"
+            f"<a href='/admin/panel/action?token={esc(token)}&type=block&chat_id={cid}&value=on'>Block ON</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=block&chat_id={cid}&value=off'>Block OFF</a>"
+            "</p>"
+        )
+    if selected_payment:
+        rid = int(selected_payment["id"])
+        action_block += (
+            "<h3>Платеж</h3>"
+            "<p>"
+            f"<a href='/admin/panel/action?token={esc(token)}&type=payment&request_id={rid}&value=paid'>Подтвердить оплату</a> | "
+            f"<a href='/admin/panel/action?token={esc(token)}&type=payment&request_id={rid}&value=cancel'>Отменить</a>"
+            "</p>"
+        )
+
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Admin Panel</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;background:#f6f8fb;color:#13213a;margin:0;padding:20px}}
+.card{{background:#fff;border:1px solid #dbe3f0;border-radius:14px;padding:16px;margin-bottom:14px}}
+table{{width:100%;border-collapse:collapse}} th,td{{border-bottom:1px solid #ecf1fa;padding:8px;text-align:left;font-size:13px}}
+a{{color:#1458d4;text-decoration:none}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#fbfdff;border:1px solid #e1e8f5;border-radius:8px;padding:10px}}
+</style></head>
+<body>
+<div class="card"><h2>Admin Panel</h2>
+<p><a href="/admin/panel/action?token={esc(token)}&type=backup">Создать бэкап БД</a> |
+<a href="/admin/panel/action?token={esc(token)}&type=nudge">Реактивировать free-пользователей</a></p>
+{info_block}
+{action_block}
+</div>
+<div class="card"><h3>Последние пользователи</h3>
+<table><tr><th>chat_id</th><th>plan</th><th>credits</th><th>usage d</th><th>blocked</th><th>last_active_at</th><th></th></tr>
+{''.join(user_rows)}
+</table></div>
+<div class="card"><h3>Последние платежи</h3>
+<table><tr><th>id</th><th>chat_id</th><th>plan</th><th>amount</th><th>status</th><th></th></tr>
+{''.join(payment_rows)}
+</table></div>
+</body></html>"""
 
 
 @app.get("/payment/status")
@@ -4099,8 +5011,10 @@ async def max_webhook(request: Request) -> dict[str, bool]:
     for update in updates:
         try:
             await process_update(update)
-        except Exception:
+        except Exception as exc:
             log.exception("Unhandled webhook processing error")
+            capture_exception_safe(exc)
+            await notify_admin_alert("max_webhook", f"Unhandled webhook error: {exc}")
     return {"ok": True}
 
 
@@ -4112,6 +5026,8 @@ async def tbank_webhook(request: Request) -> PlainTextResponse:
 
     if not tbank_notification_is_valid(payload):
         log.warning("Invalid T-Bank webhook signature or terminal")
+        with suppress(Exception):
+            await notify_admin_alert("tbank_webhook", "Invalid webhook signature or terminal key.")
         raise HTTPException(status_code=403, detail="forbidden")
 
     order_id = scalar_string(payload.get("OrderId"))
