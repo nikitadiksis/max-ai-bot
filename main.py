@@ -544,6 +544,7 @@ class UserStore:
                     receipt_email TEXT NOT NULL DEFAULT '',
                     receipt_phone TEXT NOT NULL DEFAULT '',
                     selected_model_alias TEXT NOT NULL DEFAULT '',
+                    selected_preset TEXT NOT NULL DEFAULT '',
                     subscription_expires_at TEXT NOT NULL DEFAULT '',
                     recurring_enabled INTEGER NOT NULL DEFAULT 0,
                     recurring_cancel_from TEXT NOT NULL DEFAULT '',
@@ -632,6 +633,7 @@ class UserStore:
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "selected_preset", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "onboarding_done", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "referral_code", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "referred_by_chat_id", "INTEGER NOT NULL DEFAULT 0")
@@ -716,13 +718,13 @@ class UserStore:
                     """
                     INSERT INTO users (
                         chat_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
-                        selected_model_alias, usage_date,
+                        selected_model_alias, selected_preset, usage_date,
                         daily_messages_used, daily_images_used, daily_gpt54_used,
                         free_image_week_key, free_image_week_used,
                         credits_balance, credits_spent_total,
                         last_active_at,
                         created_at, updated_at
-                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, ?, 0, 0, 0, ?, 0, ?, 0, ?, ?, ?)
+                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, ?, 0, ?, 0, ?, ?, ?)
                     """,
                     (
                         chat_id,
@@ -794,6 +796,14 @@ class UserStore:
             conn.execute(
                 "UPDATE users SET selected_model_alias = ?, updated_at = ? WHERE chat_id = ?",
                 (alias, datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def set_selected_preset(self, chat_id: int, preset: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET selected_preset = ?, updated_at = ? WHERE chat_id = ?",
+                (preset.strip(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
 
@@ -2772,6 +2782,7 @@ def user_profile(chat_id: int) -> dict[str, Any]:
     if info is None or not plan_allowed(plan, info.min_plan):
         selected = best_default_alias_for_plan(plan)
         state.user_store.set_selected_model(chat_id, selected)
+        state.user_store.set_selected_preset(chat_id, "")
         row = state.user_store.get_or_create_user(chat_id, selected)
     return row
 
@@ -3323,6 +3334,18 @@ def current_model_label(chat_id: int) -> str:
     return model.label
 
 
+def current_model_display(chat_id: int) -> str:
+    row = user_profile(chat_id)
+    plan = str(row.get("plan", "free"))
+    selected = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan))
+    model = TEXT_MODELS.get(selected, DEFAULT_TEXT_MODEL)
+    preset = str(row.get("selected_preset", "") or "").strip().lower()
+    preset_cfg = MODEL_PRESETS.get(preset)
+    if preset_cfg and selected == resolve_preset_alias_for_plan(plan, preset):
+        return f"{preset_cfg['label']} — {model.label}"
+    return model.label
+
+
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
@@ -3559,7 +3582,7 @@ async def send_menu(chat_id: int) -> None:
         f"{capabilities}\n\n"
         f"{preset_block}\n\n"
         "Выбери действие кнопками или просто напиши вопрос.\n\n"
-        f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
+        f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
     )
@@ -3721,7 +3744,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             f"{capabilities}\n\n"
             f"{preset_block}\n\n"
             "Выбери действие кнопками или просто напиши вопрос.\n\n"
-            f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
+            f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
         )
@@ -4672,6 +4695,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         try:
             alias = resolve_preset_alias_for_chat(chat_id, preset)
             label = await set_user_model(chat_id, alias)
+            state.user_store.set_selected_preset(chat_id, preset)
             await show_ui_page(
                 chat_id,
                 UI_PAGE_MENU,
@@ -4690,6 +4714,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         alias = payload.split(":", 1)[1]
         try:
             label = await set_user_model(chat_id, alias)
+            state.user_store.set_selected_preset(chat_id, "")
             target_page = state.ui_page.get(chat_id, UI_PAGE_MENU)
             if target_page not in UI_PAGE_KEYS:
                 target_page = UI_PAGE_MENU
@@ -5405,6 +5430,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             return True
         alias = resolve_preset_alias_for_chat(chat_id, preset)
         label = await set_user_model(chat_id, alias)
+        state.user_store.set_selected_preset(chat_id, preset)
         await max_send_message(
             chat_id,
             f"Режим: {preset_cfg['label']}\nМодель: {label}",
@@ -5417,6 +5443,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Укажи модель: /model deepseek|gpt|gpt4o|gemini|gpt54", attachments=build_keyboard())
             return True
         label = await set_user_model(chat_id, arg)
+        state.user_store.set_selected_preset(chat_id, "")
         await max_send_message(chat_id, f"Выбрана модель: {label}", attachments=build_keyboard())
         return True
 
