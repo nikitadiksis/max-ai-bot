@@ -144,7 +144,7 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
-PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "80"))
+PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "0"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
 CHANNEL_PROMO_ENABLED = os.getenv("CHANNEL_PROMO_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 CHANNEL_PROMO_CODE = os.getenv("CHANNEL_PROMO_CODE", "CHANNEL").strip()
@@ -469,8 +469,8 @@ def channel_promo_meta(today: date | None = None) -> dict[str, Any]:
     )
     days_left = max(0, (end_exclusive - current).days)
     return {
-        "enabled": CHANNEL_PROMO_ENABLED and bool(promo_code) and CHANNEL_PROMO_CREDITS > 0,
-        "active": active,
+        "enabled": False,
+        "active": False,
         "code": promo_code,
         "credits": max(0, CHANNEL_PROMO_CREDITS),
         "start": start,
@@ -500,7 +500,9 @@ def promo_offer_for_code(code: str) -> tuple[int, int, str]:
 
 
 def promo_catalog() -> dict[str, int]:
-    catalog: dict[str, int] = {"WELCOME": max(0, PROMO_WELCOME_CREDITS)}
+    catalog: dict[str, int] = {}
+    if PROMO_WELCOME_CREDITS > 0:
+        catalog["WELCOME"] = int(PROMO_WELCOME_CREDITS)
     raw = PROMO_CODES_RAW
     if not raw:
         return {k: v for k, v in catalog.items() if v > 0}
@@ -2082,10 +2084,7 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "🎟 Ввести реф-код", "payload": "growth:ref_enter"},
                     ],
                     [
-                        {"type": "callback", "text": "🎁 Бонус за канал", "payload": "growth:channel_bonus"},
                         {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
-                    ],
-                    [
                         {"type": "callback", "text": "🎁 Промокод", "payload": "growth:promo_enter"},
                     ],
                     [
@@ -2245,7 +2244,7 @@ def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> li
     buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
     buttons.append(
         [
-            {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
             {"type": "callback", "text": "Помощь", "payload": "action:support"},
         ]
     )
@@ -2275,8 +2274,12 @@ def build_payments_keyboard(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ]
             )
 
-    buttons.append([{"type": "callback", "text": "Тарифы", "payload": "action:tariffs"}])
-    buttons.append([{"type": "callback", "text": "Помощь", "payload": "action:support"}])
+    buttons.append(
+        [
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ]
+    )
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -2323,7 +2326,8 @@ def build_consent_keyboard(plan: str) -> list[dict[str, Any]]:
                         },
                     ],
                     [
-                        {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
             },
@@ -2391,7 +2395,7 @@ def build_topups_keyboard() -> list[dict[str, Any]]:
                         },
                     ],
                     [
-                        {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -2410,7 +2414,8 @@ def build_topup_consent_keyboard(code: str) -> list[dict[str, Any]]:
                         {"type": "callback", "text": "Подтверждаю покупку", "payload": f"topup_consent:{code}"},
                     ],
                     [
-                        {"type": "callback", "text": "Отмена", "payload": "action:topups"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
             },
@@ -3121,7 +3126,7 @@ async def max_edit_message(
         "type": "text",
         "text": text,
     }
-    if attachments:
+    if attachments is not None:
         payload["attachments"] = attachments
 
     async with session.put(
@@ -3406,7 +3411,14 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
         f"По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT} кредитов (с тарифа {DEFAULT_IMAGE_MODEL.min_plan}).\n\n"
         "Выбери стиль и формат, затем нажми «Сгенерировать» или «По фото»."
     )
-    await max_send_message(chat_id, text, attachments=build_image_menu_keyboard(chat_id), notify=notify)
+    await show_managed_content(
+        chat_id,
+        text,
+        attachments=build_image_menu_keyboard(chat_id),
+        page=UI_PAGE_IMAGE_MENU,
+        push_history=False,
+        force_new=False,
+    )
 
 
 async def process_image_generation(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
@@ -3800,7 +3812,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         promo_items = sorted(promo_catalog().items())
         promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
         channel = channel_promo_meta()
-        channel_block = "Сейчас бонус за канал недоступен."
+        channel_block = "Бонус за подписку на канал пока отключен: в боте еще нет честной автопроверки подписки."
         if channel["enabled"]:
             if channel["active"]:
                 promo_lines.append(
@@ -3810,7 +3822,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
                     f"Бонус за канал: +{channel['credits']} кредитов.\n"
                     f"Срок акции: еще {channel['days_left']} дн.\n"
                     f"Срок бонуса: {channel['bonus_ttl_days']} дн.\n"
-                    "Подпишись на канал и нажми кнопку «Бонус за канал»."
+                    "Автопроверка подписки пока не подключена, поэтому выдача бонуса отключена."
                 )
             else:
                 promo_lines.append(f"• {channel['code']}: акция завершена")
@@ -3826,7 +3838,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             f"{channel_block}\n\n"
             "Доступные промокоды:\n"
             f"{promo_block}\n\n"
-            f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+            f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
             "Обновления и кейсы: в нашем канале."
         )
         return text, build_growth_keyboard()
@@ -3857,6 +3869,37 @@ async def show_ui_page(
 ) -> None:
     text, attachments = build_ui_page_payload(chat_id, page)
     ui_set_page(chat_id, page, push_history=push_history)
+    attachments = add_ui_nav_buttons(chat_id, attachments)
+
+    managed_mid = state.ui_message_mid.get(chat_id)
+    can_edit_managed = bool((not force_new) and managed_mid and ((not source_mid) or source_mid == managed_mid))
+    if can_edit_managed:
+        ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
+        if ok:
+            if callback_id:
+                await answer_callback(callback_id, notification)
+            return
+
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False)
+    if sent_mid:
+        state.ui_message_mid[chat_id] = sent_mid
+    if callback_id:
+        await answer_callback(callback_id, notification)
+
+
+async def show_managed_content(
+    chat_id: int,
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+    page: str | None = None,
+    push_history: bool = False,
+    notification: str = "Открываю",
+    force_new: bool = False,
+) -> None:
+    if page in UI_PAGE_KEYS:
+        ui_set_page(chat_id, str(page), push_history=push_history)
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     managed_mid = state.ui_message_mid.get(chat_id)
@@ -3995,7 +4038,7 @@ async def send_growth_menu(chat_id: int) -> None:
         "Друг активирует код командой: /ref <код>\n\n"
         "Доступные промокоды:\n"
         f"{promo_block}\n\n"
-        f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+        f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
         "Обновления и кейсы: в нашем канале."
     )
     await send_managed_message(chat_id, text, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
@@ -4094,7 +4137,13 @@ async def send_topups(chat_id: int) -> None:
     await send_managed_message(chat_id, text, attachments=build_topups_keyboard(), page=UI_PAGE_TOPUPS)
 
 
-async def send_topup_consent(chat_id: int, code: str, notify: bool = False) -> bool:
+async def send_topup_consent(
+    chat_id: int,
+    code: str,
+    notify: bool = False,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+) -> bool:
     pack = topup_spec(code)
     if not pack:
         await max_send_message(chat_id, "Неизвестный пакет кредитов.", attachments=build_topups_keyboard(), notify=notify)
@@ -4106,7 +4155,14 @@ async def send_topup_consent(chat_id: int, code: str, notify: bool = False) -> b
         "Это разовая покупка без автосписаний.\n"
         "Подтверди покупку кнопкой ниже."
     )
-    await send_managed_message(chat_id, text, attachments=build_topup_consent_keyboard(code), notify=notify)
+    await show_managed_content(
+        chat_id,
+        text,
+        attachments=build_topup_consent_keyboard(code),
+        callback_id=callback_id,
+        source_mid=source_mid,
+        notification="Открываю покупку",
+    )
     return True
 
 
@@ -4132,9 +4188,15 @@ def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
     return email, phone
 
 
-async def request_receipt_contact(chat_id: int, plan: str, notify: bool = False) -> None:
+async def request_receipt_contact(
+    chat_id: int,
+    plan: str,
+    notify: bool = False,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+) -> None:
     state.pending_receipt_plan[chat_id] = plan
-    await max_send_message(
+    await show_managed_content(
         chat_id,
         (
             "Перед оплатой нужен контакт для отправки чека.\n"
@@ -4144,23 +4206,37 @@ async def request_receipt_contact(chat_id: int, plan: str, notify: bool = False)
             "Чтобы отменить — отправь «отмена»."
         ),
         attachments=build_tariffs_keyboard_pricing(),
-        notify=notify,
+        callback_id=callback_id,
+        source_mid=source_mid,
+        notification="Нужен контакт для чека",
     )
 
 
-async def start_buy_flow(chat_id: int, plan: str, notify: bool = False) -> bool:
+async def start_buy_flow(
+    chat_id: int,
+    plan: str,
+    notify: bool = False,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+) -> bool:
     if plan not in BUYABLE_PLANS:
         await max_send_message(chat_id, "Доступно: lite, start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
         return False
     row = user_profile(chat_id)
     email, phone = effective_receipt_contact(row)
     if not (email or phone):
-        await request_receipt_contact(chat_id, plan, notify=notify)
+        await request_receipt_contact(chat_id, plan, notify=notify, callback_id=callback_id, source_mid=source_mid)
         return False
-    return await send_buy_consent(chat_id, plan, notify=notify)
+    return await send_buy_consent(chat_id, plan, notify=notify, callback_id=callback_id, source_mid=source_mid)
 
 
-async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> bool:
+async def send_buy_consent(
+    chat_id: int,
+    plan: str,
+    notify: bool = False,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+) -> bool:
     if plan not in BUYABLE_PLANS:
         await max_send_message(chat_id, "Доступно: lite, start или pro.", attachments=build_tariffs_keyboard_pricing(), notify=notify)
         return False
@@ -4175,7 +4251,14 @@ async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> boo
         "После согласия откроется оплата.\n"
         "Отменить автопродление можно в «Мой план»."
     )
-    await send_managed_message(chat_id, text, attachments=build_consent_keyboard(plan), notify=notify)
+    await show_managed_content(
+        chat_id,
+        text,
+        attachments=build_consent_keyboard(plan),
+        callback_id=callback_id,
+        source_mid=source_mid,
+        notification="Проверь условия",
+    )
     return True
 
 
@@ -4926,24 +5009,22 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload == "action:channel":
-        if callback_id:
-            await answer_callback(callback_id, "Канал")
-        await send_channel(chat_id)
-        return True
-
-    if payload == "action:support":
-        if callback_id:
-            await answer_callback(callback_id, "Открываю помощь")
-        await max_send_message(chat_id, support_help_text(), attachments=build_keyboard(), notify=False)
+        await show_managed_content(
+            chat_id,
+            f"📣 Канал проекта:\n{channel_url_value()}",
+            attachments=build_growth_keyboard(),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_GROWTH,
+            notification="Канал",
+        )
         return True
 
     if payload == "growth:ref_show":
-        if callback_id:
-            await answer_callback(callback_id, "Твой реф-код")
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
         invited = int(row.get("referrals_invited", 0) or 0)
-        await max_send_message(
+        await show_managed_content(
             chat_id,
             (
                 f"👥 Твой реф-код: {code}\n"
@@ -4952,63 +5033,48 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
             ),
             attachments=build_growth_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_GROWTH,
+            notification="Твой реф-код",
         )
         return True
 
     if payload == "growth:ref_enter":
         state.pending_referral_code_input.add(chat_id)
-        if callback_id:
-            await answer_callback(callback_id, "Жду код")
-        await max_send_message(
+        await show_managed_content(
             chat_id,
             "Введи реферальный код одним сообщением (пример: RFABC123). Для отмены отправь «отмена».",
             attachments=build_growth_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_GROWTH,
+            notification="Жду код",
         )
         return True
 
     if payload == "growth:promo_enter":
         state.pending_promo_code_input.add(chat_id)
-        if callback_id:
-            await answer_callback(callback_id, "Жду промокод")
-        await max_send_message(
+        await show_managed_content(
             chat_id,
-            "Введи промокод одним сообщением (пример: WELCOME). Для отмены отправь «отмена».",
+            "Введи промокод одним сообщением. Для отмены отправь «отмена».",
             attachments=build_growth_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_GROWTH,
+            notification="Жду промокод",
         )
         return True
 
     if payload == "growth:channel_bonus":
-        channel = channel_promo_meta()
-        if callback_id:
-            await answer_callback(callback_id, "Проверяю бонус")
-        if not channel["enabled"]:
-            await send_managed_message(chat_id, "Бонус за канал сейчас отключен.", attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
-            return True
-        if not channel["active"]:
-            if datetime.utcnow().date() < channel["start"]:
-                text = f"Акция еще не началась. Старт: {channel['start'].isoformat()}."
-            else:
-                text = "Акция с бонусом за канал уже завершена."
-            await send_managed_message(chat_id, text, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
-            return True
-        ok, info = state.user_store.redeem_promo_code(
+        await show_managed_content(
             chat_id,
-            str(channel["code"]),
-            int(channel["credits"]),
-            bonus_ttl_days=int(channel["bonus_ttl_days"]),
-        )
-        if not ok:
-            await send_managed_message(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
-            return True
-        ttl_tail = f" Бонус действует {int(channel['bonus_ttl_days'])} дн." if int(channel["bonus_ttl_days"]) > 0 else ""
-        await send_managed_message(
-            chat_id,
-            f"Бонус за канал активирован: +{info} кредитов.{ttl_tail}",
+            "Бонус за подписку на канал пока отключен: в боте еще нет честной автопроверки подписки.",
             attachments=build_growth_keyboard(),
+            callback_id=callback_id,
+            source_mid=source_mid,
             page=UI_PAGE_GROWTH,
+            notification="Бонус пока недоступен",
         )
         return True
 
@@ -5216,18 +5282,18 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             if callback_id:
                 await answer_callback(callback_id, "Неверный тариф")
             return True
-        if callback_id:
-            await answer_callback(callback_id, "Согласие получено")
         terms = recurring_terms_for_plan(plan)
         request_id, msg = await create_buy_request_v2(chat_id, plan, consent_text=terms)
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        await send_managed_message(
+        await show_managed_content(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            notification="Открываю оплату",
         )
         return True
 
@@ -5247,9 +5313,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Неверный тариф")
             await max_send_message(chat_id, "Доступно: Lite, Start или Pro.", attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        if callback_id:
-            await answer_callback(callback_id, "Проверь условия")
-        ok = await start_buy_flow(chat_id, plan, notify=False)
+        ok = await start_buy_flow(chat_id, plan, notify=False, callback_id=callback_id, source_mid=source_mid)
         if not ok:
             return True
         return True
@@ -5267,14 +5331,16 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         email, phone = effective_receipt_contact(row)
         if not (email or phone):
             state.pending_receipt_plan[chat_id] = f"topup_consent:{code}"
-            if callback_id:
-                await answer_callback(callback_id, "Нужен контакт для чека")
-            await request_receipt_contact(chat_id, f"topup_consent:{code}", notify=False)
+            await request_receipt_contact(
+                chat_id,
+                f"topup_consent:{code}",
+                notify=False,
+                callback_id=callback_id,
+                source_mid=source_mid,
+            )
             return True
 
-        if callback_id:
-            await answer_callback(callback_id, "Проверь покупку")
-        await send_topup_consent(chat_id, code, notify=False)
+        await send_topup_consent(chat_id, code, notify=False, callback_id=callback_id, source_mid=source_mid)
         return True
 
     if payload.startswith("topup_quick:"):
@@ -5283,38 +5349,42 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         email, phone = effective_receipt_contact(row)
         if not (email or phone):
             state.pending_receipt_plan[chat_id] = f"topup_consent:{code}"
-            if callback_id:
-                await answer_callback(callback_id, "Нужен контакт для чека")
-            await request_receipt_contact(chat_id, f"topup_consent:{code}", notify=False)
+            await request_receipt_contact(
+                chat_id,
+                f"topup_consent:{code}",
+                notify=False,
+                callback_id=callback_id,
+                source_mid=source_mid,
+            )
             return True
 
-        if callback_id:
-            await answer_callback(callback_id, "Открываю быструю покупку")
         request_id, msg = await create_topup_request_v2(chat_id, code)
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
-        await send_managed_message(
+        await show_managed_content(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            notification="Открываю быструю покупку",
         )
         return True
 
     if payload.startswith("topup_consent:"):
         code = payload.split(":", 1)[1].lower().strip()
-        if callback_id:
-            await answer_callback(callback_id, "Открываю оплату")
         request_id, msg = await create_topup_request_v2(chat_id, code)
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
-        await send_managed_message(
+        await show_managed_content(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            notification="Открываю оплату",
         )
         return True
 
@@ -5343,13 +5413,13 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 log.exception("T-Bank GetState failed from status button for request_id=%s", request_id)
 
         refreshed_status = str((payment or {}).get("status", "pending")).lower()
-        if callback_id:
-            await answer_callback(callback_id, payment_status_label(refreshed_status))
-        await send_managed_message(
+        await show_managed_content(
             chat_id,
             payment_user_status_text(payment or {}, bank_status=bank_status),
             attachments=build_payment_request_keyboard(request_id) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            notification=payment_status_label(refreshed_status),
         )
         return True
 
