@@ -2086,7 +2086,7 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
                     ],
                     [
-                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
                     ],
                 ]
             },
@@ -2162,7 +2162,7 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
                         {"type": "callback", "text": "🖼 По фото", "payload": "image_ref:start"},
                     ],
                     [
-                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -2227,7 +2227,7 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
                     ],
                     [
-                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -2348,7 +2348,7 @@ def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
                     ],
                     [
-                        {"type": "callback", "text": "Назад", "payload": "action:menu"},
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
                         {"type": "callback", "text": "Помощь", "payload": "action:support"},
                     ],
                 ]
@@ -3908,6 +3908,56 @@ async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> 
     await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=notify)
 
 
+async def show_onboarding_step(
+    chat_id: int,
+    step: int,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+    notification: str = "Открываю",
+) -> None:
+    row = user_profile(chat_id)
+    if step <= 1:
+        text = (
+            "👋 Добро пожаловать!\n\n"
+            "Это AI-бот в MAX:\n"
+            "• ответы через GPT, Gemini и DeepSeek\n"
+            "• генерация картинок\n"
+            "• кредиты и прозрачные лимиты\n\n"
+            "Давай за 3 коротких шага покажу как пользоваться."
+        )
+    elif step == 2:
+        text = (
+            "⚡ Шаг 2/3: выбери быстрый сценарий\n\n"
+            "• вопрос/текст\n"
+            "• картинка\n"
+            "• выбор тарифа\n\n"
+            "Можно нажать кнопку ниже или просто написать сообщение."
+        )
+    else:
+        text = (
+            "✅ Шаг 3/3: всё готово\n\n"
+            f"Сейчас модель: {current_model_label(chat_id)}\n"
+            f"{usage_text(row)}\n\n"
+            "Нажми «Готово, начать», и открою основное меню."
+        )
+    if source_mid:
+        ok = await max_edit_message(chat_id, source_mid, text, attachments=build_onboarding_keyboard(step))
+        if ok:
+            if callback_id:
+                await answer_callback(callback_id, notification)
+            return
+    await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=False)
+    if callback_id:
+        await answer_callback(callback_id, notification)
+
+
+async def close_onboarding_message(chat_id: int, source_mid: str | None, text: str = "Онбординг завершен.") -> None:
+    if not source_mid:
+        return
+    with suppress(Exception):
+        await max_edit_message(chat_id, source_mid, text, attachments=[])
+
+
 async def send_growth_menu(chat_id: int) -> None:
     row = user_profile(chat_id)
     referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
@@ -4730,6 +4780,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             )
             return True
 
+    if payload.startswith("onboard:") and int(user_profile(chat_id).get("onboarding_done", 0) or 0) == 1:
+        if callback_id:
+            await answer_callback(callback_id, "Онбординг уже завершен")
+        await close_onboarding_message(chat_id, source_mid, "Онбординг уже завершен. Используй меню ниже.")
+        return True
+
     if payload == "ui_nav:back":
         target = ui_nav_back(chat_id)
         if target:
@@ -4914,25 +4970,23 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:skip":
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, source_mid, "Онбординг пропущен. Основное меню открыто ниже.")
         if callback_id:
             await answer_callback(callback_id, "Ок")
         await send_menu(chat_id)
         return True
 
     if payload == "onboard:2":
-        if callback_id:
-            await answer_callback(callback_id, "Шаг 2")
-        await send_onboarding(chat_id, step=2, notify=False)
+        await show_onboarding_step(chat_id, step=2, callback_id=callback_id, source_mid=source_mid, notification="Шаг 2")
         return True
 
     if payload == "onboard:3":
-        if callback_id:
-            await answer_callback(callback_id, "Шаг 3")
-        await send_onboarding(chat_id, step=3, notify=False)
+        await show_onboarding_step(chat_id, step=3, callback_id=callback_id, source_mid=source_mid, notification="Шаг 3")
         return True
 
     if payload == "onboard:done":
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Основное меню открыто ниже.")
         if callback_id:
             await answer_callback(callback_id, "Погнали")
         await send_menu(chat_id)
@@ -4940,6 +4994,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:scenario:text":
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Можешь сразу написать вопрос.")
         if callback_id:
             await answer_callback(callback_id, "Текст")
         await max_send_message(chat_id, "Супер, просто напиши вопрос в чат — отвечу сразу.", attachments=build_keyboard(), notify=False)
@@ -4947,6 +5002,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:scenario:image":
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Открываю режим картинки.")
         if callback_id:
             await answer_callback(callback_id, "Картинка")
         await send_image_menu(chat_id)
@@ -4954,9 +5010,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:scenario:tariff":
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Открываю тарифы.")
         if callback_id:
             await answer_callback(callback_id, "Тарифы")
-        await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), notify=False)
+        await send_managed_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), page=UI_PAGE_TARIFFS, notify=False)
         return True
 
     if payload == "action:image_menu":
