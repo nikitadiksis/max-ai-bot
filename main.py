@@ -3159,7 +3159,7 @@ async def get_upload_url(upload_type: str = "image") -> str:
     async with session.post(
         f"{MAX_API}/uploads",
         headers=max_headers(),
-        json={"type": upload_type},
+        params={"type": upload_type},
     ) as resp:
         body = await resp.json(content_type=None)
         if resp.status >= 400:
@@ -3175,7 +3175,7 @@ async def upload_image_to_max(image_bytes: bytes, mime_type: str) -> dict[str, A
     upload_url = await get_upload_url("image")
     ext = image_extension(mime_type)
     form = aiohttp.FormData()
-    form.add_field("file", BytesIO(image_bytes), filename=f"generated.{ext}", content_type=mime_type)
+    form.add_field("data", BytesIO(image_bytes), filename=f"generated.{ext}", content_type=mime_type)
 
     async with session.post(upload_url, data=form) as resp:
         body = await resp.json(content_type=None)
