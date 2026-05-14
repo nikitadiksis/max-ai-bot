@@ -148,6 +148,12 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").stri
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
 PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "80"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
+CHANNEL_PROMO_ENABLED = os.getenv("CHANNEL_PROMO_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+CHANNEL_PROMO_CODE = os.getenv("CHANNEL_PROMO_CODE", "CHANNEL").strip()
+CHANNEL_PROMO_CREDITS = int(os.getenv("CHANNEL_PROMO_CREDITS", "70"))
+CHANNEL_PROMO_START_DATE = os.getenv("CHANNEL_PROMO_START_DATE", datetime.utcnow().date().isoformat()).strip()
+CHANNEL_PROMO_CAMPAIGN_DAYS = int(os.getenv("CHANNEL_PROMO_CAMPAIGN_DAYS", "7"))
+CHANNEL_PROMO_BONUS_TTL_DAYS = int(os.getenv("CHANNEL_PROMO_BONUS_TTL_DAYS", "7"))
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
 BACKUP_KEEP_FILES = int(os.getenv("BACKUP_KEEP_FILES", "12"))
 ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("ERROR_ALERT_COOLDOWN_SEC", "120"))
@@ -439,6 +445,60 @@ def normalize_referral_code(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", value.strip().upper())
 
 
+def parse_date_ymd(value: str) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def channel_promo_meta(today: date | None = None) -> dict[str, Any]:
+    promo_code = normalize_referral_code(CHANNEL_PROMO_CODE)
+    start = parse_date_ymd(CHANNEL_PROMO_START_DATE) or datetime.utcnow().date()
+    duration_days = max(1, CHANNEL_PROMO_CAMPAIGN_DAYS)
+    end_exclusive = start + timedelta(days=duration_days)
+    current = today or datetime.utcnow().date()
+    active = (
+        CHANNEL_PROMO_ENABLED
+        and bool(promo_code)
+        and CHANNEL_PROMO_CREDITS > 0
+        and start <= current < end_exclusive
+    )
+    days_left = max(0, (end_exclusive - current).days)
+    return {
+        "enabled": CHANNEL_PROMO_ENABLED and bool(promo_code) and CHANNEL_PROMO_CREDITS > 0,
+        "active": active,
+        "code": promo_code,
+        "credits": max(0, CHANNEL_PROMO_CREDITS),
+        "start": start,
+        "end_exclusive": end_exclusive,
+        "days_left": days_left,
+        "bonus_ttl_days": max(0, CHANNEL_PROMO_BONUS_TTL_DAYS),
+    }
+
+
+def promo_offer_for_code(code: str) -> tuple[int, int, str]:
+    promo_code = normalize_referral_code(code)
+    if not promo_code:
+        return 0, 0, "Пустой промокод."
+
+    channel = channel_promo_meta()
+    if promo_code == channel["code"] and channel["enabled"]:
+        if channel["active"]:
+            return int(channel["credits"]), int(channel["bonus_ttl_days"]), ""
+        if datetime.utcnow().date() < channel["start"]:
+            return 0, 0, f"Акция еще не началась (старт: {channel['start'].isoformat()})."
+        return 0, 0, "Акция по этому промокоду завершена."
+
+    credits = int(promo_catalog().get(promo_code, 0) or 0)
+    if credits > 0:
+        return credits, 0, ""
+    return 0, 0, "Такого промокода нет или он выключен."
+
+
 def promo_catalog() -> dict[str, int]:
     catalog: dict[str, int] = {"WELCOME": max(0, PROMO_WELCOME_CREDITS)}
     raw = PROMO_CODES_RAW
@@ -554,6 +614,20 @@ class UserStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promo_bonus_grants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    promo_code TEXT NOT NULL,
+                    amount_total INTEGER NOT NULL DEFAULT 0,
+                    amount_remaining INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    expired_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
@@ -578,6 +652,9 @@ class UserStore:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_activations_unique ON promo_activations(chat_id, promo_code)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_promo_bonus_grants_expiry ON promo_bonus_grants(chat_id, expires_at)"
+            )
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
@@ -593,6 +670,40 @@ class UserStore:
         today = date.today()
         year, week, _ = today.isocalendar()
         return f"{year}-W{week:02d}"
+
+    def _expire_bonus_grants_if_needed(self, conn: sqlite3.Connection, chat_id: int, row: sqlite3.Row, now: datetime) -> sqlite3.Row:
+        now_iso = now.isoformat()
+        grants = conn.execute(
+            """
+            SELECT id, amount_remaining
+            FROM promo_bonus_grants
+            WHERE chat_id = ? AND amount_remaining > 0 AND expires_at <> '' AND expires_at <= ?
+            ORDER BY expires_at ASC, id ASC
+            """,
+            (chat_id, now_iso),
+        ).fetchall()
+        if not grants:
+            return row
+
+        balance = int(row["credits_balance"] or 0)
+        for grant in grants:
+            remaining = int(grant["amount_remaining"] or 0)
+            if remaining <= 0:
+                continue
+            deduction = min(balance, remaining)
+            balance -= deduction
+            conn.execute(
+                "UPDATE promo_bonus_grants SET amount_remaining = 0, expired_at = ? WHERE id = ?",
+                (now_iso, int(grant["id"])),
+            )
+
+        conn.execute(
+            "UPDATE users SET credits_balance = ?, updated_at = ? WHERE chat_id = ?",
+            (max(0, balance), now_iso, chat_id),
+        )
+        conn.commit()
+        refreshed = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+        return refreshed if refreshed is not None else row
 
     def get_or_create_user(self, chat_id: int, default_model_alias: str) -> dict[str, Any]:
         now = datetime.utcnow().isoformat()
@@ -629,6 +740,8 @@ class UserStore:
                 )
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+
+            row = self._expire_bonus_grants_if_needed(conn, chat_id, row, datetime.utcnow())
 
             day_changed = row["usage_date"] != today
             if day_changed:
@@ -761,7 +874,7 @@ class UserStore:
             conn.commit()
             return True, str(owner_chat_id)
 
-    def redeem_promo_code(self, chat_id: int, promo_code: str, credits: int) -> tuple[bool, str]:
+    def redeem_promo_code(self, chat_id: int, promo_code: str, credits: int, bonus_ttl_days: int = 0) -> tuple[bool, str]:
         code = normalize_referral_code(promo_code)
         if not code:
             return False, "Пустой промокод."
@@ -783,8 +896,36 @@ class UserStore:
                 "UPDATE users SET credits_balance = credits_balance + ?, updated_at = ? WHERE chat_id = ?",
                 (credits, now, chat_id),
             )
+            ttl_days = max(0, int(bonus_ttl_days))
+            if ttl_days > 0:
+                expires_at = (datetime.utcnow() + timedelta(days=ttl_days)).replace(microsecond=0).isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO promo_bonus_grants (chat_id, promo_code, amount_total, amount_remaining, expires_at, created_at, expired_at)
+                    VALUES (?, ?, ?, ?, ?, ?, '')
+                    """,
+                    (chat_id, code, credits, credits, expires_at, now),
+                )
             conn.commit()
         return True, str(credits)
+
+    def active_bonus_credits_summary(self, chat_id: int) -> tuple[int, str]:
+        now_iso = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT amount_remaining, expires_at
+                FROM promo_bonus_grants
+                WHERE chat_id = ? AND amount_remaining > 0 AND expires_at > ?
+                ORDER BY expires_at ASC
+                """,
+                (chat_id, now_iso),
+            ).fetchall()
+        if not rows:
+            return 0, ""
+        total = sum(int(row["amount_remaining"] or 0) for row in rows)
+        nearest = str(rows[0]["expires_at"] or "")
+        return total, nearest
 
     def list_recent_users(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -2056,8 +2197,6 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
 
 def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> list[dict[str, Any]]:
     buttons: list[list[dict[str, Any]]] = []
-    if payment_url:
-        buttons.append([{"type": "link", "text": "💳 Оплатить", "url": payment_url}])
     buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
     buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
     buttons.append(
@@ -2625,11 +2764,16 @@ def usage_text(row: dict[str, Any]) -> str:
     if plan_name != "free":
         expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "не задан"
     balance = int(row.get("credits_balance", 0) or 0)
+    bonus_total, bonus_expires = state.user_store.active_bonus_credits_summary(int(row.get("chat_id", 0) or 0))
     text = (
         f"План: {plan_name}\n"
         f"Подписка до: {expires_text}\n"
         f"Кредиты: {balance}"
     )
+    if bonus_total > 0 and bonus_expires:
+        bonus_dt = parse_iso_datetime(bonus_expires)
+        bonus_until = bonus_dt.strftime("%Y-%m-%d %H:%M UTC") if bonus_dt else bonus_expires
+        text += f"\n🎁 Временный бонус: {bonus_total} кредитов (сгорит {bonus_until})"
     if plan_name == "free":
         text += f"\nДневной бонус free: {FREE_DAILY_CREDITS} кредитов"
         weekly_used = int(row.get("free_image_week_used", 0) or 0)
@@ -3363,6 +3507,14 @@ async def send_growth_menu(chat_id: int) -> None:
     referred_by = int(row.get("referred_by_chat_id", 0) or 0)
     promo_items = sorted(promo_catalog().items())
     promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
+    channel = channel_promo_meta()
+    if channel["enabled"]:
+        if channel["active"]:
+            promo_lines.append(
+                f"• {channel['code']}: +{channel['credits']} кредитов (акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
+            )
+        else:
+            promo_lines.append(f"• {channel['code']}: акция завершена")
     promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
     text = (
         "🎁 Бонусы и приглашения\n\n"
@@ -4852,15 +5004,16 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Введи промокод одним сообщением.", attachments=build_growth_keyboard())
             return True
         code = normalize_referral_code(arg)
-        credits = promo_catalog().get(code, 0)
+        credits, bonus_ttl_days, reason = promo_offer_for_code(code)
         if credits <= 0:
-            await max_send_message(chat_id, "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+            await max_send_message(chat_id, reason or "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
             return True
-        ok, info = state.user_store.redeem_promo_code(chat_id, code, credits)
+        ok, info = state.user_store.redeem_promo_code(chat_id, code, credits, bonus_ttl_days=bonus_ttl_days)
         if not ok:
             await max_send_message(chat_id, info, attachments=build_growth_keyboard())
             return True
-        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.", attachments=build_growth_keyboard())
+        ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
+        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard())
         return True
 
     if command == "/preset":
@@ -5029,15 +5182,16 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
     state.pending_promo_code_input.discard(chat_id)
 
     code = normalize_referral_code(text)
-    credits = promo_catalog().get(code, 0)
+    credits, bonus_ttl_days, reason = promo_offer_for_code(code)
     if credits <= 0:
-        await max_send_message(chat_id, "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+        await max_send_message(chat_id, reason or "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
         return True
-    ok, info = state.user_store.redeem_promo_code(chat_id, code, credits)
+    ok, info = state.user_store.redeem_promo_code(chat_id, code, credits, bonus_ttl_days=bonus_ttl_days)
     if not ok:
         await max_send_message(chat_id, info, attachments=build_growth_keyboard())
         return True
-    await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.", attachments=build_growth_keyboard())
+    ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
+    await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard())
     return True
 
 
