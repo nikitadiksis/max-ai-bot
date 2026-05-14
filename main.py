@@ -121,8 +121,6 @@ TBANK_GET_STATE_URL = os.getenv("TBANK_GET_STATE_URL", "https://securepay.tinkof
 TBANK_NOTIFICATION_URL = os.getenv("TBANK_NOTIFICATION_URL", "").strip()
 TBANK_SUCCESS_URL = os.getenv("TBANK_SUCCESS_URL", "").strip()
 TBANK_FAIL_URL = os.getenv("TBANK_FAIL_URL", "").strip()
-TBANK_RECEIPT_EMAIL = os.getenv("TBANK_RECEIPT_EMAIL", "").strip()
-TBANK_RECEIPT_PHONE = os.getenv("TBANK_RECEIPT_PHONE", "").strip()
 TBANK_RECEIPT_TAXATION = os.getenv("TBANK_RECEIPT_TAXATION", "usn_income").strip()
 TBANK_RECEIPT_TAX = os.getenv("TBANK_RECEIPT_TAX", "none").strip()
 TBANK_RECEIPT_PAYMENT_METHOD = os.getenv("TBANK_RECEIPT_PAYMENT_METHOD", "full_prepayment").strip()
@@ -4003,8 +4001,8 @@ async def send_payments(chat_id: int) -> None:
 
 
 def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
-    email = str(row.get("receipt_email", "")).strip() or TBANK_RECEIPT_EMAIL
-    phone = str(row.get("receipt_phone", "")).strip() or TBANK_RECEIPT_PHONE
+    email = str(row.get("receipt_email", "")).strip()
+    phone = str(row.get("receipt_phone", "")).strip()
     return email, phone
 
 
@@ -4137,12 +4135,10 @@ async def tbank_init_payment(
         "Description": description[:140],
         "PayType": "O",
     }
-    final_email = receipt_email.strip() or TBANK_RECEIPT_EMAIL
-    final_phone = receipt_phone.strip() or TBANK_RECEIPT_PHONE
+    final_email = receipt_email.strip()
+    final_phone = receipt_phone.strip()
     if not (final_email or final_phone):
-        raise RuntimeError(
-            "T-Bank Receipt required: set TBANK_RECEIPT_EMAIL or TBANK_RECEIPT_PHONE in .env"
-        )
+        raise RuntimeError("T-Bank Receipt required: buyer email or phone is missing")
     payload["Receipt"] = build_tbank_receipt(
         amount_rub=amount_rub,
         description=description,
