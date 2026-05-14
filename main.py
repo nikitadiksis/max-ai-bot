@@ -218,6 +218,7 @@ MENU_TEXT = (
 HELP_TEXT = (
     "Команды:\n"
     "/start или /menu — меню\n"
+    "/id — твой chat_id\n"
     "/models — версии и описание моделей\n"
     "/plan — твой тариф и остатки\n"
     "/preset <fast|balanced|quality|expert> — выбрать режим\n"
@@ -250,7 +251,8 @@ ADMIN_HELP_TEXT = (
     "/admin nudge [days] [limit]\n"
     "/admin kpi [days]\n"
     "/admin panel\n"
-    "/costs — модели и цены"
+    "/costs — модели и цены\n"
+    "/id — твой chat_id"
 )
 
 TARIFFS_TEXT = (
@@ -579,6 +581,7 @@ class UserStore:
                     status TEXT NOT NULL DEFAULT 'pending',
                     provider TEXT NOT NULL DEFAULT 'manual',
                     provider_ref TEXT NOT NULL DEFAULT '',
+                    payment_url TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT '',
                     paid_at TEXT NOT NULL DEFAULT '',
                     activated_at TEXT NOT NULL DEFAULT ''
@@ -649,6 +652,7 @@ class UserStore:
             self._ensure_column(conn, "payment_requests", "recurring_consent_text", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "receipt_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "payment_requests", "receipt_phone", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "payment_requests", "payment_url", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_activations_unique ON promo_activations(chat_id, promo_code)"
             )
@@ -1139,6 +1143,14 @@ class UserStore:
             conn.execute(
                 "UPDATE payment_requests SET provider_ref = ? WHERE id = ?",
                 (provider_ref, request_id),
+            )
+            conn.commit()
+
+    def set_payment_url(self, request_id: int, payment_url: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET payment_url = ? WHERE id = ?",
+                (payment_url.strip(), request_id),
             )
             conn.commit()
 
@@ -1762,7 +1774,9 @@ def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> 
     status_human = payment_status_label(status)
     plan = str(payment.get("plan", ""))
     amount = int(payment.get("amount_rub", 0) or 0)
+    payment_url = str(payment.get("payment_url", "") or "").strip()
     bank_line = f"\nСтатус банка: {bank_status}" if bank_status else ""
+    pay_line = f"\nСсылка на оплату: {payment_url}" if payment_url and status in {"pending", "claimed"} else ""
 
     if status == "paid":
         return (
@@ -1785,12 +1799,12 @@ def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> 
     if status == "claimed":
         return (
             f"🕒 Заявка #{request_id}: {status_human}\n"
-            f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+            f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}{pay_line}\n"
             "Платеж уже отправлен на проверку."
         )
     return (
         f"⏳ Заявка #{request_id}: {status_human}\n"
-        f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+        f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}{pay_line}\n"
         "Если уже оплатил — нажми «Я оплатил»."
     )
 
@@ -2047,13 +2061,13 @@ def build_reply_shortcuts_keyboard(chat_id: int) -> list[dict[str, Any]]:
     row = user_profile(chat_id)
     buttons: list[list[dict[str, Any]]] = [
         [
-            {"type": "callback", "text": "Меню", "payload": "action:menu"},
-            {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+            {"type": "callback", "text": "Меню", "payload": "reply_action:menu"},
+            {"type": "callback", "text": "🎨 Картинка", "payload": "reply_action:image_menu"},
         ]
     ]
     if str(row.get("plan", "free")) == "free":
-        buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "action:tariffs"})
-    buttons.append([{"type": "callback", "text": "Сброс", "payload": "action:clear"}])
+        buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
+    buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -3582,7 +3596,7 @@ async def send_help(chat_id: int) -> None:
         f"{help_base}"
         f"{admin_part}"
     )
-    await max_send_message(chat_id, text, attachments=build_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_keyboard())
 
 
 async def send_menu(chat_id: int) -> None:
@@ -3603,7 +3617,7 @@ async def send_menu(chat_id: int) -> None:
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
     )
-    await max_send_message(chat_id, text, attachments=build_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_MENU)
 
 
 UI_PAGE_MENU = "menu"
@@ -3827,13 +3841,14 @@ async def show_ui_page(
     source_mid: str | None = None,
     push_history: bool = True,
     notification: str = "Открываю",
+    force_new: bool = False,
 ) -> None:
     text, attachments = build_ui_page_payload(chat_id, page)
     ui_set_page(chat_id, page, push_history=push_history)
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     managed_mid = state.ui_message_mid.get(chat_id)
-    can_edit_managed = bool(managed_mid and ((not source_mid) or source_mid == managed_mid))
+    can_edit_managed = bool((not force_new) and managed_mid and ((not source_mid) or source_mid == managed_mid))
     if can_edit_managed:
         ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
         if ok:
@@ -3853,7 +3868,11 @@ async def send_managed_message(
     text: str,
     attachments: list[dict[str, Any]] | None = None,
     notify: bool = False,
+    page: str | None = None,
+    push_history: bool = False,
 ) -> str | None:
+    if page in UI_PAGE_KEYS:
+        ui_set_page(chat_id, page, push_history=push_history)
     sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=notify)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
@@ -3917,11 +3936,11 @@ async def send_growth_menu(chat_id: int) -> None:
         f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
         "Обновления и кейсы: в нашем канале."
     )
-    await max_send_message(chat_id, text, attachments=build_growth_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
 
 
 async def send_channel(chat_id: int) -> None:
-    await max_send_message(
+    await send_managed_message(
         chat_id,
         f"📣 Канал проекта:\n{channel_url_value()}",
         attachments=build_keyboard(),
@@ -3952,28 +3971,29 @@ async def send_reengage_nudges(days: int, limit: int) -> tuple[int, int]:
 
 async def send_models(chat_id: int) -> None:
     row = user_profile(chat_id)
-    await max_send_message(chat_id, build_models_text(row["plan"], include_prices=False), attachments=build_keyboard())
+    await send_managed_message(chat_id, build_models_text(row["plan"], include_prices=False), attachments=build_keyboard(), page=UI_PAGE_MODELS)
 
 
 async def send_costs(chat_id: int) -> None:
     row = user_profile(chat_id)
-    await max_send_message(chat_id, build_models_text(row["plan"], include_prices=True), attachments=build_keyboard())
+    await send_managed_message(chat_id, build_models_text(row["plan"], include_prices=True), attachments=build_keyboard())
 
 
 async def send_plan(chat_id: int) -> None:
     row = user_profile(chat_id)
     text = f"{usage_text(row)}{recurring_status_text(row)}"
-    await max_send_message(chat_id, text, attachments=build_plan_keyboard(row))
+    await send_managed_message(chat_id, text, attachments=build_plan_keyboard(row), page=UI_PAGE_PLAN)
 
 
 async def send_credits(chat_id: int) -> None:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
     if plan_name not in PAID_PLANS:
-        await max_send_message(
+        await send_managed_message(
             chat_id,
             f"🆓 На free каждый день доступно {FREE_DAILY_CREDITS} кредитов. Сейчас у тебя: {int(row.get('credits_balance', 0) or 0)}.",
             attachments=build_tariffs_keyboard_pricing(),
+            page=UI_PAGE_TARIFFS,
         )
         return
     text = (
@@ -3988,7 +4008,7 @@ async def send_credits(chat_id: int) -> None:
         f"• По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT}\n\n"
         "Точное списание за текст зависит от длины и сложности ответа."
     )
-    await max_send_message(chat_id, text, attachments=build_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_keyboard())
 
 
 async def send_topups(chat_id: int) -> None:
@@ -4009,7 +4029,7 @@ async def send_topups(chat_id: int) -> None:
         "Кредиты списываются за запросы к моделям и генерацию картинок.\n"
         "Перед созданием оплаты бот попросит подтверждение покупки пакета."
     )
-    await max_send_message(chat_id, text, attachments=build_topups_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_topups_keyboard(), page=UI_PAGE_TOPUPS)
 
 
 async def send_topup_consent(chat_id: int, code: str, notify: bool = False) -> bool:
@@ -4024,14 +4044,14 @@ async def send_topup_consent(chat_id: int, code: str, notify: bool = False) -> b
         "Это разовая покупка без автосписаний.\n"
         "Подтверди покупку кнопкой ниже."
     )
-    await max_send_message(chat_id, text, attachments=build_topup_consent_keyboard(code), notify=notify)
+    await send_managed_message(chat_id, text, attachments=build_topup_consent_keyboard(code), notify=notify)
     return True
 
 
 async def send_payments(chat_id: int) -> None:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
-        await max_send_message(chat_id, "Заявок пока нет. Используй кнопку «Тарифы».", attachments=build_keyboard())
+        await send_managed_message(chat_id, "Заявок пока нет. Используй кнопку «Тарифы».", attachments=build_keyboard(), page=UI_PAGE_PAYMENTS)
         return
     lines = ["Твои последние заявки:"]
     for item in rows:
@@ -4041,7 +4061,7 @@ async def send_payments(chat_id: int) -> None:
             f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
         )
     lines.append("\nНажми «Проверить #...», чтобы обновить статус по банку.")
-    await max_send_message(chat_id, "\n".join(lines), attachments=build_payments_keyboard(rows))
+    await send_managed_message(chat_id, "\n".join(lines), attachments=build_payments_keyboard(rows), page=UI_PAGE_PAYMENTS)
 
 
 def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
@@ -4093,7 +4113,7 @@ async def send_buy_consent(chat_id: int, plan: str, notify: bool = False) -> boo
         "После согласия откроется оплата.\n"
         "Отменить автопродление можно в «Мой план»."
     )
-    await max_send_message(chat_id, text, attachments=build_consent_keyboard(plan), notify=notify)
+    await send_managed_message(chat_id, text, attachments=build_consent_keyboard(plan), notify=notify)
     return True
 
 
@@ -4432,6 +4452,7 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
                 receipt_phone=receipt_phone,
             )
             state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
+            state.user_store.set_payment_url(request_id, payment_url)
             text = (
                 f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
                 "Оплати по ссылке Т-Банка:\n"
@@ -4490,6 +4511,7 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
                 receipt_phone=receipt_phone,
             )
             state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
+            state.user_store.set_payment_url(request_id, payment_url)
             text = (
                 f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n\n"
                 "Оплати по ссылке Т-Банка:\n"
@@ -4683,6 +4705,31 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if chat_id is None or not payload:
         return False
 
+    if payload.startswith("reply_action:"):
+        reply_action = payload.split(":", 1)[1].strip()
+        reply_page_map = {
+            "menu": UI_PAGE_MENU,
+            "image_menu": UI_PAGE_IMAGE_MENU,
+            "tariffs": UI_PAGE_TARIFFS,
+        }
+        if reply_action == "clear":
+            state.history(chat_id).clear()
+            if callback_id:
+                await answer_callback(callback_id, "Контекст очищен")
+            await send_managed_message(chat_id, "Контекст диалога очищен.", attachments=build_keyboard(), page=UI_PAGE_MENU)
+            return True
+        target_page = reply_page_map.get(reply_action)
+        if target_page:
+            await show_ui_page(
+                chat_id,
+                target_page,
+                callback_id=callback_id,
+                source_mid=source_mid,
+                push_history=True,
+                force_new=True,
+            )
+            return True
+
     if payload == "ui_nav:back":
         target = ui_nav_back(chat_id)
         if target:
@@ -4765,7 +4812,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         state.history(chat_id).clear()
         if callback_id:
             await answer_callback(callback_id, "Контекст очищен")
-        await max_send_message(chat_id, "Контекст диалога очищен.", attachments=build_keyboard(), notify=False)
+        await send_managed_message(chat_id, "Контекст диалога очищен.", attachments=build_keyboard(), notify=False, page=UI_PAGE_MENU)
         return True
 
     if payload == "action:models":
@@ -5339,8 +5386,12 @@ async def handle_command(chat_id: int, text: str) -> bool:
         await send_costs(chat_id)
         return True
 
+    if command == "/id":
+        await max_send_message(chat_id, f"Твой chat_id: {chat_id}")
+        return True
+
     if command == "/tariffs":
-        await max_send_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing())
+        await send_managed_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), page=UI_PAGE_TARIFFS)
         return True
 
     if command == "/topup":
@@ -5356,7 +5407,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         return True
 
     if command == "/support":
-        await max_send_message(chat_id, support_help_text(), attachments=build_keyboard())
+        await send_managed_message(chat_id, support_help_text(), attachments=build_keyboard(), page=UI_PAGE_SUPPORT)
         return True
 
     if command == "/channel":
