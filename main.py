@@ -2082,8 +2082,11 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                         {"type": "callback", "text": "🎟 Ввести реф-код", "payload": "growth:ref_enter"},
                     ],
                     [
-                        {"type": "callback", "text": "🎁 Промокод", "payload": "growth:promo_enter"},
+                        {"type": "callback", "text": "🎁 Бонус за канал", "payload": "growth:channel_bonus"},
                         {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
+                    ],
+                    [
+                        {"type": "callback", "text": "🎁 Промокод", "payload": "growth:promo_enter"},
                     ],
                     [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
@@ -3797,13 +3800,21 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         promo_items = sorted(promo_catalog().items())
         promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
         channel = channel_promo_meta()
+        channel_block = "Сейчас бонус за канал недоступен."
         if channel["enabled"]:
             if channel["active"]:
                 promo_lines.append(
                     f"• {channel['code']}: +{channel['credits']} кредитов (акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
                 )
+                channel_block = (
+                    f"Бонус за канал: +{channel['credits']} кредитов.\n"
+                    f"Срок акции: еще {channel['days_left']} дн.\n"
+                    f"Срок бонуса: {channel['bonus_ttl_days']} дн.\n"
+                    "Подпишись на канал и нажми кнопку «Бонус за канал»."
+                )
             else:
                 promo_lines.append(f"• {channel['code']}: акция завершена")
+                channel_block = "Акция с бонусом за канал уже завершена."
         promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
         text = (
             "🎁 Бонусы и приглашения\n\n"
@@ -3812,6 +3823,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
             f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
             "Друг активирует код командой: /ref <код>\n\n"
+            f"{channel_block}\n\n"
             "Доступные промокоды:\n"
             f"{promo_block}\n\n"
             f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
@@ -4965,6 +4977,38 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             "Введи промокод одним сообщением (пример: WELCOME). Для отмены отправь «отмена».",
             attachments=build_growth_keyboard(),
             notify=False,
+        )
+        return True
+
+    if payload == "growth:channel_bonus":
+        channel = channel_promo_meta()
+        if callback_id:
+            await answer_callback(callback_id, "Проверяю бонус")
+        if not channel["enabled"]:
+            await send_managed_message(chat_id, "Бонус за канал сейчас отключен.", attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+            return True
+        if not channel["active"]:
+            if datetime.utcnow().date() < channel["start"]:
+                text = f"Акция еще не началась. Старт: {channel['start'].isoformat()}."
+            else:
+                text = "Акция с бонусом за канал уже завершена."
+            await send_managed_message(chat_id, text, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+            return True
+        ok, info = state.user_store.redeem_promo_code(
+            chat_id,
+            str(channel["code"]),
+            int(channel["credits"]),
+            bonus_ttl_days=int(channel["bonus_ttl_days"]),
+        )
+        if not ok:
+            await send_managed_message(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+            return True
+        ttl_tail = f" Бонус действует {int(channel['bonus_ttl_days'])} дн." if int(channel["bonus_ttl_days"]) > 0 else ""
+        await send_managed_message(
+            chat_id,
+            f"Бонус за канал активирован: +{info} кредитов.{ttl_tail}",
+            attachments=build_growth_keyboard(),
+            page=UI_PAGE_GROWTH,
         )
         return True
 
