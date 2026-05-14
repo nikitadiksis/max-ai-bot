@@ -105,6 +105,10 @@ TOPUP_MEDIUM_PRICE_RUB = int(os.getenv("TOPUP_MEDIUM_PRICE_RUB", "499"))
 TOPUP_MEDIUM_CREDITS = int(os.getenv("TOPUP_MEDIUM_CREDITS", "4500"))
 TOPUP_LARGE_PRICE_RUB = int(os.getenv("TOPUP_LARGE_PRICE_RUB", "990"))
 TOPUP_LARGE_CREDITS = int(os.getenv("TOPUP_LARGE_CREDITS", "9500"))
+TOPUP_QUICK_CODE = os.getenv("TOPUP_QUICK_CODE", "medium").strip().lower() or "medium"
+LOW_CREDITS_NUDGE_THRESHOLD_FREE = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_FREE", "10"))
+LOW_CREDITS_NUDGE_THRESHOLD_PAID = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_PAID", "120"))
+LOW_CREDITS_NUDGE_COOLDOWN_HOURS = int(os.getenv("LOW_CREDITS_NUDGE_COOLDOWN_HOURS", "18"))
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -1226,6 +1230,7 @@ class BotState:
         self.processed_lookup: set[str] = set()
         self.last_message_at: dict[int, datetime] = {}
         self.last_image_at: dict[int, datetime] = {}
+        self.last_low_credits_nudge_at: dict[int, datetime] = {}
         self.error_alert_last_at: dict[str, datetime] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
@@ -1597,6 +1602,45 @@ def payment_status_title_message(status: str) -> tuple[str, str]:
     )
 
 
+def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> str:
+    request_id = int(payment.get("id", 0) or 0)
+    status = str(payment.get("status", "pending")).lower()
+    status_human = payment_status_label(status)
+    plan = str(payment.get("plan", ""))
+    amount = int(payment.get("amount_rub", 0) or 0)
+    bank_line = f"\nСтатус банка: {bank_status}" if bank_status else ""
+
+    if status == "paid":
+        return (
+            f"✅ Заявка #{request_id}: {status_human}\n"
+            f"Тариф/пакет: {plan}, сумма: {amount} ₽.\n"
+            "Доступ уже активирован."
+        )
+    if status == "refunded":
+        return (
+            f"↩️ Заявка #{request_id}: {status_human}\n"
+            f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+            "Возврат подтвержден."
+        )
+    if status == "canceled":
+        return (
+            f"❌ Заявка #{request_id}: {status_human}\n"
+            f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+            "Оплата не завершена. Можно создать новую заявку в «Тарифы»."
+        )
+    if status == "claimed":
+        return (
+            f"🕒 Заявка #{request_id}: {status_human}\n"
+            f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+            "Платеж уже отправлен на проверку."
+        )
+    return (
+        f"⏳ Заявка #{request_id}: {status_human}\n"
+        f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
+        "Если уже оплатил — нажми «Я оплатил»."
+    )
+
+
 def plan_allowed(plan: str, min_plan: str) -> bool:
     if min_plan not in PLAN_ORDER:
         log.warning("Unknown min_plan=%r in model config; denying access", min_plan)
@@ -1699,6 +1743,13 @@ def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def extract_first_http_url(text: str) -> str:
+    match = re.search(r"https?://[^\s]+", text or "")
+    if not match:
+        return ""
+    return match.group(0).rstrip(").,]>")
 
 
 def trim_history_by_chars(history: list[dict[str, str]], budget_chars: int) -> list[dict[str, str]]:
@@ -1991,6 +2042,7 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
                     buy_row_2,
                     [
                         {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
+                        {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
                     ],
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
@@ -2002,18 +2054,70 @@ def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
     ]
 
 
-def build_payment_request_keyboard(request_id: int) -> list[dict[str, Any]]:
+def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> list[dict[str, Any]]:
+    buttons: list[list[dict[str, Any]]] = []
+    if payment_url:
+        buttons.append([{"type": "link", "text": "💳 Оплатить", "url": payment_url}])
+    buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
+    buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
+    buttons.append(
+        [
+            {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ]
+    )
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {"buttons": buttons},
+        }
+    ]
+
+
+def build_payments_keyboard(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buttons: list[list[dict[str, Any]]] = []
+    for item in rows[:5]:
+        request_id = int(item.get("id", 0) or 0)
+        if request_id <= 0:
+            continue
+        status = str(item.get("status", "")).lower()
+        if status in {"pending", "claimed"}:
+            buttons.append(
+                [
+                    {
+                        "type": "callback",
+                        "text": f"Проверить #{request_id}",
+                        "payload": f"payment_status:{request_id}",
+                    }
+                ]
+            )
+
+    buttons.append([{"type": "callback", "text": "Тарифы", "payload": "action:tariffs"}])
+    buttons.append([{"type": "callback", "text": "Помощь", "payload": "action:support"}])
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
+def build_quick_topup_keyboard(code: str) -> list[dict[str, Any]]:
+    pack = topup_spec(code) or topup_spec("medium")
+    payload_code = code if topup_spec(code) else "medium"
+    label = str(pack.get("label", "Medium")) if pack else "Medium"
+    price_rub = int(pack.get("price_rub", TOPUP_MEDIUM_PRICE_RUB)) if pack else TOPUP_MEDIUM_PRICE_RUB
+    credits = int(pack.get("credits", TOPUP_MEDIUM_CREDITS)) if pack else TOPUP_MEDIUM_CREDITS
     return [
         {
             "type": "inline_keyboard",
             "payload": {
                 "buttons": [
                     [
-                        {"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"},
+                        {
+                            "type": "callback",
+                            "text": f"⚡ Быстро докупить {label} ({credits} кр / {price_rub}₽)",
+                            "payload": f"topup_quick:{payload_code}",
+                        }
                     ],
                     [
-                        {"type": "callback", "text": "Назад к тарифам", "payload": "action:tariffs"},
-                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                        {"type": "callback", "text": "⭐ Все пакеты", "payload": "action:topups"},
+                        {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
                     ],
                 ]
             },
@@ -2061,6 +2165,7 @@ def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
                     buy_row_2,
                     [
                         {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
+                        {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
                     ],
                     [
                         {"type": "callback", "text": "Назад", "payload": "action:menu"},
@@ -2578,6 +2683,54 @@ def recurring_status_text(row: dict[str, Any]) -> str:
     )
 
 
+def low_credits_threshold_for_plan(plan_name: str) -> int:
+    if plan_name == "free":
+        return max(1, LOW_CREDITS_NUDGE_THRESHOLD_FREE)
+    return max(1, LOW_CREDITS_NUDGE_THRESHOLD_PAID)
+
+
+def should_nudge_low_credits(row: dict[str, Any]) -> bool:
+    plan_name = str(row.get("plan", "free"))
+    balance = int(row.get("credits_balance", 0) or 0)
+    threshold = low_credits_threshold_for_plan(plan_name)
+    if balance > threshold:
+        return False
+    chat_id = int(row.get("chat_id", 0) or 0)
+    if chat_id <= 0:
+        return False
+    cooldown = timedelta(hours=max(1, LOW_CREDITS_NUDGE_COOLDOWN_HOURS))
+    last = state.last_low_credits_nudge_at.get(chat_id)
+    if last and (datetime.utcnow() - last) < cooldown:
+        return False
+    return True
+
+
+async def maybe_send_low_credits_nudge(chat_id: int) -> None:
+    row = user_profile(chat_id)
+    if not should_nudge_low_credits(row):
+        return
+    plan_name = str(row.get("plan", "free"))
+    balance = int(row.get("credits_balance", 0) or 0)
+    threshold = low_credits_threshold_for_plan(plan_name)
+    state.last_low_credits_nudge_at[chat_id] = datetime.utcnow()
+    await max_send_message(
+        chat_id,
+        (
+            f"⚠️ Осталось мало кредитов: {balance} (порог уведомления: {threshold}).\n"
+            "Чтобы не прерывать диалог, можно быстро докупить пакет в 1 тап."
+        ),
+        attachments=build_quick_topup_keyboard(TOPUP_QUICK_CODE),
+        notify=False,
+    )
+
+
+def purchase_help_keyboard_for_row(row: dict[str, Any]) -> list[dict[str, Any]]:
+    plan_name = str(row.get("plan", "free"))
+    if plan_name == "free":
+        return build_tariffs_keyboard_pricing()
+    return build_quick_topup_keyboard(TOPUP_QUICK_CODE)
+
+
 def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
     info = TEXT_MODELS.get(model_alias)
     if not info:
@@ -2995,7 +3148,7 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
     img_cost = image_credit_cost()
     ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
     if not ok_credit:
-        await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
         return True
 
     ok, reason = check_and_consume_limit(chat_id, "images")
@@ -3019,6 +3172,8 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
             tokens_total=0,
             details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
         )
+        with suppress(Exception):
+            await maybe_send_low_credits_nudge(chat_id)
     except Exception:
         state.user_store.refund_credits(chat_id, img_cost)
         raise
@@ -3060,7 +3215,7 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
     edit_cost = max(CREDIT_COST_IMAGE_EDIT, CREDIT_COST_IMAGE + 1)
     ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
     if not ok_credit:
-        await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
         return True
 
     ok, reason = check_and_consume_limit(chat_id, "images")
@@ -3084,6 +3239,8 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
             tokens_total=0,
             details=f"mode=image_edit;style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
         )
+        with suppress(Exception):
+            await maybe_send_low_credits_nudge(chat_id)
     except Exception:
         state.user_store.refund_credits(chat_id, edit_cost)
         raise
@@ -3140,8 +3297,6 @@ async def handle_pending_image_ref_prompt_input(chat_id: int, text: str) -> bool
 
 async def send_help(chat_id: int) -> None:
     help_base = HELP_TEXT
-    if not is_admin(chat_id):
-        help_base = "\n".join(line for line in HELP_TEXT.splitlines() if "/payments" not in line)
     admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
     text = (
         f"Справка\n\n"
@@ -3204,12 +3359,21 @@ async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> 
 async def send_growth_menu(chat_id: int) -> None:
     row = user_profile(chat_id)
     referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+    invited = int(row.get("referrals_invited", 0) or 0)
+    referred_by = int(row.get("referred_by_chat_id", 0) or 0)
+    promo_items = sorted(promo_catalog().items())
+    promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
+    promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
     text = (
-        "🎁 Бонусы и рост\n\n"
+        "🎁 Бонусы и приглашения\n\n"
         f"Твой реф-код: {referral_code}\n"
+        f"Приглашено друзей: {invited}\n"
+        f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
         f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
         "Друг активирует код командой: /ref <код>\n\n"
-        f"Промокод welcome: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+        "Доступные промокоды:\n"
+        f"{promo_block}\n\n"
+        f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
         "Обновления и кейсы: в нашем канале."
     )
     await max_send_message(chat_id, text, attachments=build_growth_keyboard())
@@ -3335,7 +3499,8 @@ async def send_payments(chat_id: int) -> None:
         lines.append(
             f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
         )
-    await max_send_message(chat_id, "\n".join(lines), attachments=build_keyboard())
+    lines.append("\nНажми «Проверить #...», чтобы обновить статус по банку.")
+    await max_send_message(chat_id, "\n".join(lines), attachments=build_payments_keyboard(rows))
 
 
 def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
@@ -4047,6 +4212,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await send_topups(chat_id)
         return True
 
+    if payload == "action:payments":
+        if callback_id:
+            await answer_callback(callback_id, "Показываю оплаты")
+        await send_payments(chat_id)
+        return True
+
     if payload == "action:menu":
         if callback_id:
             await answer_callback(callback_id, "Открываю меню")
@@ -4076,10 +4247,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await answer_callback(callback_id, "Твой реф-код")
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        invited = int(row.get("referrals_invited", 0) or 0)
         await max_send_message(
             chat_id,
             (
-                f"👥 Твой реф-код: {code}\n\n"
+                f"👥 Твой реф-код: {code}\n"
+                f"Приглашено друзей: {invited}\n\n"
                 f"Пригласи друга: он вводит /ref {code}\n"
                 f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
             ),
@@ -4326,7 +4499,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
+        await max_send_message(
+            chat_id,
+            msg,
+            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            notify=False,
+        )
         return True
 
     if payload.startswith("buy:"):
@@ -4375,6 +4553,31 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await send_topup_consent(chat_id, code, notify=False)
         return True
 
+    if payload.startswith("topup_quick:"):
+        code = payload.split(":", 1)[1].lower().strip() or TOPUP_QUICK_CODE
+        row = user_profile(chat_id)
+        email, phone = effective_receipt_contact(row)
+        if not (email or phone):
+            state.pending_receipt_plan[chat_id] = f"topup_consent:{code}"
+            if callback_id:
+                await answer_callback(callback_id, "Нужен контакт для чека")
+            await request_receipt_contact(chat_id, f"topup_consent:{code}", notify=False)
+            return True
+
+        if callback_id:
+            await answer_callback(callback_id, "Открываю быструю покупку")
+        request_id, msg = await create_topup_request_v2(chat_id, code)
+        if request_id is None:
+            await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
+            return True
+        await max_send_message(
+            chat_id,
+            msg,
+            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            notify=False,
+        )
+        return True
+
     if payload.startswith("topup_consent:"):
         code = payload.split(":", 1)[1].lower().strip()
         if callback_id:
@@ -4383,7 +4586,47 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
-        await max_send_message(chat_id, msg, attachments=build_payment_request_keyboard(request_id), notify=False)
+        await max_send_message(
+            chat_id,
+            msg,
+            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            notify=False,
+        )
+        return True
+
+    if payload.startswith("payment_status:"):
+        request_raw = payload.split(":", 1)[1].strip()
+        if not request_raw.isdigit():
+            if callback_id:
+                await answer_callback(callback_id, "Ошибка номера заявки")
+            return True
+        request_id = int(request_raw)
+        payment = state.user_store.get_payment(request_id)
+        if not payment or int(payment.get("chat_id", 0) or 0) != chat_id:
+            if callback_id:
+                await answer_callback(callback_id, "Заявка не найдена")
+            await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
+            return True
+
+        bank_status = ""
+        status = str(payment.get("status", "pending")).lower()
+        provider_ref = str(payment.get("provider_ref", ""))
+        if provider_ref.startswith("tbank:") and status in {"pending", "claimed"}:
+            try:
+                payment, bank_status = await refresh_payment_from_tbank(request_id, source="T-Bank GetState (status button)")
+                payment = payment or state.user_store.get_payment(request_id) or payment
+            except Exception:
+                log.exception("T-Bank GetState failed from status button for request_id=%s", request_id)
+
+        refreshed_status = str((payment or {}).get("status", "pending")).lower()
+        if callback_id:
+            await answer_callback(callback_id, payment_status_label(refreshed_status))
+        await max_send_message(
+            chat_id,
+            payment_user_status_text(payment or {}, bank_status=bank_status),
+            attachments=build_payment_request_keyboard(request_id) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
+            notify=False,
+        )
         return True
 
     if payload.startswith("paid:"):
@@ -4564,9 +4807,6 @@ async def handle_command(chat_id: int, text: str) -> bool:
         return True
 
     if command == "/payments":
-        if not is_admin(chat_id):
-            await max_send_message(chat_id, "Для пользователей команда скрыта. Используй кнопки в разделе «Тарифы».", attachments=build_tariffs_keyboard_pricing())
-            return True
         await send_payments(chat_id)
         return True
 
@@ -4574,10 +4814,12 @@ async def handle_command(chat_id: int, text: str) -> bool:
         row = user_profile(chat_id)
         if not arg:
             code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+            invited = int(row.get("referrals_invited", 0) or 0)
             await max_send_message(
                 chat_id,
                 (
                     f"👥 Твой реф-код: {code}\n"
+                    f"Приглашено друзей: {invited}\n"
                     f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
                     f"Другу нужно отправить: /ref {code}"
                 ),
@@ -4915,7 +5157,7 @@ async def process_update(update: dict[str, Any]) -> None:
             f"текст ({model_label})",
         )
         if not ok_credit:
-            await max_send_message(chat_id, reason_credit, attachments=build_tariffs_keyboard_pricing())
+            await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(user_profile(chat_id)))
             return
 
         ok, reason = check_and_consume_limit(chat_id, "messages")
@@ -4954,6 +5196,8 @@ async def process_update(update: dict[str, Any]) -> None:
                 details=f"prompt={int(result.prompt_tokens)};completion={int(result.completion_tokens)}",
             )
             await max_send_message(chat_id, result.text)
+            with suppress(Exception):
+                await maybe_send_low_credits_nudge(chat_id)
         except Exception:
             state.user_store.refund_credits(chat_id, reserved_total_cost)
             raise
