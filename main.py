@@ -4734,7 +4734,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         try:
             label = await set_user_model(chat_id, alias)
             state.user_store.set_selected_preset(chat_id, "")
-            target_page = state.ui_page.get(chat_id, UI_PAGE_MENU)
+            target_page = state.ui_current_page.get(chat_id, UI_PAGE_MENU)
             if target_page not in UI_PAGE_KEYS:
                 target_page = UI_PAGE_MENU
             await show_ui_page(
