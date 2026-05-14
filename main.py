@@ -3793,7 +3793,8 @@ async def show_ui_page(
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     managed_mid = state.ui_message_mid.get(chat_id)
-    if managed_mid:
+    can_edit_managed = bool(managed_mid and ((not source_mid) or source_mid == managed_mid))
+    if can_edit_managed:
         ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
         if ok:
             if callback_id:
@@ -4671,13 +4672,13 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         try:
             alias = resolve_preset_alias_for_chat(chat_id, preset)
             label = await set_user_model(chat_id, alias)
-            if callback_id:
-                await answer_callback(callback_id, f"{preset_cfg['label']} → {label}")
-            await max_send_message(
+            await show_ui_page(
                 chat_id,
-                f"Режим: {preset_cfg['label']}\nМодель: {label}",
-                attachments=build_keyboard(),
-                notify=False,
+                UI_PAGE_MENU,
+                callback_id=callback_id,
+                source_mid=source_mid,
+                push_history=False,
+                notification=f"{preset_cfg['label']} → {label}",
             )
         except Exception as exc:
             if callback_id:
@@ -4689,9 +4690,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         alias = payload.split(":", 1)[1]
         try:
             label = await set_user_model(chat_id, alias)
-            if callback_id:
-                await answer_callback(callback_id, f"Модель: {label}")
-            await max_send_message(chat_id, f"Выбрана модель: {label}", attachments=build_keyboard(), notify=False)
+            target_page = state.ui_page.get(chat_id, UI_PAGE_MENU)
+            if target_page not in UI_PAGE_KEYS:
+                target_page = UI_PAGE_MENU
+            await show_ui_page(
+                chat_id,
+                target_page,
+                callback_id=callback_id,
+                source_mid=source_mid,
+                push_history=False,
+                notification=f"Модель: {label}",
+            )
         except Exception as exc:
             if callback_id:
                 await answer_callback(callback_id, str(exc)[:120])
