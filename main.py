@@ -3793,26 +3793,18 @@ async def show_ui_page(
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     managed_mid = state.ui_message_mid.get(chat_id)
-    can_update_callback_message = bool(callback_id and source_mid and managed_mid and source_mid == managed_mid)
-    if can_update_callback_message:
-        ok = await answer_callback(
-            callback_id or "",
-            "Открываю",
-            text=text,
-            attachments=attachments,
-        )
-        if ok:
-            state.ui_message_mid[chat_id] = str(source_mid)
-            return
-
-    if source_mid and managed_mid and source_mid == managed_mid:
+    if managed_mid:
         ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
         if ok:
+            if callback_id:
+                await answer_callback(callback_id, notification)
             return
 
     sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
+    if callback_id:
+        await answer_callback(callback_id, notification)
 
 
 async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
