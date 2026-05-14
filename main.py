@@ -2042,6 +2042,20 @@ def build_keyboard() -> list[dict[str, Any]]:
     ]
 
 
+def build_reply_shortcuts_keyboard(chat_id: int) -> list[dict[str, Any]]:
+    row = user_profile(chat_id)
+    buttons: list[list[dict[str, Any]]] = [
+        [
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+        ]
+    ]
+    if str(row.get("plan", "free")) == "free":
+        buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "action:tariffs"})
+    buttons.append([{"type": "callback", "text": "Сброс", "payload": "action:clear"}])
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
 def build_growth_keyboard() -> list[dict[str, Any]]:
     return [
         {
@@ -3173,7 +3187,11 @@ async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, di
     attachment_payload = await upload_image_to_max(image.image_bytes, image.mime_type)
     attachment = {"type": "image", "payload": attachment_payload}
     shown_prompt = display_prompt or prompt
-    await max_send_message(chat_id, f"Готово. Вот картинка по запросу:\n{shown_prompt}", attachments=[attachment])
+    await max_send_message(
+        chat_id,
+        f"Готово. Вот картинка по запросу:\n{shown_prompt}",
+        attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id)],
+    )
 
 
 async def fetch_image_bytes(url: str, use_max_auth: bool = False) -> ImageResult:
@@ -5746,7 +5764,7 @@ async def process_update(update: dict[str, Any]) -> None:
                 tokens_total=int(result.total_tokens),
                 details=f"prompt={int(result.prompt_tokens)};completion={int(result.completion_tokens)}",
             )
-            await max_send_message(chat_id, result.text)
+            await max_send_message(chat_id, result.text, attachments=build_reply_shortcuts_keyboard(chat_id))
             with suppress(Exception):
                 await maybe_send_low_credits_nudge(chat_id)
         except Exception:
