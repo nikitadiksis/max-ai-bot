@@ -3684,27 +3684,27 @@ def build_topups_text() -> str:
         return credits // CREDIT_COST_IMAGE
 
     return (
-        "в­ђ РџР°РєРµС‚С‹ РєСЂРµРґРёС‚РѕРІ\n\n"
-        f"вЂў Small: {small['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {small['price_rub']} в‚Ѕ (~{approx_images(int(small['credits']))} РєР°СЂС‚РёРЅРѕРє)\n"
-        f"вЂў Medium: {medium['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {medium['price_rub']} в‚Ѕ (~{approx_images(int(medium['credits']))} РєР°СЂС‚РёРЅРѕРє)\n"
-        f"вЂў Large: {large['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {large['price_rub']} в‚Ѕ (~{approx_images(int(large['credits']))} РєР°СЂС‚РёРЅРѕРє)\n\n"
-        "РљСЂРµРґРёС‚С‹ СЃРїРёСЃС‹РІР°СЋС‚СЃСЏ Р·Р° Р·Р°РїСЂРѕСЃС‹ Рє РјРѕРґРµР»СЏРј Рё РіРµРЅРµСЂР°С†РёСЋ РєР°СЂС‚РёРЅРѕРє.\n"
-        "РџРµСЂРµРґ СЃРѕР·РґР°РЅРёРµРј РѕРїР»Р°С‚С‹ Р±РѕС‚ РїРѕРїСЂРѕСЃРёС‚ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РїРѕРєСѓРїРєРё РїР°РєРµС‚Р°."
+        "⭐ Пакеты кредитов\n\n"
+        f"• Small: {small['credits']} кредитов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
+        f"• Medium: {medium['credits']} кредитов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
+        f"• Large: {large['credits']} кредитов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
+        "Кредиты списываются за запросы к моделям и генерацию картинок.\n"
+        "Перед созданием оплаты бот попросит подтверждение покупки пакета."
     )
 
 
 def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
-        return "Р—Р°СЏРІРѕРє РїРѕРєР° РЅРµС‚. РСЃРїРѕР»СЊР·СѓР№ РєРЅРѕРїРєСѓ В«РўР°СЂРёС„С‹В».", build_keyboard()
-    lines = ["РўРІРѕРё РїРѕСЃР»РµРґРЅРёРµ Р·Р°СЏРІРєРё:"]
+        return "Заявок пока нет. Используй кнопку «Тарифы».", build_keyboard()
+    lines = ["Твои последние заявки:"]
     for item in rows:
         status = str(item["status"]).lower()
         status_human = payment_status_label(status)
         lines.append(
-            f"#{item['id']} | {item['plan']} | {item['days']} РґРЅ | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
+            f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
         )
-    lines.append("\nРќР°Р¶РјРё В«РџСЂРѕРІРµСЂРёС‚СЊ #...В», С‡С‚РѕР±С‹ РѕР±РЅРѕРІРёС‚СЊ СЃС‚Р°С‚СѓСЃ РїРѕ Р±Р°РЅРєСѓ.")
+    lines.append("\nНажми «Проверить #...», чтобы обновить статус по банку.")
     return "\n".join(lines), build_payments_keyboard(rows)
 
 
@@ -3713,17 +3713,17 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
     if page == UI_PAGE_MENU:
         preset_block = build_preset_block(str(row.get("plan", "free")))
         capabilities = (
-            "Р§С‚Рѕ СѓРјРµСЋ:\n"
-            "вЂў вљЎ РѕС‚РІРµС‚С‹ С‡РµСЂРµР· GPT, Gemini Рё DeepSeek\n"
-            f"вЂў рџЋЁ {image_capability_line().replace('вЂў ', '')}\n"
-            "вЂў рџ§  СЃРѕС…СЂР°РЅРµРЅРёРµ РєРѕРЅС‚РµРєСЃС‚Р° РґРёР°Р»РѕРіР°"
+            "Что умею:\n"
+            "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
+            f"• 🎨 {image_capability_line().replace('• ', '')}\n"
+            "• 🧠 сохранение контекста диалога"
         )
         text = (
-            "РџСЂРёРІРµС‚. Р­С‚Рѕ С‚РІРѕР№ AI-Р±РѕС‚ РІ MAX.\n\n"
+            "Привет. Это твой AI-бот в MAX.\n\n"
             f"{capabilities}\n\n"
             f"{preset_block}\n\n"
-            "Р’С‹Р±РµСЂРё РґРµР№СЃС‚РІРёРµ РєРЅРѕРїРєР°РјРё РёР»Рё РїСЂРѕСЃС‚Рѕ РЅР°РїРёС€Рё РІРѕРїСЂРѕСЃ.\n\n"
-            f"РЎРµР№С‡Р°СЃ РІС‹Р±СЂР°РЅР° РјРѕРґРµР»СЊ: {current_model_label(chat_id)}\n"
+            "Выбери действие кнопками или просто напиши вопрос.\n\n"
+            f"Сейчас выбрана модель: {current_model_label(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
         )
@@ -3743,43 +3743,43 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         invited = int(row.get("referrals_invited", 0) or 0)
         referred_by = int(row.get("referred_by_chat_id", 0) or 0)
         promo_items = sorted(promo_catalog().items())
-        promo_lines = [f"вЂў {code}: +{credits} РєСЂРµРґРёС‚РѕРІ" for code, credits in promo_items[:6]]
+        promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
         channel = channel_promo_meta()
         if channel["enabled"]:
             if channel["active"]:
                 promo_lines.append(
-                    f"вЂў {channel['code']}: +{channel['credits']} РєСЂРµРґРёС‚РѕРІ (Р°РєС†РёСЏ {channel['days_left']} РґРЅ, Р±РѕРЅСѓСЃ РЅР° {channel['bonus_ttl_days']} РґРЅ)"
+                    f"• {channel['code']}: +{channel['credits']} кредитов (акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
                 )
             else:
-                promo_lines.append(f"вЂў {channel['code']}: Р°РєС†РёСЏ Р·Р°РІРµСЂС€РµРЅР°")
-        promo_block = "\n".join(promo_lines) if promo_lines else "вЂў РЎРµР№С‡Р°СЃ Р°РєС‚РёРІРЅС‹С… РїСЂРѕРјРѕРєРѕРґРѕРІ РЅРµС‚"
+                promo_lines.append(f"• {channel['code']}: акция завершена")
+        promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
         text = (
-            "рџЋЃ Р‘РѕРЅСѓСЃС‹ Рё РїСЂРёРіР»Р°С€РµРЅРёСЏ\n\n"
-            f"РўРІРѕР№ СЂРµС„-РєРѕРґ: {referral_code}\n"
-            f"РџСЂРёРіР»Р°С€РµРЅРѕ РґСЂСѓР·РµР№: {invited}\n"
-            f"РўС‹ РїСЂРёРіР»Р°С€РµРЅ РїРѕ СЂРµС„-РєРѕРґСѓ: {'РґР°' if referred_by > 0 else 'РЅРµС‚'}\n"
-            f"Р‘РѕРЅСѓСЃ Р·Р° РґСЂСѓРіР°: {REFERRAL_BONUS_CREDITS} РєСЂРµРґРёС‚РѕРІ С‚РµР±Рµ Рё РґСЂСѓРіСѓ.\n"
-            "Р”СЂСѓРі Р°РєС‚РёРІРёСЂСѓРµС‚ РєРѕРґ РєРѕРјР°РЅРґРѕР№: /ref <РєРѕРґ>\n\n"
-            "Р”РѕСЃС‚СѓРїРЅС‹Рµ РїСЂРѕРјРѕРєРѕРґС‹:\n"
+            "🎁 Бонусы и приглашения\n\n"
+            f"Твой реф-код: {referral_code}\n"
+            f"Приглашено друзей: {invited}\n"
+            f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
+            f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
+            "Друг активирует код командой: /ref <код>\n\n"
+            "Доступные промокоды:\n"
             f"{promo_block}\n\n"
-            f"Р‘Р°Р·РѕРІС‹Р№ РїСЂРѕРјРѕРєРѕРґ: /promo WELCOME (+{PROMO_WELCOME_CREDITS} РєСЂРµРґРёС‚РѕРІ, 1 СЂР°Р·)\n"
-            "РћР±РЅРѕРІР»РµРЅРёСЏ Рё РєРµР№СЃС‹: РІ РЅР°С€РµРј РєР°РЅР°Р»Рµ."
+            f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+            "Обновления и кейсы: в нашем канале."
         )
         return text, build_growth_keyboard()
     if page == UI_PAGE_SUPPORT:
         return support_help_text(), build_keyboard()
     if page == UI_PAGE_IMAGE_MENU:
         text = (
-            "Р РµР¶РёРј В«РљР°СЂС‚РёРЅРєР°В»\n"
-            "РџРµСЂРµРєР»СЋС‡Рё СЃС‚РёР»СЊ Рё С„РѕСЂРјР°С‚, РїРѕС‚РѕРј РЅР°Р¶РјРё В«РЎРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊВ».\n"
-            f"РЎРїРёСЃР°РЅРёРµ: {CREDIT_COST_IMAGE} РєСЂРµРґРёС‚РѕРІ/РєР°СЂС‚РёРЅРєР°.\n"
-            f"РџРѕ С„РѕС‚Рѕ: {CREDIT_COST_IMAGE_EDIT} РєСЂРµРґРёС‚РѕРІ.\n"
-            "РќР° Free СЃРѕР·РґР°РЅРёРµ РєР°СЂС‚РёРЅРѕРє РѕРіСЂР°РЅРёС‡РµРЅРѕ РµР¶РµРЅРµРґРµР»СЊРЅС‹Рј Р»РёРјРёС‚РѕРј.\n\n"
+            "Режим «Картинка»\n"
+            "Переключи стиль и формат, потом нажми «Сгенерировать».\n"
+            f"Списание: {CREDIT_COST_IMAGE} кредитов/картинка.\n"
+            f"По фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+            "На Free действует дополнительный лимит: не более 1 картинки в неделю.\n\n"
             f"{image_params_summary(chat_id)}\n\n"
-            "РњРѕР¶РЅРѕ РІРІРµСЃС‚Рё /image <РѕРїРёСЃР°РЅРёРµ> РёР»Рё /image_ref <РѕРїРёСЃР°РЅРёРµ>."
+            "Можно ввести /image <описание> или /image_ref <описание>."
         )
         return text, build_image_menu_keyboard(chat_id)
-    return "РћС‚РєСЂРѕР№ РјРµРЅСЋ Рё РІС‹Р±РµСЂРё СЂР°Р·РґРµР».", build_keyboard()
+    return "Открой меню и выбери раздел.", build_keyboard()
 
 
 async def show_ui_page(
