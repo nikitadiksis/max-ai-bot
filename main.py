@@ -2635,6 +2635,7 @@ async def max_send_message(
 
     for index, chunk in enumerate(chunks):
         payload: dict[str, Any] = {
+            "type": "text",
             "text": chunk,
             "notify": notify,
         }
