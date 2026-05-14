@@ -212,8 +212,8 @@ WELCOME_TEXT = (
 MENU_TEXT = (
     "Кнопки ниже — основной способ пользоваться ботом.\n"
     "Для генерации картинки нажми «🎨 Картинка».\n"
-    "Если нужен список команд, отправь /help.\n"
-    "Если проблема с оплатой — нажми «Помощь» или отправь /support.\n"
+    "Если нужен список команд, отправь /help\n"
+    "Если проблема с оплатой — нажми «Помощь» или отправь /support\n"
     "Новости и обновления: /channel"
 )
 
@@ -224,7 +224,7 @@ HELP_TEXT = (
     "/plan — твой тариф и остатки\n"
     "/preset <fast|balanced|quality|expert> — выбрать режим\n"
     "/model <alias> — выбрать модель вручную\n"
-    "/gpt, /gpt4o, /gemini, /deepseek, /gpt54 — быстрый выбор модели\n"
+    "/gpt /gpt4o /gemini /deepseek /gpt54 — быстрый выбор модели\n"
     "/image <описание> — сгенерировать картинку\n"
     "/image_ref <описание> — сгенерировать по последнему фото\n"
     "/tariffs — тарифы\n"
@@ -1373,6 +1373,10 @@ class BotState:
         self.last_image_at: dict[int, datetime] = {}
         self.last_low_credits_nudge_at: dict[int, datetime] = {}
         self.error_alert_last_at: dict[str, datetime] = {}
+        self.ui_message_mid: dict[int, str] = {}
+        self.ui_current_page: dict[int, str] = {}
+        self.ui_back_stack: dict[int, list[str]] = {}
+        self.ui_forward_stack: dict[int, list[str]] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.user_store = UserStore(DB_PATH)
@@ -2556,18 +2560,39 @@ def parse_incoming_image_url(update: dict[str, Any]) -> str:
     return found[0] if found else ""
 
 
-def parse_callback_payload(update: dict[str, Any]) -> tuple[int | None, str | None, str | None]:
+def parse_callback_source_mid(update: dict[str, Any]) -> str | None:
+    callback = update.get("callback") if isinstance(update, dict) else None
+    if not isinstance(callback, dict):
+        return None
+    message = callback.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    candidates: list[Any] = [
+        message.get("mid"),
+        (message.get("body") or {}).get("mid") if isinstance(message.get("body"), dict) else None,
+        message.get("message_id"),
+        (message.get("body") or {}).get("message_id") if isinstance(message.get("body"), dict) else None,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, (int, str)) and str(candidate).strip():
+            return str(candidate).strip()
+    return None
+
+
+def parse_callback_payload(update: dict[str, Any]) -> tuple[int | None, str | None, str | None, str | None]:
     chat_id, _ = parse_incoming_text(update)
     callback = update.get("callback") or {}
     callback_id = callback.get("callback_id")
     payload = callback.get("payload")
+    source_mid = parse_callback_source_mid(update)
     if isinstance(payload, dict):
         payload = payload.get("value") or payload.get("payload") or payload.get("data")
     if not isinstance(callback_id, str):
         callback_id = None
     if not isinstance(payload, str):
         payload = None
-    return chat_id, callback_id, payload
+    return chat_id, callback_id, payload, source_mid
 
 
 def is_supported_update(update: dict[str, Any]) -> bool:
@@ -2878,7 +2903,7 @@ def purchase_help_keyboard_for_row(row: dict[str, Any]) -> list[dict[str, Any]]:
 def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
     info = TEXT_MODELS.get(model_alias)
     if not info:
-        return False, "Неизвестная модель. Используй /models."
+        return False, "Неизвестная модель. Используй /models"
     if not plan_allowed(plan, info.min_plan):
         return False, f"Модель {info.label} доступна с тарифа {info.min_plan}."
     return True, ""
@@ -2994,12 +3019,13 @@ async def max_send_message(
     text: str,
     attachments: list[dict[str, Any]] | None = None,
     notify: bool = True,
-) -> None:
+) -> str | None:
     session = await get_session()
     chunks = split_message(text)
     if not chunks and attachments:
         chunks = [""]
 
+    first_mid: str | None = None
     for index, chunk in enumerate(chunks):
         payload: dict[str, Any] = {
             "type": "text",
@@ -3015,22 +3041,87 @@ async def max_send_message(
             params={"chat_id": str(chat_id)},
             json=payload,
         ) as resp:
+            body_json: Any = None
+            with suppress(Exception):
+                body_json = await resp.json(content_type=None)
             if resp.status >= 400:
                 body = await resp.text()
                 raise RuntimeError(f"MAX send error {resp.status}: {body[:500]}")
+            if index == 0 and isinstance(body_json, dict):
+                first_mid = extract_message_mid(body_json)
+    return first_mid
 
 
-async def answer_callback(callback_id: str, notification: str) -> None:
+def extract_message_mid(node: Any) -> str | None:
+    if isinstance(node, dict):
+        for key in ("mid", "message_id", "messageId"):
+            value = node.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        for key in ("message", "body", "payload", "result", "data"):
+            if key in node:
+                found = extract_message_mid(node.get(key))
+                if found:
+                    return found
+    elif isinstance(node, list):
+        for item in node:
+            found = extract_message_mid(item)
+            if found:
+                return found
+    return None
+
+
+async def max_edit_message(
+    chat_id: int,
+    message_mid: str,
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> bool:
     session = await get_session()
+    payload: dict[str, Any] = {
+        "type": "text",
+        "text": text,
+    }
+    if attachments:
+        payload["attachments"] = attachments
+
+    async with session.put(
+        f"{MAX_API}/messages",
+        headers=max_headers(),
+        params={"chat_id": str(chat_id), "message_id": str(message_mid)},
+        json=payload,
+    ) as resp:
+        if resp.status >= 400:
+            body = await resp.text()
+            log.warning("MAX edit error %s (chat_id=%s, mid=%s): %s", resp.status, chat_id, message_mid, body[:300])
+            return False
+    return True
+
+
+async def answer_callback(
+    callback_id: str,
+    notification: str,
+    text: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> bool:
+    session = await get_session()
+    payload: dict[str, Any] = {"notification": notification}
+    if text is not None:
+        message_payload: dict[str, Any] = {"type": "text", "text": text}
+        if attachments:
+            message_payload["attachments"] = attachments
+        payload["message"] = message_payload
     async with session.post(
         f"{MAX_API}/answers",
         headers=max_headers(),
         params={"callback_id": callback_id},
-        json={"notification": notification},
+        json=payload,
     ) as resp:
         if resp.status >= 400:
             body = await resp.text()
             log.warning("Callback answer failed %s: %s", resp.status, body[:300])
+            return False
+    return True
 
 
 async def get_upload_url(upload_type: str = "image") -> str:
@@ -3469,6 +3560,256 @@ async def send_menu(chat_id: int) -> None:
         f"{MENU_TEXT}"
     )
     await max_send_message(chat_id, text, attachments=build_keyboard())
+
+
+UI_PAGE_MENU = "menu"
+UI_PAGE_MODELS = "models"
+UI_PAGE_PLAN = "plan"
+UI_PAGE_TARIFFS = "tariffs"
+UI_PAGE_TOPUPS = "topups"
+UI_PAGE_PAYMENTS = "payments"
+UI_PAGE_GROWTH = "growth"
+UI_PAGE_SUPPORT = "support"
+UI_PAGE_IMAGE_MENU = "image_menu"
+
+UI_PAGE_KEYS = {
+    UI_PAGE_MENU,
+    UI_PAGE_MODELS,
+    UI_PAGE_PLAN,
+    UI_PAGE_TARIFFS,
+    UI_PAGE_TOPUPS,
+    UI_PAGE_PAYMENTS,
+    UI_PAGE_GROWTH,
+    UI_PAGE_SUPPORT,
+    UI_PAGE_IMAGE_MENU,
+}
+
+UI_HISTORY_LIMIT = 20
+
+
+def ui_back_stack(chat_id: int) -> list[str]:
+    return state.ui_back_stack.setdefault(chat_id, [])
+
+
+def ui_forward_stack(chat_id: int) -> list[str]:
+    return state.ui_forward_stack.setdefault(chat_id, [])
+
+
+def ui_can_go_back(chat_id: int) -> bool:
+    return bool(ui_back_stack(chat_id))
+
+
+def ui_can_go_forward(chat_id: int) -> bool:
+    return bool(ui_forward_stack(chat_id))
+
+
+def ui_set_page(chat_id: int, page: str, push_history: bool = True) -> None:
+    current = state.ui_current_page.get(chat_id)
+    if push_history and current is None and page != UI_PAGE_MENU:
+        back = ui_back_stack(chat_id)
+        back.append(UI_PAGE_MENU)
+        ui_forward_stack(chat_id).clear()
+    if push_history and current and current != page:
+        back = ui_back_stack(chat_id)
+        back.append(current)
+        if len(back) > UI_HISTORY_LIMIT:
+            del back[:-UI_HISTORY_LIMIT]
+        ui_forward_stack(chat_id).clear()
+    state.ui_current_page[chat_id] = page
+
+
+def ui_nav_back(chat_id: int) -> str | None:
+    back = ui_back_stack(chat_id)
+    if not back:
+        return None
+    target = back.pop()
+    current = state.ui_current_page.get(chat_id)
+    if current:
+        fwd = ui_forward_stack(chat_id)
+        fwd.append(current)
+        if len(fwd) > UI_HISTORY_LIMIT:
+            del fwd[:-UI_HISTORY_LIMIT]
+    state.ui_current_page[chat_id] = target
+    return target
+
+
+def ui_nav_forward(chat_id: int) -> str | None:
+    fwd = ui_forward_stack(chat_id)
+    if not fwd:
+        return None
+    target = fwd.pop()
+    current = state.ui_current_page.get(chat_id)
+    if current:
+        back = ui_back_stack(chat_id)
+        back.append(current)
+        if len(back) > UI_HISTORY_LIMIT:
+            del back[:-UI_HISTORY_LIMIT]
+    state.ui_current_page[chat_id] = target
+    return target
+
+
+def add_ui_nav_buttons(chat_id: int, attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    result = json.loads(json.dumps(attachments or []))
+    nav_row: list[dict[str, Any]] = []
+    if ui_can_go_back(chat_id):
+        nav_row.append({"type": "callback", "text": "◀ Назад", "payload": "ui_nav:back"})
+    if ui_can_go_forward(chat_id):
+        nav_row.append({"type": "callback", "text": "↩ Откат", "payload": "ui_nav:forward"})
+    if not nav_row:
+        return result
+
+    if result and isinstance(result[0], dict) and result[0].get("type") == "inline_keyboard":
+        keyboard_payload = result[0].setdefault("payload", {})
+        buttons = keyboard_payload.setdefault("buttons", [])
+        if isinstance(buttons, list):
+            buttons.append(nav_row)
+            return result
+    return [{"type": "inline_keyboard", "payload": {"buttons": [nav_row]}}]
+
+
+def build_topups_text() -> str:
+    small = TOPUP_PACKS["small"]
+    medium = TOPUP_PACKS["medium"]
+    large = TOPUP_PACKS["large"]
+
+    def approx_images(credits: int) -> int:
+        if CREDIT_COST_IMAGE <= 0:
+            return 0
+        return credits // CREDIT_COST_IMAGE
+
+    return (
+        "в­ђ РџР°РєРµС‚С‹ РєСЂРµРґРёС‚РѕРІ\n\n"
+        f"вЂў Small: {small['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {small['price_rub']} в‚Ѕ (~{approx_images(int(small['credits']))} РєР°СЂС‚РёРЅРѕРє)\n"
+        f"вЂў Medium: {medium['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {medium['price_rub']} в‚Ѕ (~{approx_images(int(medium['credits']))} РєР°СЂС‚РёРЅРѕРє)\n"
+        f"вЂў Large: {large['credits']} РєСЂРµРґРёС‚РѕРІ Р·Р° {large['price_rub']} в‚Ѕ (~{approx_images(int(large['credits']))} РєР°СЂС‚РёРЅРѕРє)\n\n"
+        "РљСЂРµРґРёС‚С‹ СЃРїРёСЃС‹РІР°СЋС‚СЃСЏ Р·Р° Р·Р°РїСЂРѕСЃС‹ Рє РјРѕРґРµР»СЏРј Рё РіРµРЅРµСЂР°С†РёСЋ РєР°СЂС‚РёРЅРѕРє.\n"
+        "РџРµСЂРµРґ СЃРѕР·РґР°РЅРёРµРј РѕРїР»Р°С‚С‹ Р±РѕС‚ РїРѕРїСЂРѕСЃРёС‚ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РїРѕРєСѓРїРєРё РїР°РєРµС‚Р°."
+    )
+
+
+def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
+    rows = state.user_store.list_user_payments(chat_id, limit=8)
+    if not rows:
+        return "Р—Р°СЏРІРѕРє РїРѕРєР° РЅРµС‚. РСЃРїРѕР»СЊР·СѓР№ РєРЅРѕРїРєСѓ В«РўР°СЂРёС„С‹В».", build_keyboard()
+    lines = ["РўРІРѕРё РїРѕСЃР»РµРґРЅРёРµ Р·Р°СЏРІРєРё:"]
+    for item in rows:
+        status = str(item["status"]).lower()
+        status_human = payment_status_label(status)
+        lines.append(
+            f"#{item['id']} | {item['plan']} | {item['days']} РґРЅ | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
+        )
+    lines.append("\nРќР°Р¶РјРё В«РџСЂРѕРІРµСЂРёС‚СЊ #...В», С‡С‚РѕР±С‹ РѕР±РЅРѕРІРёС‚СЊ СЃС‚Р°С‚СѓСЃ РїРѕ Р±Р°РЅРєСѓ.")
+    return "\n".join(lines), build_payments_keyboard(rows)
+
+
+def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, Any]]]:
+    row = user_profile(chat_id)
+    if page == UI_PAGE_MENU:
+        preset_block = build_preset_block(str(row.get("plan", "free")))
+        capabilities = (
+            "Р§С‚Рѕ СѓРјРµСЋ:\n"
+            "вЂў вљЎ РѕС‚РІРµС‚С‹ С‡РµСЂРµР· GPT, Gemini Рё DeepSeek\n"
+            f"вЂў рџЋЁ {image_capability_line().replace('вЂў ', '')}\n"
+            "вЂў рџ§  СЃРѕС…СЂР°РЅРµРЅРёРµ РєРѕРЅС‚РµРєСЃС‚Р° РґРёР°Р»РѕРіР°"
+        )
+        text = (
+            "РџСЂРёРІРµС‚. Р­С‚Рѕ С‚РІРѕР№ AI-Р±РѕС‚ РІ MAX.\n\n"
+            f"{capabilities}\n\n"
+            f"{preset_block}\n\n"
+            "Р’С‹Р±РµСЂРё РґРµР№СЃС‚РІРёРµ РєРЅРѕРїРєР°РјРё РёР»Рё РїСЂРѕСЃС‚Рѕ РЅР°РїРёС€Рё РІРѕРїСЂРѕСЃ.\n\n"
+            f"РЎРµР№С‡Р°СЃ РІС‹Р±СЂР°РЅР° РјРѕРґРµР»СЊ: {current_model_label(chat_id)}\n"
+            f"{usage_text(row)}\n\n"
+            f"{MENU_TEXT}"
+        )
+        return text, build_keyboard()
+    if page == UI_PAGE_MODELS:
+        return build_models_text(row["plan"], include_prices=False), build_keyboard()
+    if page == UI_PAGE_PLAN:
+        return f"{usage_text(row)}{recurring_status_text(row)}", build_plan_keyboard(row)
+    if page == UI_PAGE_TARIFFS:
+        return build_tariffs_text(), build_tariffs_keyboard_pricing()
+    if page == UI_PAGE_TOPUPS:
+        return build_topups_text(), build_topups_keyboard()
+    if page == UI_PAGE_PAYMENTS:
+        return build_payments_text(chat_id)
+    if page == UI_PAGE_GROWTH:
+        referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        invited = int(row.get("referrals_invited", 0) or 0)
+        referred_by = int(row.get("referred_by_chat_id", 0) or 0)
+        promo_items = sorted(promo_catalog().items())
+        promo_lines = [f"вЂў {code}: +{credits} РєСЂРµРґРёС‚РѕРІ" for code, credits in promo_items[:6]]
+        channel = channel_promo_meta()
+        if channel["enabled"]:
+            if channel["active"]:
+                promo_lines.append(
+                    f"вЂў {channel['code']}: +{channel['credits']} РєСЂРµРґРёС‚РѕРІ (Р°РєС†РёСЏ {channel['days_left']} РґРЅ, Р±РѕРЅСѓСЃ РЅР° {channel['bonus_ttl_days']} РґРЅ)"
+                )
+            else:
+                promo_lines.append(f"вЂў {channel['code']}: Р°РєС†РёСЏ Р·Р°РІРµСЂС€РµРЅР°")
+        promo_block = "\n".join(promo_lines) if promo_lines else "вЂў РЎРµР№С‡Р°СЃ Р°РєС‚РёРІРЅС‹С… РїСЂРѕРјРѕРєРѕРґРѕРІ РЅРµС‚"
+        text = (
+            "рџЋЃ Р‘РѕРЅСѓСЃС‹ Рё РїСЂРёРіР»Р°С€РµРЅРёСЏ\n\n"
+            f"РўРІРѕР№ СЂРµС„-РєРѕРґ: {referral_code}\n"
+            f"РџСЂРёРіР»Р°С€РµРЅРѕ РґСЂСѓР·РµР№: {invited}\n"
+            f"РўС‹ РїСЂРёРіР»Р°С€РµРЅ РїРѕ СЂРµС„-РєРѕРґСѓ: {'РґР°' if referred_by > 0 else 'РЅРµС‚'}\n"
+            f"Р‘РѕРЅСѓСЃ Р·Р° РґСЂСѓРіР°: {REFERRAL_BONUS_CREDITS} РєСЂРµРґРёС‚РѕРІ С‚РµР±Рµ Рё РґСЂСѓРіСѓ.\n"
+            "Р”СЂСѓРі Р°РєС‚РёРІРёСЂСѓРµС‚ РєРѕРґ РєРѕРјР°РЅРґРѕР№: /ref <РєРѕРґ>\n\n"
+            "Р”РѕСЃС‚СѓРїРЅС‹Рµ РїСЂРѕРјРѕРєРѕРґС‹:\n"
+            f"{promo_block}\n\n"
+            f"Р‘Р°Р·РѕРІС‹Р№ РїСЂРѕРјРѕРєРѕРґ: /promo WELCOME (+{PROMO_WELCOME_CREDITS} РєСЂРµРґРёС‚РѕРІ, 1 СЂР°Р·)\n"
+            "РћР±РЅРѕРІР»РµРЅРёСЏ Рё РєРµР№СЃС‹: РІ РЅР°С€РµРј РєР°РЅР°Р»Рµ."
+        )
+        return text, build_growth_keyboard()
+    if page == UI_PAGE_SUPPORT:
+        return support_help_text(), build_keyboard()
+    if page == UI_PAGE_IMAGE_MENU:
+        text = (
+            "Р РµР¶РёРј В«РљР°СЂС‚РёРЅРєР°В»\n"
+            "РџРµСЂРµРєР»СЋС‡Рё СЃС‚РёР»СЊ Рё С„РѕСЂРјР°С‚, РїРѕС‚РѕРј РЅР°Р¶РјРё В«РЎРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊВ».\n"
+            f"РЎРїРёСЃР°РЅРёРµ: {CREDIT_COST_IMAGE} РєСЂРµРґРёС‚РѕРІ/РєР°СЂС‚РёРЅРєР°.\n"
+            f"РџРѕ С„РѕС‚Рѕ: {CREDIT_COST_IMAGE_EDIT} РєСЂРµРґРёС‚РѕРІ.\n"
+            "РќР° Free СЃРѕР·РґР°РЅРёРµ РєР°СЂС‚РёРЅРѕРє РѕРіСЂР°РЅРёС‡РµРЅРѕ РµР¶РµРЅРµРґРµР»СЊРЅС‹Рј Р»РёРјРёС‚РѕРј.\n\n"
+            f"{image_params_summary(chat_id)}\n\n"
+            "РњРѕР¶РЅРѕ РІРІРµСЃС‚Рё /image <РѕРїРёСЃР°РЅРёРµ> РёР»Рё /image_ref <РѕРїРёСЃР°РЅРёРµ>."
+        )
+        return text, build_image_menu_keyboard(chat_id)
+    return "РћС‚РєСЂРѕР№ РјРµРЅСЋ Рё РІС‹Р±РµСЂРё СЂР°Р·РґРµР».", build_keyboard()
+
+
+async def show_ui_page(
+    chat_id: int,
+    page: str,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+    push_history: bool = True,
+) -> None:
+    text, attachments = build_ui_page_payload(chat_id, page)
+    ui_set_page(chat_id, page, push_history=push_history)
+    attachments = add_ui_nav_buttons(chat_id, attachments)
+
+    managed_mid = state.ui_message_mid.get(chat_id)
+    can_update_callback_message = bool(
+        callback_id and source_mid and (source_mid == managed_mid or (managed_mid is None and page != UI_PAGE_MENU))
+    )
+    if can_update_callback_message:
+        ok = await answer_callback(
+            callback_id or "",
+            "Открываю",
+            text=text,
+            attachments=attachments,
+        )
+        if ok:
+            state.ui_message_mid[chat_id] = str(source_mid)
+            return
+
+    if source_mid and managed_mid and source_mid == managed_mid:
+        ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
+        if ok:
+            return
+
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False)
+    if sent_mid:
+        state.ui_message_mid[chat_id] = sent_mid
 
 
 async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
@@ -4292,9 +4633,42 @@ async def handle_admin(chat_id: int, text: str) -> bool:
 
 
 async def handle_callback(update: dict[str, Any]) -> bool:
-    chat_id, callback_id, payload = parse_callback_payload(update)
+    chat_id, callback_id, payload, source_mid = parse_callback_payload(update)
     if chat_id is None or not payload:
         return False
+
+    if payload == "ui_nav:back":
+        target = ui_nav_back(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Назад" if target else "Назад недоступен")
+        if target:
+            await show_ui_page(chat_id, target, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        return True
+
+    if payload == "ui_nav:forward":
+        target = ui_nav_forward(chat_id)
+        if callback_id:
+            await answer_callback(callback_id, "Откат" if target else "Откат недоступен")
+        if target:
+            await show_ui_page(chat_id, target, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        return True
+
+    action_page_map = {
+        "action:menu": UI_PAGE_MENU,
+        "action:models": UI_PAGE_MODELS,
+        "action:plan": UI_PAGE_PLAN,
+        "action:tariffs": UI_PAGE_TARIFFS,
+        "action:topups": UI_PAGE_TOPUPS,
+        "action:payments": UI_PAGE_PAYMENTS,
+        "action:growth": UI_PAGE_GROWTH,
+        "action:support": UI_PAGE_SUPPORT,
+        "action:image_menu": UI_PAGE_IMAGE_MENU,
+    }
+    if payload in action_page_map:
+        if callback_id:
+            await answer_callback(callback_id, "Открываю")
+        await show_ui_page(chat_id, action_page_map[payload], callback_id=callback_id, source_mid=source_mid, push_history=True)
+        return True
 
     if payload.startswith("set_preset:"):
         preset = payload.split(":", 1)[1].strip().lower()
@@ -4501,7 +4875,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         state.image_request_prefs[chat_id] = prefs
         if callback_id:
             await answer_callback(callback_id, f"Стиль: {IMAGE_STYLE_OPTIONS[style][0]}")
-        await send_image_menu(chat_id)
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload.startswith("image_aspect:"):
@@ -4515,7 +4889,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         state.image_request_prefs[chat_id] = prefs
         if callback_id:
             await answer_callback(callback_id, f"Формат: {IMAGE_ASPECT_OPTIONS[aspect][0]}")
-        await send_image_menu(chat_id)
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "image_prompt:start":
@@ -4545,7 +4919,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{image_params_summary(chat_id)}\n"
             f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n"
-            "Чтобы отменить — нажми «Отмена» или отправь /cancel.",
+            "Чтобы отменить — нажми «Отмена» или отправь /cancel",
             attachments=build_image_prompt_keyboard(),
             notify=False,
         )
