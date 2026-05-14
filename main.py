@@ -3850,6 +3850,18 @@ async def show_ui_page(
         await answer_callback(callback_id, notification)
 
 
+async def send_managed_message(
+    chat_id: int,
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+    notify: bool = False,
+) -> str | None:
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=notify)
+    if sent_mid:
+        state.ui_message_mid[chat_id] = sent_mid
+    return sent_mid
+
+
 async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
     row = user_profile(chat_id)
     if step <= 1:
@@ -5065,7 +5077,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
-        await max_send_message(
+        await send_managed_message(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
@@ -5136,7 +5148,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
-        await max_send_message(
+        await send_managed_message(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
@@ -5152,7 +5164,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
-        await max_send_message(
+        await send_managed_message(
             chat_id,
             msg,
             attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
@@ -5187,7 +5199,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         refreshed_status = str((payment or {}).get("status", "pending")).lower()
         if callback_id:
             await answer_callback(callback_id, payment_status_label(refreshed_status))
-        await max_send_message(
+        await send_managed_message(
             chat_id,
             payment_user_status_text(payment or {}, bank_status=bank_status),
             attachments=build_payment_request_keyboard(request_id) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
