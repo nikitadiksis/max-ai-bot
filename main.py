@@ -3107,7 +3107,7 @@ async def answer_callback(
     session = await get_session()
     payload: dict[str, Any] = {"notification": notification}
     if text is not None:
-        message_payload: dict[str, Any] = {"type": "text", "text": text}
+        message_payload: dict[str, Any] = {"text": text}
         if attachments:
             message_payload["attachments"] = attachments
         payload["message"] = message_payload
@@ -3117,9 +3117,15 @@ async def answer_callback(
         params={"callback_id": callback_id},
         json=payload,
     ) as resp:
+        response_json: Any = None
+        with suppress(Exception):
+            response_json = await resp.json(content_type=None)
         if resp.status >= 400:
             body = await resp.text()
             log.warning("Callback answer failed %s: %s", resp.status, body[:300])
+            return False
+        if isinstance(response_json, dict) and response_json.get("success") is False:
+            log.warning("Callback answer returned success=false: %s", response_json)
             return False
     return True
 
