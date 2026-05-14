@@ -3786,15 +3786,14 @@ async def show_ui_page(
     callback_id: str | None = None,
     source_mid: str | None = None,
     push_history: bool = True,
+    notification: str = "Открываю",
 ) -> None:
     text, attachments = build_ui_page_payload(chat_id, page)
     ui_set_page(chat_id, page, push_history=push_history)
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     managed_mid = state.ui_message_mid.get(chat_id)
-    can_update_callback_message = bool(
-        callback_id and source_mid and (source_mid == managed_mid or (managed_mid is None and page != UI_PAGE_MENU))
-    )
+    can_update_callback_message = bool(callback_id and source_mid and managed_mid and source_mid == managed_mid)
     if can_update_callback_message:
         ok = await answer_callback(
             callback_id or "",
@@ -4641,18 +4640,18 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "ui_nav:back":
         target = ui_nav_back(chat_id)
-        if callback_id:
-            await answer_callback(callback_id, "Назад" if target else "Назад недоступен")
         if target:
             await show_ui_page(chat_id, target, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        elif callback_id:
+            await answer_callback(callback_id, "Назад недоступен")
         return True
 
     if payload == "ui_nav:forward":
         target = ui_nav_forward(chat_id)
-        if callback_id:
-            await answer_callback(callback_id, "Откат" if target else "Откат недоступен")
         if target:
             await show_ui_page(chat_id, target, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        elif callback_id:
+            await answer_callback(callback_id, "Откат недоступен")
         return True
 
     action_page_map = {
@@ -4667,8 +4666,6 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         "action:image_menu": UI_PAGE_IMAGE_MENU,
     }
     if payload in action_page_map:
-        if callback_id:
-            await answer_callback(callback_id, "Открываю")
         await show_ui_page(chat_id, action_page_map[payload], callback_id=callback_id, source_mid=source_mid, push_history=True)
         return True
 
@@ -4875,8 +4872,6 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         prefs = get_image_prefs(chat_id)
         prefs["style"] = style
         state.image_request_prefs[chat_id] = prefs
-        if callback_id:
-            await answer_callback(callback_id, f"Стиль: {IMAGE_STYLE_OPTIONS[style][0]}")
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
@@ -4889,8 +4884,6 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         prefs = get_image_prefs(chat_id)
         prefs["aspect"] = aspect
         state.image_request_prefs[chat_id] = prefs
-        if callback_id:
-            await answer_callback(callback_id, f"Формат: {IMAGE_ASPECT_OPTIONS[aspect][0]}")
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
