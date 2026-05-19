@@ -2793,13 +2793,13 @@ def model_line(model: ModelInfo, include_prices: bool) -> str:
 def build_models_text(user_plan: str, include_prices: bool = False) -> str:
     lines = [f"Текстовые модели (твой план: {user_plan}):"]
     for model in TEXT_MODELS.values():
-        prefix = "доступно" if plan_allowed(user_plan, model.min_plan) else f"нужно {plan_access_human(model.min_plan)}"
+        prefix = "✅" if plan_allowed(user_plan, model.min_plan) else f"нужно {plan_access_human(model.min_plan)}"
         lines.append(f"\n[{prefix}]\n{model_line(model, include_prices)}")
     image_model = DEFAULT_IMAGE_MODEL
     if user_plan == "free":
-        image_prefix = "доступно: 1 раз в 7 дней"
+        image_prefix = "✅ 1 раз в 7 дней"
     else:
-        image_prefix = "доступно" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {plan_access_human(image_model.min_plan)}"
+        image_prefix = "✅" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {plan_access_human(image_model.min_plan)}"
     lines.append("\nКартинки:")
     lines.append(f"\n[{image_prefix}]\n{model_line(image_model, include_prices)}")
     return "\n".join(lines)
