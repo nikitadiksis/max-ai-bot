@@ -213,7 +213,6 @@ WELCOME_TEXT = (
 
 MENU_TEXT = (
     "Кнопки ниже — основной способ пользоваться ботом.\n"
-    "Для генерации картинки нажми «🎨 Картинка».\n"
     "Если нужна помощь по оплате — нажми «Помощь».\n"
     "Новости и обновления — в кнопке «📣 Канал»."
 )
@@ -2136,6 +2135,7 @@ def build_preset_block(plan: str) -> str:
             extras.append(f"{higher_plan}: {higher_label}")
             seen_labels.add(higher_label)
         lines.append(f"• {cfg['label']} — {cfg['description']} ({'; '.join(extras)})")
+    lines.append("• 🎨 Картинка — отдельный режим для генерации и редактирования")
     return "\n".join(lines)
 
 
