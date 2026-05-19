@@ -1420,6 +1420,12 @@ def clear_growth_pending_inputs(chat_id: int) -> None:
     state.pending_promo_code_input.discard(chat_id)
 
 
+def handoff_onboarding_to_ui(chat_id: int, source_mid: str | None) -> None:
+    if source_mid:
+        state.ui_message_mid[chat_id] = source_mid
+    state.onboarding_message_mid.pop(chat_id, None)
+
+
 def looks_like_bonus_code(text: str) -> bool:
     value = text.strip()
     if not value:
@@ -4052,7 +4058,7 @@ async def show_onboarding_step(
         await answer_callback(callback_id, notification)
 
 
-async def close_onboarding_message(chat_id: int, source_mid: str | None, text: str = "Онбординг завершен.") -> None:
+async def close_onboarding_message(chat_id: int, source_mid: str | None, text: str = " ") -> None:
     target_mid = source_mid or state.onboarding_message_mid.get(chat_id)
     if not target_mid:
         return
@@ -5136,10 +5142,8 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:skip":
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, source_mid, "Онбординг пропущен. Основное меню открыто ниже.")
-        if callback_id:
-            await answer_callback(callback_id, "Ок")
-        await send_menu(chat_id)
+        handoff_onboarding_to_ui(chat_id, source_mid)
+        await show_ui_page(chat_id, UI_PAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "onboard:2":
@@ -5152,34 +5156,34 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "onboard:done":
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Основное меню открыто ниже.")
-        if callback_id:
-            await answer_callback(callback_id, "Погнали")
-        await send_menu(chat_id)
+        handoff_onboarding_to_ui(chat_id, source_mid)
+        await show_ui_page(chat_id, UI_PAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "onboard:scenario:text":
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Можешь сразу написать вопрос.")
-        if callback_id:
-            await answer_callback(callback_id, "Текст")
-        await max_send_message(chat_id, "Супер, просто напиши вопрос в чат — отвечу сразу.", attachments=build_keyboard(), notify=False)
+        handoff_onboarding_to_ui(chat_id, source_mid)
+        await show_managed_content(
+            chat_id,
+            "Супер, просто напиши вопрос в чат — отвечу сразу.",
+            attachments=build_keyboard(),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_MENU,
+            notification="Текст",
+        )
         return True
 
     if payload == "onboard:scenario:image":
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Открываю режим картинки.")
-        if callback_id:
-            await answer_callback(callback_id, "Картинка")
-        await send_image_menu(chat_id)
+        handoff_onboarding_to_ui(chat_id, source_mid)
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "onboard:scenario:tariff":
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, source_mid, "Онбординг завершен. Открываю тарифы.")
-        if callback_id:
-            await answer_callback(callback_id, "Тарифы")
-        await send_managed_message(chat_id, build_tariffs_text(), attachments=build_tariffs_keyboard_pricing(), page=UI_PAGE_TARIFFS, notify=False)
+        handoff_onboarding_to_ui(chat_id, source_mid)
+        await show_ui_page(chat_id, UI_PAGE_TARIFFS, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "action:image_menu":
@@ -5981,7 +5985,6 @@ async def process_update(update: dict[str, Any]) -> None:
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
     if int(row.get("onboarding_done", 0) or 0) == 0 and text.strip().lower() not in {"/start"}:
         state.user_store.set_onboarding_done(chat_id, True)
-        await close_onboarding_message(chat_id, None, "Онбординг завершен.")
     try:
         if await handle_pending_referral_input(chat_id, text):
             return
