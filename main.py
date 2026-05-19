@@ -3755,7 +3755,8 @@ def current_model_display(chat_id: int) -> str:
     preset = str(row.get("selected_preset", "") or "").strip().lower()
     preset_cfg = MODEL_PRESETS.get(preset)
     if preset_cfg and selected == resolve_preset_alias_for_plan(plan, preset):
-        return f"{preset_cfg['label']} — {model.label}"
+        preset_icon = str(preset_cfg["label"]).split()[0]
+        return f"{preset_icon} {model.label}"
     return model.label
 
 
