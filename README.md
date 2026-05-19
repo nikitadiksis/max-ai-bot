@@ -157,6 +157,10 @@ Admin (`ADMIN_IDS` only):
 - `/admin kpi [days]`
 - `/costs`
 
+Закрытая веб-аналитика:
+- `/analytics`
+- вход по паролю `ADMIN_PANEL_TOKEN`
+
 ## Deploy (Docker)
 
 ```bash

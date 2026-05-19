@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 import uvicorn
 
 load_dotenv()
@@ -153,6 +154,8 @@ CHANNEL_PROMO_START_DATE = os.getenv("CHANNEL_PROMO_START_DATE", datetime.utcnow
 CHANNEL_PROMO_CAMPAIGN_DAYS = int(os.getenv("CHANNEL_PROMO_CAMPAIGN_DAYS", "7"))
 CHANNEL_PROMO_BONUS_TTL_DAYS = int(os.getenv("CHANNEL_PROMO_BONUS_TTL_DAYS", "7"))
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+ADMIN_SESSION_COOKIE = "aimax_admin_session"
+ADMIN_SESSION_MAX_AGE = 60 * 60 * 24 * 14
 BACKUP_KEEP_FILES = int(os.getenv("BACKUP_KEEP_FILES", "12"))
 ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("ERROR_ALERT_COOLDOWN_SEC", "120"))
 ERROR_ALERTS_ENABLED = os.getenv("ERROR_ALERTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
@@ -1548,6 +1551,33 @@ class UserStore:
                 (since,),
             ).fetchall()
 
+            plan_rows = conn.execute(
+                """
+                SELECT plan, COUNT(*) AS payments, SUM(rub_amount) AS revenue
+                FROM usage_events
+                WHERE created_at >= ? AND event_type = 'payment' AND rub_amount > 0
+                GROUP BY plan
+                ORDER BY revenue DESC, payments DESC
+                """
+                ,
+                (since,),
+            ).fetchall()
+
+            daily_rows = conn.execute(
+                """
+                SELECT
+                    substr(created_at, 1, 10) AS day,
+                    SUM(CASE WHEN event_type = 'payment' THEN rub_amount ELSE 0 END) AS revenue,
+                    COUNT(DISTINCT chat_id) AS active_users
+                FROM usage_events
+                WHERE created_at >= ?
+                GROUP BY substr(created_at, 1, 10)
+                ORDER BY day DESC
+                LIMIT 14
+                """,
+                (since,),
+            ).fetchall()
+
             return {
                 "days": period_days,
                 "since": since,
@@ -1563,6 +1593,8 @@ class UserStore:
                 "text_tokens": int((summary["text_tokens"] or 0) if summary else 0),
                 "payers": int((payers_row["payers"] or 0) if payers_row else 0),
                 "models": [dict(row) for row in model_rows],
+                "plans": [dict(row) for row in plan_rows],
+                "daily": [dict(row) for row in daily_rows],
             }
 
 
@@ -1986,6 +2018,56 @@ def admin_panel_enabled() -> bool:
 
 def admin_panel_authorized(token: str) -> bool:
     return bool(ADMIN_PANEL_TOKEN) and token.strip() == ADMIN_PANEL_TOKEN
+
+
+def resolve_admin_token(request: Request, token: str = "") -> str:
+    provided = token.strip()
+    if admin_panel_authorized(provided):
+        return provided
+    cookie_token = request.cookies.get(ADMIN_SESSION_COOKIE, "").strip()
+    if admin_panel_authorized(cookie_token):
+        return cookie_token
+    return ""
+
+
+def set_admin_cookie(response: HTMLResponse | RedirectResponse, token: str) -> None:
+    secure = PUBLIC_BASE_URL.startswith("https://")
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        value=token,
+        max_age=ADMIN_SESSION_MAX_AGE,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def clear_admin_cookie(response: HTMLResponse | RedirectResponse) -> None:
+    response.delete_cookie(key=ADMIN_SESSION_COOKIE, path="/")
+
+
+def admin_url(path: str, token: str = "", **params: Any) -> str:
+    query: dict[str, str] = {}
+    if token:
+        query["token"] = token
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        query[key] = str(value)
+    if not query:
+        return path
+    return f"{path}?{urlencode(query)}"
+
+
+def repair_mojibake(text: str) -> str:
+    if not text or ("Р" not in text and "вЂ" not in text):
+        return text
+    try:
+        fixed = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        return text
+    return fixed or text
 
 
 def backups_dir() -> Path:
@@ -6739,15 +6821,230 @@ async def mailru_domain_verify() -> FileResponse:
     return FileResponse(site_file("mailru-domainMB5PESlCeJQEXuoC.html"))
 
 
+def render_admin_login_html(error: str = "") -> str:
+    esc = html.escape
+    error_block = ""
+    if error:
+        error_block = f"<p class='error-box'>{esc(error)}</p>"
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Вход в аналитику</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+  <style>
+    .login-card {{ max-width: 520px; margin: 48px auto 0; }}
+    .form-grid {{ display: grid; gap: 12px; margin-top: 18px; }}
+    .field-label {{ font-size: 14px; font-weight: 700; color: var(--text); }}
+    .input {{ width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; font: inherit; }}
+    .error-box {{ border: 1px solid #ffd1d5; background: #fff0f1; color: #b82b3d; border-radius: 12px; padding: 10px 12px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card login-card">
+      <div class="top">
+        <span class="badge">Закрытый раздел</span>
+      </div>
+      <h1>Аналитика и управление</h1>
+      <p>Введи пароль администратора, чтобы открыть денежную аналитику и панель управления ботом.</p>
+      {error_block}
+      <form class="form-grid" method="post" action="/analytics/login">
+        <label class="field-label" for="password">Пароль</label>
+        <input class="input" id="password" name="password" type="password" autocomplete="current-password" placeholder="Пароль администратора"/>
+        <button class="btn btn-primary" type="submit">Войти</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def render_admin_analytics_html(token: str, days: int = 30) -> str:
+    report = state.user_store.kpi_report(days=days)
+    esc = html.escape
+
+    def money(value: int | float) -> str:
+        return f"{int(round(value)):,}".replace(",", " ")
+
+    active_users = int(report.get("active_users", 0) or 0)
+    payers = int(report.get("payers", 0) or 0)
+    revenue_rub = int(report.get("revenue_rub", 0) or 0)
+    refunds_raw = int(report.get("refunds_rub", 0) or 0)
+    refunds_abs = abs(refunds_raw)
+    net_rub = revenue_rub + refunds_raw if refunds_raw < 0 else revenue_rub - refunds_abs
+    pay_share = (payers * 100.0 / active_users) if active_users else 0.0
+    arpu = (net_rub / active_users) if active_users else 0.0
+    arppu = (net_rub / payers) if payers else 0.0
+    text_requests = int(report.get("text_requests", 0) or 0)
+    image_requests = int(report.get("image_requests", 0) or 0)
+    text_credits = int(report.get("text_credits", 0) or 0)
+    image_credits = int(report.get("image_credits", 0) or 0)
+    total_credits = int(report.get("total_credits_spent", 0) or 0)
+    text_tokens = int(report.get("text_tokens", 0) or 0)
+    avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
+
+    period_links = " ".join(
+        f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
+        for option in (7, 30, 90, 180)
+    )
+
+    models_rows = []
+    for row in report.get("models", []):
+        alias = str(row.get("model_alias", "") or "")
+        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label if alias else "-"
+        models_rows.append(
+            "<tr>"
+            f"<td>{esc(label)}</td>"
+            f"<td>{int(row.get('cnt', 0) or 0)}</td>"
+            f"<td>{int(row.get('credits', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not models_rows:
+        models_rows.append("<tr><td colspan='3'>Пока нет данных по моделям.</td></tr>")
+
+    plan_rows = []
+    for row in report.get("plans", []):
+        plan_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('plan', '-') or '-'))}</td>"
+            f"<td>{int(row.get('payments', 0) or 0)}</td>"
+            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
+            "</tr>"
+        )
+    if not plan_rows:
+        plan_rows.append("<tr><td colspan='3'>Платежей за выбранный период пока нет.</td></tr>")
+
+    daily_rows = []
+    for row in report.get("daily", []):
+        daily_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('day', '-') or '-'))}</td>"
+            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
+            f"<td>{int(row.get('active_users', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not daily_rows:
+        daily_rows.append("<tr><td colspan='3'>За период пока нет дневных данных.</td></tr>")
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Аналитика бота</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+  <style>
+    .dash-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-top:16px; }}
+    .metric {{ border:1px solid var(--line); border-radius:16px; padding:16px; background:#fcfdff; }}
+    .metric-label {{ color:var(--muted); font-size:13px; margin-bottom:8px; }}
+    .metric-value {{ font-size:28px; font-weight:800; color:var(--text); }}
+    .metric-note {{ color:var(--muted); font-size:13px; margin-top:6px; }}
+    .panel-nav {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+    .table-card {{ margin-top:14px; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <span class="badge">Закрытая аналитика</span>
+        <span class="badge">Период: {int(report.get('days', days) or days)} дней</span>
+      </div>
+      <h1>Деньги и метрики</h1>
+      <p>Здесь можно быстро смотреть выручку, плательщиков, нагрузку на модели и общую экономику проекта.</p>
+      <div class="panel-nav">
+        <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
+        <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
+      </div>
+      <div class="actions">{period_links}</div>
+      <div class="dash-grid">
+        <div class="metric"><div class="metric-label">Чистая выручка</div><div class="metric-value">{money(net_rub)} ₽</div><div class="metric-note">Выручка {money(revenue_rub)} ₽, возвраты {money(refunds_abs)} ₽</div></div>
+        <div class="metric"><div class="metric-label">Плательщики</div><div class="metric-value">{payers}</div><div class="metric-note">{pay_share:.1f}% от активных</div></div>
+        <div class="metric"><div class="metric-label">Активные пользователи</div><div class="metric-value">{active_users}</div><div class="metric-note">За выбранный период</div></div>
+        <div class="metric"><div class="metric-label">ARPU / ARPPU</div><div class="metric-value">{money(arpu)} / {money(arppu)} ₽</div><div class="metric-note">На активного и на платящего</div></div>
+        <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
+        <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Израсходовано {image_credits} кредитов</div></div>
+        <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
+        <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
+      </div>
+    </div>
+    <div class="card table-card">
+      <h2>Выручка по тарифам</h2>
+      <table>
+        <tr><th>Тариф</th><th>Оплат</th><th>Выручка</th></tr>
+        {''.join(plan_rows)}
+      </table>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Топ моделей</h2>
+        <table>
+          <tr><th>Модель</th><th>Запросов</th><th>Кредитов</th></tr>
+          {''.join(models_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Последние дни</h2>
+        <table>
+          <tr><th>День</th><th>Выручка</th><th>Активные</th></tr>
+          {''.join(daily_rows)}
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_page(request: Request, token: str = "", days: int = 30) -> HTMLResponse:
+    auth_token = resolve_admin_token(request, token)
+    if not auth_token:
+        return HTMLResponse(render_admin_login_html())
+
+    response = HTMLResponse(render_admin_analytics_html(token="", days=days))
+    set_admin_cookie(response, auth_token)
+    return response
+
+
+@app.post("/analytics/login", response_class=HTMLResponse)
+async def analytics_login(request: Request) -> HTMLResponse:
+    raw_body = (await request.body()).decode("utf-8", errors="ignore")
+    form_data = dict(parse_qsl(raw_body, keep_blank_values=True))
+    password = str(form_data.get("password", "")).strip()
+    if not admin_panel_authorized(password):
+        return HTMLResponse(render_admin_login_html("Неверный пароль."), status_code=401)
+
+    response = RedirectResponse(url="/analytics", status_code=303)
+    set_admin_cookie(response, password)
+    return response
+
+
+@app.get("/analytics/logout")
+async def analytics_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/analytics", status_code=303)
+    clear_admin_cookie(response)
+    return response
+
+
 @app.get("/admin/panel", response_class=HTMLResponse)
-async def admin_panel(token: str = "", chat_id: int | None = None, request_id: int | None = None) -> HTMLResponse:
-    if not admin_panel_authorized(token):
+async def admin_panel(request: Request, token: str = "", chat_id: int | None = None, request_id: int | None = None) -> HTMLResponse:
+    auth_token = resolve_admin_token(request, token)
+    if not auth_token:
         raise HTTPException(status_code=403, detail="forbidden")
-    return HTMLResponse(render_admin_panel_html(token=token, chat_id=chat_id, request_id=request_id))
+    response = HTMLResponse(render_admin_panel_html_v2(token="", chat_id=chat_id, request_id=request_id))
+    set_admin_cookie(response, auth_token)
+    return response
 
 
 @app.get("/admin/panel/action", response_class=HTMLResponse)
 async def admin_panel_action(
+    request: Request,
     token: str = "",
     type: str = "",
     chat_id: int | None = None,
@@ -6756,7 +7053,8 @@ async def admin_panel_action(
     amount: int = 0,
     value: str = "",
 ) -> HTMLResponse:
-    if not admin_panel_authorized(token):
+    auth_token = resolve_admin_token(request, token)
+    if not auth_token:
         raise HTTPException(status_code=403, detail="forbidden")
     message = "Готово"
     action = type.strip().lower()
@@ -6797,7 +7095,9 @@ async def admin_panel_action(
         capture_exception_safe(exc)
         message = f"Ошибка: {exc}"
 
-    return HTMLResponse(render_admin_panel_html(token=token, chat_id=chat_id, request_id=request_id, message=message))
+    response = HTMLResponse(render_admin_panel_html_v2(token="", chat_id=chat_id, request_id=request_id, message=message))
+    set_admin_cookie(response, auth_token)
+    return response
 
 
 def payment_status_view(request_id: int | None) -> dict[str, Any]:
@@ -6944,6 +7244,134 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#fbfdff;border:1px so
 {''.join(payment_rows)}
 </table></div>
 </body></html>"""
+
+
+def render_admin_panel_html_v2(
+    token: str,
+    chat_id: int | None = None,
+    request_id: int | None = None,
+    message: str = "",
+) -> str:
+    users = state.user_store.list_recent_users(limit=25)
+    payments = state.user_store.list_recent_payments(limit=25)
+    selected_user = state.user_store.get_user(chat_id) if chat_id else None
+    selected_payment = state.user_store.get_payment(request_id) if request_id else None
+    esc = html.escape
+
+    info_block = ""
+    if message:
+        info_block += f"<p class='notice'>{esc(repair_mojibake(message))}</p>"
+    if selected_user:
+        info_block += "<h3>Пользователь</h3>" + f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
+    if selected_payment:
+        info_block += "<h3>Платёж</h3>" + f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
+
+    user_rows = []
+    for row in users:
+        cid = int(row.get("chat_id", 0) or 0)
+        user_rows.append(
+            "<tr>"
+            f"<td>{cid}</td>"
+            f"<td>{esc(str(row.get('plan', '')))}</td>"
+            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
+            f"<td>{int(row.get('daily_messages_used', 0) or 0)}/{int(row.get('daily_images_used', 0) or 0)}</td>"
+            f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            "</tr>"
+        )
+
+    payment_rows = []
+    for row in payments:
+        rid = int(row.get("id", 0) or 0)
+        payment_rows.append(
+            "<tr>"
+            f"<td>{rid}</td>"
+            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('plan', '')))}</td>"
+            f"<td>{int(row.get('amount_rub', 0) or 0)}</td>"
+            f"<td>{esc(payment_status_label(str(row.get('status', ''))))}</td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', token, request_id=rid))}'>Открыть</a></td>"
+            "</tr>"
+        )
+
+    action_block = ""
+    if selected_user:
+        cid = int(selected_user["chat_id"])
+        action_block = (
+            "<h3>Ручная корректировка</h3>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='free'))}'>План free</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='lite'))}'>План lite</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='start'))}'>План start</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='pro'))}'>План pro</a>"
+            "</p>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=500))}'>+500 кредитов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-500 кредитов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='reset_daily', chat_id=cid))}'>Сброс дневных лимитов</a>"
+            "</p>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='block', chat_id=cid, value='on'))}'>Block ON</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='block', chat_id=cid, value='off'))}'>Block OFF</a>"
+            "</p>"
+        )
+    if selected_payment:
+        rid = int(selected_payment["id"])
+        action_block += (
+            "<h3>Платёж</h3>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='payment', request_id=rid, value='paid'))}'>Подтвердить оплату</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='payment', request_id=rid, value='cancel'))}'>Отменить</a>"
+            "</p>"
+        )
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Админка бота</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+  <style>
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; }}
+    pre {{ white-space:pre-wrap; word-break:break-word; background:#fbfdff; border:1px solid #e1e8f5; border-radius:12px; padding:12px; }}
+    .notice {{ padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#f8fbff; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <span class="badge">Закрытая админка</span>
+      </div>
+      <h1>Управление ботом</h1>
+      <div class="actions">
+        <a class="btn" href="{esc(admin_url('/analytics', token))}">Аналитика</a>
+        <a class="btn btn-primary" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='backup'))}">Создать бэкап БД</a>
+        <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='nudge'))}">Реактивировать free</a>
+        <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
+      </div>
+      {info_block}
+      {action_block}
+    </div>
+    <div class="card">
+      <h2>Последние пользователи</h2>
+      <table><tr><th>chat_id</th><th>plan</th><th>credits</th><th>usage d</th><th>blocked</th><th>last_active_at</th><th></th></tr>
+      {''.join(user_rows)}
+      </table>
+    </div>
+    <div class="card">
+      <h2>Последние платежи</h2>
+      <table><tr><th>id</th><th>chat_id</th><th>plan</th><th>amount</th><th>status</th><th></th></tr>
+      {''.join(payment_rows)}
+      </table>
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 @app.get("/payment/status")
