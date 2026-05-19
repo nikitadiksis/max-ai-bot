@@ -2420,7 +2420,7 @@ def build_onboarding_keyboard(step: int) -> list[dict[str, Any]]:
     else:
         buttons = [
             [{"type": "callback", "text": "Готово, начать", "payload": "onboard:done"}],
-            [{"type": "callback", "text": "📣 Канал с обновлениями", "payload": "action:channel"}],
+            [{"type": "link", "text": "📣 Канал с обновлениями", "url": channel_url_value()}],
         ]
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
