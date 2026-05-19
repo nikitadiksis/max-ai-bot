@@ -4001,10 +4001,10 @@ async def send_menu(chat_id: int) -> None:
         "• 🧠 сохранение контекста диалога"
     )
     text = (
-        "Привет. Это твой AI-бот в MAX.\n\n"
+        "Главное меню\n\n"
+        "Выбери режим кнопками или просто напиши вопрос.\n\n"
         f"{capabilities}\n\n"
         f"{preset_block}\n\n"
-        "Выбери действие кнопками или просто напиши вопрос.\n\n"
         f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
@@ -4117,6 +4117,14 @@ def add_ui_nav_buttons(chat_id: int, attachments: list[dict[str, Any]] | None) -
     return [{"type": "inline_keyboard", "payload": {"buttons": [nav_row]}}]
 
 
+def resolve_edit_target_mid(chat_id: int, source_mid: str | None, force_new: bool = False) -> str | None:
+    if force_new:
+        return None
+    if source_mid:
+        return source_mid
+    return state.ui_message_mid.get(chat_id)
+
+
 def build_topups_text() -> str:
     small = TOPUP_PACKS["small"]
     medium = TOPUP_PACKS["medium"]
@@ -4163,10 +4171,10 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "• 🧠 сохранение контекста диалога"
         )
         text = (
-            "Привет. Это твой AI-бот в MAX.\n\n"
+            "Главное меню\n\n"
+            "Выбери режим кнопками или просто напиши вопрос.\n\n"
             f"{capabilities}\n\n"
             f"{preset_block}\n\n"
-            "Выбери действие кнопками или просто напиши вопрос.\n\n"
             f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
@@ -4248,11 +4256,11 @@ async def show_ui_page(
     ui_set_page(chat_id, page, push_history=push_history)
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
-    managed_mid = state.ui_message_mid.get(chat_id)
-    can_edit_managed = bool((not force_new) and managed_mid and ((not source_mid) or source_mid == managed_mid))
-    if can_edit_managed:
-        ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
+    target_mid = resolve_edit_target_mid(chat_id, source_mid, force_new=force_new)
+    if target_mid:
+        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments)
         if ok:
+            state.ui_message_mid[chat_id] = target_mid
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
@@ -4279,11 +4287,11 @@ async def show_managed_content(
         ui_set_page(chat_id, str(page), push_history=push_history)
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
-    managed_mid = state.ui_message_mid.get(chat_id)
-    can_edit_managed = bool((not force_new) and managed_mid and ((not source_mid) or source_mid == managed_mid))
-    if can_edit_managed:
-        ok = await max_edit_message(chat_id, managed_mid, text, attachments=attachments)
+    target_mid = resolve_edit_target_mid(chat_id, source_mid, force_new=force_new)
+    if target_mid:
+        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments)
         if ok:
+            state.ui_message_mid[chat_id] = target_mid
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
