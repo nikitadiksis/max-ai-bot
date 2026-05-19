@@ -4005,7 +4005,7 @@ async def send_menu(chat_id: int) -> None:
         "Выбери режим кнопками или просто напиши вопрос.\n\n"
         f"{capabilities}\n\n"
         f"{preset_block}\n\n"
-        f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
+        f"{current_model_focus_block(chat_id)}\n"
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
     )
@@ -4125,6 +4125,14 @@ def resolve_edit_target_mid(chat_id: int, source_mid: str | None, force_new: boo
     return state.ui_message_mid.get(chat_id)
 
 
+def current_model_focus_block(chat_id: int) -> str:
+    return (
+        "────────────\n"
+        f"**Сейчас выбрана модель:** {current_model_display(chat_id)}\n"
+        "────────────"
+    )
+
+
 def build_topups_text() -> str:
     small = TOPUP_PACKS["small"]
     medium = TOPUP_PACKS["medium"]
@@ -4175,7 +4183,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "Выбери режим кнопками или просто напиши вопрос.\n\n"
             f"{capabilities}\n\n"
             f"{preset_block}\n\n"
-            f"Сейчас выбрана модель: {current_model_display(chat_id)}\n"
+            f"{current_model_focus_block(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
         )
