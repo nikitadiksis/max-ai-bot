@@ -2122,15 +2122,21 @@ def build_preset_block(plan: str) -> str:
     lines = ["🎛 Режимы ответов:"]
     for key in ("fast", "balanced", "quality", "expert"):
         cfg = MODEL_PRESETS[key]
-        aliases = list(cfg.get("aliases", []))
-        primary_alias = str(aliases[0]) if aliases else ""
-        primary_info = TEXT_MODELS.get(primary_alias)
         alias = resolve_preset_alias_for_plan(plan, key)
         label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
-        if primary_info and not plan_allowed(plan, primary_info.min_plan):
-            lines.append(f"• {cfg['label']} — {cfg['description']} (сейчас: {label})")
-            continue
-        lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
+        extras: list[str] = [f"сейчас: {label}"]
+        seen_labels = {label}
+        current_rank = PLAN_ORDER.get(plan, 0)
+        for higher_plan in ("lite", "start", "pro"):
+            if PLAN_ORDER.get(higher_plan, 0) <= current_rank:
+                continue
+            higher_alias = resolve_preset_alias_for_plan(higher_plan, key)
+            higher_label = TEXT_MODELS.get(higher_alias, DEFAULT_TEXT_MODEL).label
+            if higher_label in seen_labels:
+                continue
+            extras.append(f"{higher_plan}: {higher_label}")
+            seen_labels.add(higher_label)
+        lines.append(f"• {cfg['label']} — {cfg['description']} ({'; '.join(extras)})")
     return "\n".join(lines)
 
 
