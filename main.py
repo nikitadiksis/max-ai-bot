@@ -2116,25 +2116,31 @@ def resolve_preset_alias_for_chat(chat_id: int, preset: str) -> str:
     return resolve_preset_alias_for_plan(plan, preset)
 
 
+def preset_available_labels_for_plan(plan: str, preset: str) -> list[str]:
+    preset_cfg = MODEL_PRESETS.get(preset) or {}
+    labels: list[str] = []
+    seen: set[str] = set()
+    for alias in preset_cfg.get("aliases", []):
+        info = TEXT_MODELS.get(str(alias))
+        if not info or not plan_allowed(plan, info.min_plan):
+            continue
+        label = str(info.label)
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    if not labels:
+        fallback = TEXT_MODELS.get(best_default_alias_for_plan(plan), DEFAULT_TEXT_MODEL).label
+        labels.append(str(fallback))
+    return labels
+
+
 def build_preset_block(plan: str) -> str:
     lines = ["🎛 Режимы ответов:"]
     for key in ("fast", "balanced", "quality", "expert"):
         cfg = MODEL_PRESETS[key]
-        alias = resolve_preset_alias_for_plan(plan, key)
-        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
-        extras: list[str] = [f"сейчас: {label}"]
-        seen_labels = {label}
-        current_rank = PLAN_ORDER.get(plan, 0)
-        for higher_plan in ("lite", "start", "pro"):
-            if PLAN_ORDER.get(higher_plan, 0) <= current_rank:
-                continue
-            higher_alias = resolve_preset_alias_for_plan(higher_plan, key)
-            higher_label = TEXT_MODELS.get(higher_alias, DEFAULT_TEXT_MODEL).label
-            if higher_label in seen_labels:
-                continue
-            extras.append(f"{higher_plan}: {higher_label}")
-            seen_labels.add(higher_label)
-        lines.append(f"• {cfg['label']} — {cfg['description']} ({'; '.join(extras)})")
+        labels = preset_available_labels_for_plan(plan, key)
+        lines.append(f"• {cfg['label']} — {cfg['description']} ({', '.join(labels)})")
     lines.append("• 🎨 Картинка — отдельный режим для генерации и редактирования")
     return "\n".join(lines)
 
