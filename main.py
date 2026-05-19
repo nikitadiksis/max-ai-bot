@@ -561,6 +561,7 @@ class UserStore:
                     daily_gpt54_used INTEGER NOT NULL DEFAULT 0,
                     free_image_week_key TEXT NOT NULL DEFAULT '',
                     free_image_week_used INTEGER NOT NULL DEFAULT 0,
+                    free_image_last_used_at TEXT NOT NULL DEFAULT '',
                     credits_balance INTEGER NOT NULL DEFAULT 0,
                     credits_spent_total INTEGER NOT NULL DEFAULT 0,
                     last_active_at TEXT NOT NULL DEFAULT '',
@@ -649,6 +650,7 @@ class UserStore:
             self._ensure_column(conn, "users", "daily_gpt54_used", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "free_image_week_key", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "free_image_week_used", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "free_image_last_used_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "credits_balance", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "credits_spent_total", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "payment_requests", "recurring_consent", "INTEGER NOT NULL DEFAULT 0")
@@ -716,8 +718,6 @@ class UserStore:
     def get_or_create_user(self, chat_id: int, default_model_alias: str) -> dict[str, Any]:
         now = datetime.utcnow().isoformat()
         today = self._today()
-        week_key = self._week_key()
-
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
             if row is None:
@@ -728,18 +728,17 @@ class UserStore:
                         chat_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
                         selected_model_alias, selected_preset, usage_date,
                         daily_messages_used, daily_images_used, daily_gpt54_used,
-                        free_image_week_key, free_image_week_used,
+                        free_image_week_key, free_image_week_used, free_image_last_used_at,
                         credits_balance, credits_spent_total,
                         last_active_at,
                         created_at, updated_at
-                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, ?, 0, ?, 0, ?, ?, ?)
+                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
                     """,
                     (
                         chat_id,
                         referral_code,
                         default_model_alias,
                         today,
-                        week_key,
                         FREE_DAILY_CREDITS,
                         now,
                         now,
@@ -760,18 +759,6 @@ class UserStore:
                     WHERE chat_id = ?
                     """,
                     (today, now, chat_id),
-                )
-                conn.commit()
-                row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
-
-            if str(row["free_image_week_key"] or "") != week_key:
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET free_image_week_key = ?, free_image_week_used = 0, updated_at = ?
-                    WHERE chat_id = ?
-                    """,
-                    (week_key, now, chat_id),
                 )
                 conn.commit()
                 row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -1005,18 +992,19 @@ class UserStore:
         if limit <= 0:
             limit = 1
         cutoff = (datetime.utcnow() - timedelta(days=dormant_days)).replace(microsecond=0).isoformat()
+        free_image_ready_cutoff = (datetime.utcnow() - timedelta(days=7)).replace(microsecond=0).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT chat_id, plan, free_image_week_used, last_active_at, credits_balance
+                SELECT chat_id, plan, free_image_last_used_at, last_active_at, credits_balance
                 FROM users
                 WHERE plan = 'free'
                   AND (last_active_at = '' OR last_active_at <= ?)
-                  AND free_image_week_used = 0
+                  AND (free_image_last_used_at = '' OR free_image_last_used_at <= ?)
                 ORDER BY last_active_at ASC
                 LIMIT ?
                 """,
-                (cutoff, limit),
+                (cutoff, free_image_ready_cutoff, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1226,14 +1214,13 @@ class UserStore:
 
     def increment_free_week_image_usage(self, chat_id: int) -> None:
         with self._connect() as conn:
-            week_key = self._week_key()
             conn.execute(
                 """
                 UPDATE users
-                SET free_image_week_key = ?, free_image_week_used = free_image_week_used + 1, updated_at = ?
+                SET free_image_week_used = 1, free_image_last_used_at = ?, updated_at = ?
                 WHERE chat_id = ?
                 """,
-                (week_key, datetime.utcnow().isoformat(), chat_id),
+                (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
 
@@ -2537,7 +2524,7 @@ def build_models_text(user_plan: str, include_prices: bool = False) -> str:
         lines.append(f"\n[{prefix}]\n{model_line(model, include_prices)}")
     image_model = DEFAULT_IMAGE_MODEL
     if user_plan == "free":
-        image_prefix = "доступно: 1/неделю"
+        image_prefix = "доступно: 1 раз в 7 дней"
     else:
         image_prefix = "доступно" if plan_allowed(user_plan, image_model.min_plan) else f"нужно {plan_access_human(image_model.min_plan)}"
     lines.append("\nКартинки:")
@@ -2747,6 +2734,24 @@ def parse_iso_datetime(value: str) -> datetime | None:
         return None
 
 
+def format_msk_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    return (value + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M МСК")
+
+
+def free_image_next_available_at(row: dict[str, Any]) -> datetime | None:
+    last_used = parse_iso_datetime(str(row.get("free_image_last_used_at", "") or ""))
+    if last_used is None:
+        return None
+    return last_used + timedelta(days=7)
+
+
+def free_image_is_available(row: dict[str, Any]) -> bool:
+    next_at = free_image_next_available_at(row)
+    return next_at is None or datetime.utcnow() >= next_at
+
+
 def plan_price_and_days(plan: str) -> tuple[int, int]:
     if plan == "lite":
         return LITE_PLAN_PRICE_RUB, LITE_PLAN_DAYS
@@ -2764,7 +2769,7 @@ def build_tariffs_text() -> str:
     free_ds_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_DEEPSEEK))
     return (
         "💠 Тарифы:\n"
-        f"• 🆓 free: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов) + 1 картинка/неделю\n"
+        f"• 🆓 free: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов) + 1 картинка / 7 дней\n"
         f"• 🍬 lite: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов\n"
         f"• 👌 start: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов\n"
         f"• 🚀 pro: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов{pro_gpt54_line}\n\n"
@@ -2781,7 +2786,7 @@ def build_tariffs_text() -> str:
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
         "Отменить автопродление можно в разделе «Мой план».\n\n"
         "Модели по тарифам:\n"
-        "• free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1/неделю)\n"
+        "• free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
         "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
         "• pro: + GPT-5.4"
     )
@@ -2893,12 +2898,11 @@ def usage_text(row: dict[str, Any]) -> str:
         text += f"\n🎁 Временный бонус: {bonus_total} кредитов (сгорит {bonus_until})"
     if plan_name == "free":
         text += f"\nДневной бонус free: {FREE_DAILY_CREDITS} кредитов"
-        weekly_used = int(row.get("free_image_week_used", 0) or 0)
-        weekly_left = max(0, 1 - weekly_used)
-        if weekly_left > 0:
-            text += f"\nКартинки на free: {weekly_used}/1 за эту неделю (осталось {weekly_left})"
+        next_at = free_image_next_available_at(row)
+        if free_image_is_available(row):
+            text += "\nКартинки на free: 1/1 доступна сейчас"
         else:
-            text += f"\nКартинки на free: {weekly_used}/1 за эту неделю. Новая с {next_free_image_available_date()}."
+            text += f"\nКартинки на free: лимит исчерпан. Новая будет доступна с {format_msk_datetime(next_at)}."
     if cfg.daily_gpt54_limit > 0:
         text += f"\nGPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})"
     return text
@@ -2906,14 +2910,6 @@ def usage_text(row: dict[str, Any]) -> str:
 
 def recurring_enabled_for_row(row: dict[str, Any]) -> bool:
     return int(row.get("recurring_enabled", 0) or 0) == 1
-
-
-def next_free_image_available_date() -> str:
-    today = date.today()
-    days_until_monday = 8 - today.isoweekday()
-    if days_until_monday <= 0:
-        days_until_monday += 7
-    return (today + timedelta(days=days_until_monday)).isoformat()
 
 
 def recurring_status_text(row: dict[str, Any]) -> str:
@@ -3045,12 +3041,11 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
 
     if limit_type == "images":
         if plan_name == "free":
-            week_used = int(row.get("free_image_week_used", 0) or 0)
-            if week_used >= 1:
-                next_date = next_free_image_available_date()
+            if not free_image_is_available(row):
+                next_at = free_image_next_available_at(row)
                 return (
                     False,
-                    f"На free доступна 1 картинка в неделю. Новая генерация будет доступна с {next_date}. "
+                    f"На free доступна 1 картинка каждые 7 дней. Новая генерация будет доступна с {format_msk_datetime(next_at)}. "
                     "Хочешь больше — открой «Тарифы».",
                 )
             return True, ""
@@ -3444,11 +3439,13 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     plan_name = str(row.get("plan", "free"))
     availability_line = f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
     if plan_name == "free":
-        week_used = int(row.get("free_image_week_used", 0) or 0)
-        if week_used >= 1:
-            availability_line = f"На free лимит: 1 картинка в неделю. Новая будет доступна с {next_free_image_available_date()}."
+        if not free_image_is_available(row):
+            availability_line = (
+                f"На free лимит: 1 картинка каждые 7 дней. "
+                f"Новая будет доступна с {format_msk_datetime(free_image_next_available_at(row))}."
+            )
         else:
-            availability_line = "На free доступна 1 картинка в неделю."
+            availability_line = "На free доступна 1 картинка каждые 7 дней."
     else:
         cfg = PLAN_CONFIGS.get(plan_name)
         if cfg and int(cfg.daily_images_limit or 0) > 0:
@@ -3904,7 +3901,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "Переключи стиль и формат, потом нажми «Сгенерировать».\n"
             f"Списание: {CREDIT_COST_IMAGE} кредитов/картинка.\n"
             f"По фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
-            "На Free действует дополнительный лимит: не более 1 картинки в неделю.\n\n"
+            "На Free действует дополнительный лимит: не более 1 картинки каждые 7 дней.\n\n"
             f"{image_params_summary(chat_id)}\n\n"
             "Можно ввести /image <описание> или /image_ref <описание>."
         )
@@ -4126,7 +4123,7 @@ async def send_reengage_nudges(days: int, limit: int) -> tuple[int, int]:
             await max_send_message(
                 target,
                 (
-                    "👋 Возвращайся, у тебя доступна 1 бесплатная картинка недели.\n"
+                    "👋 Возвращайся, у тебя снова доступна 1 бесплатная картинка.\n"
                     "Нажми «🎨 Картинка» и отправь идею."
                 ),
                 attachments=build_keyboard(),
