@@ -4133,6 +4133,12 @@ def current_model_focus_block(chat_id: int) -> str:
     )
 
 
+def managed_page_text_format(page: str | None) -> str | None:
+    if page in UI_PAGE_KEYS:
+        return "markdown"
+    return None
+
+
 def build_topups_text() -> str:
     small = TOPUP_PACKS["small"]
     medium = TOPUP_PACKS["medium"]
@@ -4265,15 +4271,16 @@ async def show_ui_page(
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     target_mid = resolve_edit_target_mid(chat_id, source_mid, force_new=force_new)
+    text_format = managed_page_text_format(page)
     if target_mid:
-        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments)
+        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments, text_format=text_format)
         if ok:
             state.ui_message_mid[chat_id] = target_mid
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
 
-    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False)
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False, text_format=text_format)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
     if callback_id:
@@ -4296,15 +4303,16 @@ async def show_managed_content(
     attachments = add_ui_nav_buttons(chat_id, attachments)
 
     target_mid = resolve_edit_target_mid(chat_id, source_mid, force_new=force_new)
+    text_format = managed_page_text_format(page)
     if target_mid:
-        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments)
+        ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments, text_format=text_format)
         if ok:
             state.ui_message_mid[chat_id] = target_mid
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
 
-    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False)
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False, text_format=text_format)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
     if callback_id:
@@ -4321,7 +4329,7 @@ async def send_managed_message(
 ) -> str | None:
     if page in UI_PAGE_KEYS:
         ui_set_page(chat_id, page, push_history=push_history)
-    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=notify)
+    sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=notify, text_format=managed_page_text_format(page))
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
     return sent_mid
