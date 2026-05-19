@@ -1421,8 +1421,10 @@ def clear_growth_pending_inputs(chat_id: int) -> None:
 
 
 def handoff_onboarding_to_ui(chat_id: int, source_mid: str | None) -> None:
-    if source_mid:
-        state.ui_message_mid[chat_id] = source_mid
+    onboarding_mid = state.onboarding_message_mid.get(chat_id)
+    target_mid = onboarding_mid or source_mid
+    if target_mid:
+        state.ui_message_mid[chat_id] = target_mid
     state.onboarding_message_mid.pop(chat_id, None)
 
 
