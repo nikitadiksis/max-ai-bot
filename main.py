@@ -2128,9 +2128,7 @@ def build_preset_block(plan: str) -> str:
         alias = resolve_preset_alias_for_plan(plan, key)
         label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
         if primary_info and not plan_allowed(plan, primary_info.min_plan):
-            lines.append(
-                f"• {cfg['label']} — {cfg['description']} (сейчас: {label}; полная версия с {primary_info.min_plan})"
-            )
+            lines.append(f"• {cfg['label']} — {cfg['description']} (сейчас: {label})")
             continue
         lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
     return "\n".join(lines)
