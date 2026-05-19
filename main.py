@@ -2116,13 +2116,65 @@ def resolve_preset_alias_for_chat(chat_id: int, preset: str) -> str:
     return resolve_preset_alias_for_plan(plan, preset)
 
 
+def preset_available_aliases_for_plan(plan: str, preset: str) -> list[str]:
+    preset_cfg = MODEL_PRESETS.get(preset) or {}
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw_alias in preset_cfg.get("aliases", []):
+        alias = str(raw_alias).strip()
+        if not alias or alias in seen:
+            continue
+        info = TEXT_MODELS.get(alias)
+        if not info or not plan_allowed(plan, info.min_plan):
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    if not aliases:
+        aliases.append(best_default_alias_for_plan(plan))
+    return aliases
+
+
+def preset_available_labels_for_plan(plan: str, preset: str) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for alias in preset_available_aliases_for_plan(plan, preset):
+        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def preset_choice_enabled_for_plan(plan: str, preset: str) -> bool:
+    if plan == "free":
+        return False
+    current_aliases = preset_available_aliases_for_plan(plan, preset)
+    free_aliases = preset_available_aliases_for_plan("free", preset)
+    return len(current_aliases) > len(free_aliases)
+
+
+def preset_model_hint(alias: str) -> str:
+    return {
+        "deepseek": "самый быстрый и выгодный",
+        "gpt": "аккуратный и лёгкий для everyday-задач",
+        "gpt4o": "живой универсальный диалог",
+        "gemini": "лучше для длинных и подробных задач",
+        "gpt54": "максимум качества для сложных запросов",
+    }.get(alias, "подходит для этого режима")
+
+
 def build_preset_block(plan: str) -> str:
     lines = ["🎛 Режимы ответов:"]
     for key in ("fast", "balanced", "quality", "expert"):
         cfg = MODEL_PRESETS[key]
-        alias = resolve_preset_alias_for_plan(plan, key)
-        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
-        lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
+        if preset_choice_enabled_for_plan(plan, key):
+            labels = preset_available_labels_for_plan(plan, key)
+            lines.append(f"• {cfg['label']} — {cfg['description']} ({', '.join(labels)})")
+        else:
+            alias = resolve_preset_alias_for_plan(plan, key)
+            label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
+            lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
     lines.append("• 🎨 Картинка — отдельный режим для генерации и редактирования")
     return "\n".join(lines)
 
@@ -3745,7 +3797,7 @@ def current_model_display(chat_id: int) -> str:
     model = TEXT_MODELS.get(selected, DEFAULT_TEXT_MODEL)
     preset = str(row.get("selected_preset", "") or "").strip().lower()
     preset_cfg = MODEL_PRESETS.get(preset)
-    if preset_cfg and selected == resolve_preset_alias_for_plan(plan, preset):
+    if preset_cfg and selected in preset_available_aliases_for_plan(plan, preset):
         preset_icon = str(preset_cfg["label"]).split()[0]
         return f"{preset_icon} {model.label}"
     return model.label
@@ -4129,6 +4181,36 @@ def managed_page_text_format(page: str | None) -> str | None:
     if page in UI_PAGE_KEYS:
         return "markdown"
     return None
+
+
+def build_preset_picker_text(chat_id: int, preset: str) -> str:
+    row = user_profile(chat_id)
+    plan = str(row.get("plan", "free"))
+    cfg = MODEL_PRESETS.get(preset, {})
+    title = str(cfg.get("label", preset))
+    description = str(cfg.get("description", "")).strip()
+    aliases = preset_available_aliases_for_plan(plan, preset)
+    lines = [f"{title}", description, "", "Выбери модель для этого режима:"]
+    for alias in aliases:
+        info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
+        lines.append(f"• {info.label} — {preset_model_hint(alias)}")
+    lines.append("")
+    lines.append("После выбора бот вернёт тебя в Главное меню.")
+    return "\n".join(part for part in lines if part is not None)
+
+
+def build_preset_picker_keyboard(plan: str, preset: str) -> list[dict[str, Any]]:
+    rows: list[list[dict[str, Any]]] = []
+    for alias in preset_available_aliases_for_plan(plan, preset):
+        info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
+        rows.append([{"type": "callback", "text": info.label, "payload": f"preset_pick:{preset}:{alias}"}])
+    rows.append(
+        [
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ]
+    )
+    return [{"type": "inline_keyboard", "payload": {"buttons": rows}}]
 
 
 def build_topups_text() -> str:
@@ -5348,7 +5430,62 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Неизвестный режим")
             return True
         try:
-            alias = resolve_preset_alias_for_chat(chat_id, preset)
+            plan = str(user_profile(chat_id).get("plan", "free"))
+            aliases = preset_available_aliases_for_plan(plan, preset)
+            if preset_choice_enabled_for_plan(plan, preset) and len(aliases) > 1:
+                await show_managed_content(
+                    chat_id,
+                    build_preset_picker_text(chat_id, preset),
+                    attachments=build_preset_picker_keyboard(plan, preset),
+                    callback_id=callback_id,
+                    source_mid=source_mid,
+                    page=UI_PAGE_MENU,
+                    push_history=False,
+                    notification=f"{preset_cfg['label']}",
+                )
+                return True
+            alias = aliases[0]
+            label = await set_user_model(chat_id, alias)
+            state.user_store.set_selected_preset(chat_id, preset)
+            await show_ui_page(
+                chat_id,
+                UI_PAGE_MENU,
+                callback_id=callback_id,
+                source_mid=source_mid,
+                push_history=False,
+                notification=f"{preset_cfg['label']} → {label}",
+            )
+        except Exception as exc:
+            if callback_id:
+                await answer_callback(callback_id, str(exc)[:120])
+            await max_send_message(chat_id, f"Ошибка: {exc}", attachments=build_keyboard(), notify=False)
+        return True
+
+    if payload.startswith("preset_pick:"):
+        _, preset, alias = (payload.split(":", 2) + ["", ""])[:3]
+        preset = preset.strip().lower()
+        alias = alias.strip().lower()
+        preset_cfg = MODEL_PRESETS.get(preset)
+        if not preset_cfg:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный режим")
+            return True
+        plan = str(user_profile(chat_id).get("plan", "free"))
+        allowed_aliases = preset_available_aliases_for_plan(plan, preset)
+        if alias not in allowed_aliases:
+            if callback_id:
+                await answer_callback(callback_id, "Модель недоступна")
+            await show_managed_content(
+                chat_id,
+                build_preset_picker_text(chat_id, preset),
+                attachments=build_preset_picker_keyboard(plan, preset),
+                callback_id=None,
+                source_mid=source_mid,
+                page=UI_PAGE_MENU,
+                push_history=False,
+            )
+            return True
+        try:
             label = await set_user_model(chat_id, alias)
             state.user_store.set_selected_preset(chat_id, preset)
             await show_ui_page(
