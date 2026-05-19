@@ -189,10 +189,10 @@ PLAN_ORDER = {"free": 0, "lite": 1, "start": 2, "pro": 3}
 PAID_PLANS = {"lite", "start", "pro"}
 BUYABLE_PLANS = {"lite", "start", "pro"}
 IMAGE_STYLE_OPTIONS: dict[str, tuple[str, str]] = {
-    "auto": ("Авто", ""),
-    "photo": ("Фото", "photorealistic style, natural lighting"),
-    "anime": ("Аниме", "anime style, clean line art"),
-    "art": ("Арт", "digital art illustration, cinematic composition"),
+    "auto": ("✨ Авто", ""),
+    "photo": ("📷 Фото", "photorealistic style, natural lighting"),
+    "anime": ("🌸 Аниме", "anime style, clean line art"),
+    "art": ("🖼 Арт", "digital art illustration, cinematic composition"),
 }
 IMAGE_ASPECT_OPTIONS: dict[str, tuple[str, str]] = {
     "square": ("1:1", "square composition"),
@@ -2472,7 +2472,7 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
                         {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
                     ],
                     [
-                        {"type": "callback", "text": "🖼 По фото", "payload": "image_ref:start"},
+                        {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
                     ],
                     [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
@@ -3776,7 +3776,7 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
                 f"Новая будет доступна с {format_msk_datetime(next_at)}."
             )
         else:
-            availability_line = "На free доступна 1 картинка каждые 7 дней."
+            availability_line = "На тарифе Free доступна 1 картинка каждые 7 дней."
     else:
         cfg = PLAN_CONFIGS.get(plan_name)
         if cfg and int(cfg.daily_images_limit or 0) > 0:
@@ -3790,8 +3790,8 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
         f"{image_params_summary(chat_id)}\n\n"
         f"{availability_line}\n"
         f"Стоимость: {CREDIT_COST_IMAGE} кредитов за 1 генерацию.\n\n"
-        f"По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT} кредитов (с тарифа {DEFAULT_IMAGE_MODEL.min_plan}).\n\n"
-        "Выбери стиль и формат, затем нажми «Сгенерировать» или «По фото»."
+        f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов (с тарифа {DEFAULT_IMAGE_MODEL.min_plan}).\n\n"
+        "Выбери стиль и формат, затем нажми «✅ Сгенерировать» или «🖼 Редактировать фото»."
     )
     await show_managed_content(
         chat_id,
@@ -4250,12 +4250,11 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
     if page == UI_PAGE_IMAGE_MENU:
         text = (
             "Режим «Картинка»\n"
-            "Переключи стиль и формат, потом нажми «Сгенерировать».\n"
+            "Переключи стиль и формат, потом нажми «✅ Сгенерировать».\n"
             f"Списание: {CREDIT_COST_IMAGE} кредитов/картинка.\n"
-            f"По фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
-            "На Free действует дополнительный лимит: не более 1 картинки каждые 7 дней.\n\n"
-            f"{image_params_summary(chat_id)}\n\n"
-            "Можно ввести /image <описание> или /image_ref <описание>."
+            f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+            "На тарифе Free: не более 1 картинки каждые 7 дней.\n\n"
+            f"{image_params_summary(chat_id)}"
         )
         return text, build_image_menu_keyboard(chat_id)
     return "Открой меню и выбери раздел.", build_keyboard()
