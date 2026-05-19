@@ -2740,6 +2740,28 @@ def format_msk_datetime(value: datetime | None) -> str:
     return (value + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M МСК")
 
 
+def format_remaining_time(target: datetime | None) -> str:
+    if target is None:
+        return "0 ч."
+    delta = target - datetime.utcnow()
+    total_seconds = max(0, int(delta.total_seconds()))
+    if total_seconds <= 0:
+        return "0 ч."
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days} д.")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours} ч.")
+    elif minutes > 0:
+        parts.append(f"{minutes} мин.")
+    else:
+        parts.append("1 мин.")
+    return " ".join(parts[:2])
+
+
 def free_image_next_available_at(row: dict[str, Any]) -> datetime | None:
     last_used = parse_iso_datetime(str(row.get("free_image_last_used_at", "") or ""))
     if last_used is None:
@@ -2902,7 +2924,11 @@ def usage_text(row: dict[str, Any]) -> str:
         if free_image_is_available(row):
             text += "\nКартинки на free: 1/1 доступна сейчас"
         else:
-            text += f"\nКартинки на free: лимит исчерпан. Новая будет доступна с {format_msk_datetime(next_at)}."
+            text += (
+                f"\nКартинки на free: лимит исчерпан. "
+                f"Осталось {format_remaining_time(next_at)}. "
+                f"Новая будет доступна с {format_msk_datetime(next_at)}."
+            )
     if cfg.daily_gpt54_limit > 0:
         text += f"\nGPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})"
     return text
@@ -3440,9 +3466,11 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     availability_line = f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
     if plan_name == "free":
         if not free_image_is_available(row):
+            next_at = free_image_next_available_at(row)
             availability_line = (
                 f"На free лимит: 1 картинка каждые 7 дней. "
-                f"Новая будет доступна с {format_msk_datetime(free_image_next_available_at(row))}."
+                f"Осталось {format_remaining_time(next_at)}. "
+                f"Новая будет доступна с {format_msk_datetime(next_at)}."
             )
         else:
             availability_line = "На free доступна 1 картинка каждые 7 дней."
