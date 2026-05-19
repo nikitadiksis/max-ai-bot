@@ -545,6 +545,7 @@ class UserStore:
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id INTEGER PRIMARY KEY,
+                    max_user_id INTEGER NOT NULL DEFAULT 0,
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
                     onboarding_done INTEGER NOT NULL DEFAULT 0,
@@ -640,6 +641,7 @@ class UserStore:
                 """
             )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "max_user_id", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
@@ -665,6 +667,9 @@ class UserStore:
             self._ensure_column(conn, "payment_requests", "payment_url", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_activations_unique ON promo_activations(chat_id, promo_code)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_max_user_id_unique ON users(max_user_id) WHERE max_user_id > 0"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_promo_bonus_grants_expiry ON promo_bonus_grants(chat_id, expires_at)"
@@ -719,38 +724,230 @@ class UserStore:
         refreshed = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
         return refreshed if refreshed is not None else row
 
+    def _insert_new_user(
+        self,
+        conn: sqlite3.Connection,
+        chat_id: int,
+        default_model_alias: str,
+        now: str,
+        today: str,
+        max_user_id: int = 0,
+    ) -> sqlite3.Row:
+        referral_code = referral_code_for_chat(chat_id)
+        conn.execute(
+            """
+            INSERT INTO users (
+                chat_id, max_user_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
+                selected_model_alias, selected_preset, usage_date,
+                daily_messages_used, daily_images_used, daily_gpt54_used,
+                free_image_week_key, free_image_week_used, free_image_last_used_at,
+                credits_balance, credits_spent_total,
+                last_active_at,
+                created_at, updated_at
+            ) VALUES (?, ?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                max(0, int(max_user_id or 0)),
+                referral_code,
+                default_model_alias,
+                today,
+                FREE_DAILY_CREDITS,
+                now,
+                now,
+                now,
+            ),
+        )
+        return conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+
+    def _update_chat_references(self, conn: sqlite3.Connection, old_chat_id: int, new_chat_id: int, now: str) -> None:
+        conn.execute(
+            "UPDATE users SET chat_id = ?, updated_at = ? WHERE chat_id = ?",
+            (new_chat_id, now, old_chat_id),
+        )
+        conn.execute(
+            "UPDATE users SET referred_by_chat_id = ? WHERE referred_by_chat_id = ?",
+            (new_chat_id, old_chat_id),
+        )
+        for table in ("payment_requests", "usage_events", "promo_activations", "promo_bonus_grants"):
+            conn.execute(f"UPDATE {table} SET chat_id = ? WHERE chat_id = ?", (new_chat_id, old_chat_id))
+
+    def _merge_rebound_user_rows(
+        self,
+        existing: sqlite3.Row,
+        current: sqlite3.Row | None,
+        max_user_id: int,
+        now: str,
+    ) -> dict[str, Any]:
+        merged = dict(existing)
+        merged["max_user_id"] = max(0, int(max_user_id or 0))
+        if current is None:
+            merged["updated_at"] = now
+            return merged
+
+        current_dict = dict(current)
+        existing_plan = str(merged.get("plan", "free") or "free")
+        current_plan = str(current_dict.get("plan", "free") or "free")
+        existing_rank = PLAN_ORDER.get(existing_plan, 0)
+        current_rank = PLAN_ORDER.get(current_plan, 0)
+
+        def later_iso(left: Any, right: Any) -> str:
+            left_s = str(left or "").strip()
+            right_s = str(right or "").strip()
+            if not left_s:
+                return right_s
+            if not right_s:
+                return left_s
+            return max(left_s, right_s)
+
+        merged["is_blocked"] = 1 if int(merged.get("is_blocked", 0) or 0) or int(current_dict.get("is_blocked", 0) or 0) else 0
+        merged["onboarding_done"] = 1 if int(merged.get("onboarding_done", 0) or 0) or int(current_dict.get("onboarding_done", 0) or 0) else 0
+        merged["referral_code"] = str(merged.get("referral_code", "") or "").strip() or str(current_dict.get("referral_code", "") or "").strip() or referral_code_for_chat(int(existing["chat_id"]))
+        merged["referred_by_chat_id"] = int(merged.get("referred_by_chat_id", 0) or 0) or int(current_dict.get("referred_by_chat_id", 0) or 0)
+        merged["referrals_invited"] = max(int(merged.get("referrals_invited", 0) or 0), int(current_dict.get("referrals_invited", 0) or 0))
+        merged["receipt_email"] = str(merged.get("receipt_email", "") or "").strip() or str(current_dict.get("receipt_email", "") or "").strip()
+        merged["receipt_phone"] = str(merged.get("receipt_phone", "") or "").strip() or str(current_dict.get("receipt_phone", "") or "").strip()
+        merged["last_active_at"] = later_iso(merged.get("last_active_at", ""), current_dict.get("last_active_at", ""))
+        merged["created_at"] = min(str(merged.get("created_at", "") or "").strip() or now, str(current_dict.get("created_at", "") or "").strip() or now)
+
+        if current_rank > existing_rank:
+            for key in (
+                "plan",
+                "selected_model_alias",
+                "selected_preset",
+                "subscription_expires_at",
+                "recurring_enabled",
+                "recurring_cancel_from",
+                "recurring_canceled_at",
+            ):
+                merged[key] = current_dict.get(key, merged.get(key))
+            merged["credits_balance"] = int(current_dict.get("credits_balance", 0) or 0)
+        elif current_rank == existing_rank and existing_plan != "free":
+            merged["credits_balance"] = max(int(merged.get("credits_balance", 0) or 0), int(current_dict.get("credits_balance", 0) or 0))
+            merged["subscription_expires_at"] = later_iso(merged.get("subscription_expires_at", ""), current_dict.get("subscription_expires_at", ""))
+            merged["recurring_enabled"] = 1 if int(merged.get("recurring_enabled", 0) or 0) or int(current_dict.get("recurring_enabled", 0) or 0) else 0
+            merged["recurring_cancel_from"] = later_iso(merged.get("recurring_cancel_from", ""), current_dict.get("recurring_cancel_from", ""))
+            merged["recurring_canceled_at"] = later_iso(merged.get("recurring_canceled_at", ""), current_dict.get("recurring_canceled_at", ""))
+        else:
+            merged["credits_balance"] = min(int(merged.get("credits_balance", 0) or 0), int(current_dict.get("credits_balance", 0) or 0))
+
+        if not str(merged.get("selected_model_alias", "") or "").strip():
+            merged["selected_model_alias"] = str(current_dict.get("selected_model_alias", "") or "").strip()
+        if not str(merged.get("selected_preset", "") or "").strip():
+            merged["selected_preset"] = str(current_dict.get("selected_preset", "") or "").strip()
+
+        merged["credits_spent_total"] = max(int(merged.get("credits_spent_total", 0) or 0), int(current_dict.get("credits_spent_total", 0) or 0))
+        merged["free_image_last_used_at"] = later_iso(merged.get("free_image_last_used_at", ""), current_dict.get("free_image_last_used_at", ""))
+        merged["free_image_week_key"] = later_iso(merged.get("free_image_week_key", ""), current_dict.get("free_image_week_key", ""))
+        merged["free_image_week_used"] = max(int(merged.get("free_image_week_used", 0) or 0), int(current_dict.get("free_image_week_used", 0) or 0))
+
+        existing_usage_date = str(merged.get("usage_date", "") or "")
+        current_usage_date = str(current_dict.get("usage_date", "") or "")
+        if current_usage_date > existing_usage_date:
+            merged["usage_date"] = current_usage_date
+            for key in ("daily_messages_used", "daily_images_used", "daily_gpt54_used"):
+                merged[key] = int(current_dict.get(key, 0) or 0)
+        elif current_usage_date == existing_usage_date and current_usage_date:
+            for key in ("daily_messages_used", "daily_images_used", "daily_gpt54_used"):
+                merged[key] = max(int(merged.get(key, 0) or 0), int(current_dict.get(key, 0) or 0))
+
+        merged["updated_at"] = now
+        return merged
+
+    def ensure_user_binding(self, chat_id: int, max_user_id: int | None, default_model_alias: str) -> int | None:
+        identity = max(0, int(max_user_id or 0))
+        now = datetime.utcnow().isoformat()
+        today = self._today()
+        with self._connect() as conn:
+            current = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            if identity <= 0:
+                if current is None:
+                    self._insert_new_user(conn, chat_id, default_model_alias, now, today, 0)
+                    conn.commit()
+                return None
+
+            existing = conn.execute("SELECT * FROM users WHERE max_user_id = ? LIMIT 1", (identity,)).fetchone()
+            if current is None and existing is None:
+                self._insert_new_user(conn, chat_id, default_model_alias, now, today, identity)
+                conn.commit()
+                return None
+
+            if existing is None:
+                conn.execute(
+                    "UPDATE users SET max_user_id = ?, updated_at = ? WHERE chat_id = ?",
+                    (identity, now, chat_id),
+                )
+                conn.commit()
+                return None
+
+            existing_chat_id = int(existing["chat_id"])
+            if existing_chat_id == chat_id:
+                if int(existing["max_user_id"] or 0) != identity:
+                    conn.execute(
+                        "UPDATE users SET max_user_id = ?, updated_at = ? WHERE chat_id = ?",
+                        (identity, now, chat_id),
+                    )
+                    conn.commit()
+                return None
+
+            merged = self._merge_rebound_user_rows(existing, current, identity, now)
+            if current is not None:
+                conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+            self._update_chat_references(conn, existing_chat_id, chat_id, now)
+            conn.execute(
+                """
+                UPDATE users
+                SET max_user_id = ?, plan = ?, is_blocked = ?, onboarding_done = ?, referral_code = ?,
+                    referred_by_chat_id = ?, referrals_invited = ?, receipt_email = ?, receipt_phone = ?,
+                    selected_model_alias = ?, selected_preset = ?, subscription_expires_at = ?,
+                    recurring_enabled = ?, recurring_cancel_from = ?, recurring_canceled_at = ?,
+                    usage_date = ?, daily_messages_used = ?, daily_images_used = ?, daily_gpt54_used = ?,
+                    free_image_week_key = ?, free_image_week_used = ?, free_image_last_used_at = ?,
+                    credits_balance = ?, credits_spent_total = ?, last_active_at = ?, created_at = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (
+                    int(merged.get("max_user_id", 0) or 0),
+                    str(merged.get("plan", "free") or "free"),
+                    int(merged.get("is_blocked", 0) or 0),
+                    int(merged.get("onboarding_done", 0) or 0),
+                    str(merged.get("referral_code", "") or ""),
+                    int(merged.get("referred_by_chat_id", 0) or 0),
+                    int(merged.get("referrals_invited", 0) or 0),
+                    str(merged.get("receipt_email", "") or ""),
+                    str(merged.get("receipt_phone", "") or ""),
+                    str(merged.get("selected_model_alias", "") or ""),
+                    str(merged.get("selected_preset", "") or ""),
+                    str(merged.get("subscription_expires_at", "") or ""),
+                    int(merged.get("recurring_enabled", 0) or 0),
+                    str(merged.get("recurring_cancel_from", "") or ""),
+                    str(merged.get("recurring_canceled_at", "") or ""),
+                    str(merged.get("usage_date", "") or ""),
+                    int(merged.get("daily_messages_used", 0) or 0),
+                    int(merged.get("daily_images_used", 0) or 0),
+                    int(merged.get("daily_gpt54_used", 0) or 0),
+                    str(merged.get("free_image_week_key", "") or ""),
+                    int(merged.get("free_image_week_used", 0) or 0),
+                    str(merged.get("free_image_last_used_at", "") or ""),
+                    int(merged.get("credits_balance", 0) or 0),
+                    int(merged.get("credits_spent_total", 0) or 0),
+                    str(merged.get("last_active_at", "") or ""),
+                    str(merged.get("created_at", "") or now),
+                    now,
+                    chat_id,
+                ),
+            )
+            conn.commit()
+            return existing_chat_id
+
     def get_or_create_user(self, chat_id: int, default_model_alias: str) -> dict[str, Any]:
         now = datetime.utcnow().isoformat()
         today = self._today()
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
             if row is None:
-                referral_code = referral_code_for_chat(chat_id)
-                conn.execute(
-                    """
-                    INSERT INTO users (
-                        chat_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
-                        selected_model_alias, selected_preset, usage_date,
-                        daily_messages_used, daily_images_used, daily_gpt54_used,
-                        free_image_week_key, free_image_week_used, free_image_last_used_at,
-                        credits_balance, credits_spent_total,
-                        last_active_at,
-                        created_at, updated_at
-                    ) VALUES (?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
-                    """,
-                    (
-                        chat_id,
-                        referral_code,
-                        default_model_alias,
-                        today,
-                        FREE_DAILY_CREDITS,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
+                row = self._insert_new_user(conn, chat_id, default_model_alias, now, today, 0)
                 conn.commit()
-                row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
             row = self._expire_bonus_grants_if_needed(conn, chat_id, row, datetime.utcnow())
 
@@ -1409,6 +1606,62 @@ state = BotState()
 def clear_growth_pending_inputs(chat_id: int) -> None:
     state.pending_referral_code_input.discard(chat_id)
     state.pending_promo_code_input.discard(chat_id)
+
+
+def migrate_runtime_chat_state(old_chat_id: int, new_chat_id: int) -> None:
+    if old_chat_id == new_chat_id:
+        return
+
+    history = state.user_histories.pop(old_chat_id, None)
+    if history is not None:
+        target = state.user_histories.get(new_chat_id)
+        if target is None:
+            state.user_histories[new_chat_id] = history
+        else:
+            for item in history:
+                target.append(item)
+
+    dict_attrs = (
+        "pending_receipt_plan",
+        "image_request_prefs",
+        "last_reference_image_data_url",
+        "last_reference_image_at",
+        "last_message_at",
+        "last_image_at",
+        "last_low_credits_nudge_at",
+        "ui_message_mid",
+        "onboarding_message_mid",
+        "ui_current_page",
+        "ui_back_stack",
+        "ui_forward_stack",
+    )
+    for attr in dict_attrs:
+        mapping = getattr(state, attr)
+        if old_chat_id not in mapping:
+            continue
+        value = mapping.pop(old_chat_id)
+        if new_chat_id not in mapping:
+            mapping[new_chat_id] = value
+
+    set_attrs = (
+        "pending_image_prompt",
+        "pending_image_ref_prompt",
+        "pending_promo_code_input",
+        "pending_referral_code_input",
+    )
+    for attr in set_attrs:
+        items = getattr(state, attr)
+        if old_chat_id in items:
+            items.discard(old_chat_id)
+            items.add(new_chat_id)
+
+
+def ensure_update_user_binding(chat_id: int, update: dict[str, Any]) -> None:
+    actor_user_id = parse_actor_user_id(update)
+    rebound_from = state.user_store.ensure_user_binding(chat_id, actor_user_id, best_default_alias_for_plan("free"))
+    if rebound_from and rebound_from != chat_id:
+        log.info("Rebound MAX user_id=%s from chat_id=%s to chat_id=%s", actor_user_id, rebound_from, chat_id)
+        migrate_runtime_chat_state(rebound_from, chat_id)
 
 
 def handoff_onboarding_to_ui(chat_id: int, source_mid: str | None) -> None:
@@ -2606,6 +2859,32 @@ def parse_incoming_text(update: dict[str, Any]) -> tuple[int | None, str]:
     if not isinstance(text, str):
         return chat_id, ""
     return chat_id, text.strip()
+
+
+def _extract_nested_int(node: Any, *path: str) -> int | None:
+    current = node
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, int) else None
+
+
+def parse_actor_user_id(update: dict[str, Any]) -> int | None:
+    candidates = [
+        _extract_nested_int(update, "user", "user_id"),
+        _extract_nested_int(update, "sender", "user_id"),
+        _extract_nested_int(update, "chat", "dialog_with_user", "user_id"),
+        _extract_nested_int(update, "message", "sender", "user_id"),
+        _extract_nested_int(update, "callback", "user", "user_id"),
+        _extract_nested_int(update, "callback", "sender", "user_id"),
+        _extract_nested_int(update, "callback", "initiator", "user_id"),
+        _extract_nested_int(update, "callback", "message", "recipient", "dialog_with_user", "user_id"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, int) and candidate > 0:
+            return candidate
+    return None
 
 
 def _walk_for_image_urls(node: Any, found: list[str]) -> None:
@@ -4979,6 +5258,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     chat_id, callback_id, payload, source_mid = parse_callback_payload(update)
     if chat_id is None or not payload:
         return False
+    ensure_update_user_binding(chat_id, update)
 
     if payload.startswith("reply_action:"):
         reply_action = payload.split(":", 1)[1].strip()
@@ -6028,6 +6308,7 @@ async def process_update(update: dict[str, Any]) -> None:
     if chat_id is None:
         return
 
+    ensure_update_user_binding(chat_id, update)
     row = user_profile(chat_id)
     state.user_store.touch_last_active(chat_id)
     if row["is_blocked"]:
