@@ -1949,6 +1949,17 @@ def truncate_text(text: str, limit: int) -> str:
     return candidate.rstrip() + "…"
 
 
+def cleanup_assistant_text(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"\*\*(.+?)\*\*", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"__(.+?)__", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"(?<!\*)\*([^\n*][^*\n]*?)\*(?!\*)", r"\1", value)
+    value = re.sub(r"(?<!_)_([^\n_][^_\n]*?)_(?!_)", r"\1", value)
+    return value.strip()
+
+
 def extract_first_http_url(text: str) -> str:
     match = re.search(r"https?://[^\s]+", text or "")
     if not match:
@@ -3330,6 +3341,7 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
 
     choice = data["choices"][0]["message"]
     answer = normalize_text_content(choice.get("content")) or "Не удалось получить текстовый ответ."
+    answer = cleanup_assistant_text(answer)
     answer = truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS)
     state.history(chat_id).append({"role": "user", "content": user_text})
     state.history(chat_id).append({"role": "assistant", "content": answer})
