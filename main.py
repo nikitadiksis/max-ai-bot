@@ -2927,7 +2927,7 @@ def usage_text(row: dict[str, Any]) -> str:
             text += (
                 f"\nКартинки на free: лимит исчерпан. "
                 f"Осталось {format_remaining_time(next_at)}. "
-                f"Новая будет доступна с {format_msk_datetime(next_at)}."
+                f"Новая будет доступна с {format_msk_datetime(next_at)} (по МСК)."
             )
     if cfg.daily_gpt54_limit > 0:
         text += f"\nGPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})"
@@ -3470,7 +3470,7 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
             availability_line = (
                 f"На free лимит: 1 картинка каждые 7 дней. "
                 f"Осталось {format_remaining_time(next_at)}. "
-                f"Новая будет доступна с {format_msk_datetime(next_at)}."
+                f"Новая будет доступна с {format_msk_datetime(next_at)} (по МСК)."
             )
         else:
             availability_line = "На free доступна 1 картинка каждые 7 дней."
