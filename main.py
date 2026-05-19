@@ -1949,17 +1949,6 @@ def truncate_text(text: str, limit: int) -> str:
     return candidate.rstrip() + "…"
 
 
-def cleanup_assistant_text(text: str) -> str:
-    value = (text or "").strip()
-    if not value:
-        return ""
-    value = re.sub(r"\*\*(.+?)\*\*", r"\1", value, flags=re.DOTALL)
-    value = re.sub(r"__(.+?)__", r"\1", value, flags=re.DOTALL)
-    value = re.sub(r"(?<!\*)\*([^\n*][^*\n]*?)\*(?!\*)", r"\1", value)
-    value = re.sub(r"(?<!_)_([^\n_][^_\n]*?)_(?!_)", r"\1", value)
-    return value.strip()
-
-
 def extract_first_http_url(text: str) -> str:
     match = re.search(r"https?://[^\s]+", text or "")
     if not match:
@@ -3122,6 +3111,7 @@ async def max_send_message(
     text: str,
     attachments: list[dict[str, Any]] | None = None,
     notify: bool = True,
+    text_format: str | None = None,
 ) -> str | None:
     session = await get_session()
     chunks = split_message(text)
@@ -3135,6 +3125,8 @@ async def max_send_message(
             "text": chunk,
             "notify": notify,
         }
+        if text_format:
+            payload["format"] = text_format
         if attachments and index == 0:
             payload["attachments"] = attachments
 
@@ -3179,12 +3171,15 @@ async def max_edit_message(
     message_mid: str,
     text: str,
     attachments: list[dict[str, Any]] | None = None,
+    text_format: str | None = None,
 ) -> bool:
     session = await get_session()
     payload: dict[str, Any] = {
         "type": "text",
         "text": text,
     }
+    if text_format:
+        payload["format"] = text_format
     if attachments is not None:
         payload["attachments"] = attachments
 
@@ -3341,7 +3336,6 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
 
     choice = data["choices"][0]["message"]
     answer = normalize_text_content(choice.get("content")) or "Не удалось получить текстовый ответ."
-    answer = cleanup_assistant_text(answer)
     answer = truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS)
     state.history(chat_id).append({"role": "user", "content": user_text})
     state.history(chat_id).append({"role": "assistant", "content": answer})
@@ -6088,7 +6082,12 @@ async def process_update(update: dict[str, Any]) -> None:
                 tokens_total=int(result.total_tokens),
                 details=f"prompt={int(result.prompt_tokens)};completion={int(result.completion_tokens)}",
             )
-            await max_send_message(chat_id, result.text, attachments=build_reply_shortcuts_keyboard(chat_id))
+            await max_send_message(
+                chat_id,
+                result.text,
+                attachments=build_reply_shortcuts_keyboard(chat_id),
+                text_format="markdown",
+            )
             with suppress(Exception):
                 await maybe_send_low_credits_nudge(chat_id)
         except Exception:
