@@ -171,7 +171,9 @@ SYSTEM_PROMPT_BASE = (
     "Ты полезный AI-ассистент в мессенджере MAX. "
     "Отвечай по-русски, если пользователь не попросил иначе. "
     "Не упоминай внутренние технические детали без необходимости. "
-    "По умолчанию отвечай кратко и легко для чтения: 2-5 коротких абзацев или пунктов. "
+    "По умолчанию отвечай кратко и легко для чтения: 2-4 коротких абзаца или 3-5 коротких пунктов. "
+    "Не используй длинные нумерованные списки и тяжелое оформление без необходимости. "
+    "Старайся писать простым живым языком, без воды. "
     "Если тема большая, дай сжатый ответ и не обрывай фразу на полуслове."
 )
 
@@ -218,7 +220,9 @@ MENU_TEXT = (
 )
 
 HELP_TEXT = (
-    "Команды:\n"
+    "Справка\n\n"
+    "Основной способ пользоваться ботом — кнопки ниже.\n"
+    "Команды пригодятся, если нужно быстрое действие:\n\n"
     "/start или /menu — меню\n"
     "/id — твой chat_id\n"
     "/models — версии и описание моделей\n"
@@ -1689,18 +1693,17 @@ def support_url_value() -> str:
 def support_help_text() -> str:
     return (
         "Помощь\n\n"
-        "Если не проходит оплата или что-то работает не так:\n"
-        "1. Открой «Тарифы» и создай новую заявку.\n"
-        "2. После оплаты подожди 1-2 минуты.\n"
-        "3. Открой «Мой план» и проверь статус.\n\n"
+        "Если что-то не работает:\n"
+        "1. Открой «Тарифы» и создай новую заявку\n"
+        "2. После оплаты подожди 1-2 минуты\n"
+        "3. Открой «Мой план» или «Мои оплаты» и проверь статус\n\n"
         f"{SUPPORT_TEXT}\n"
         f"Email: {CONTACT_EMAIL}\n"
-        f"Ссылка: {support_url_value()}\n\n"
-        "FAQ: страница «Помощь»\n\n"
-        "Шаблоны для обращения в поддержку:\n"
-        "• «Оплатил, но доступ не открылся. Номер заявки: #123. Время оплаты: 14:32 МСК. Приложил скрин.»\n"
-        "• «Платеж не проходит. Номер заявки: #123. Банк пишет: <текст ошибки>.»\n"
-        "• «Прошу оформить возврат по заявке #123. Причина: <кратко>.»"
+        f"FAQ: {support_url_value()}\n\n"
+        "Что прислать в поддержку:\n"
+        "• номер заявки\n"
+        "• что произошло\n"
+        "• скрин ошибки или оплаты, если он есть"
     )
 
 
@@ -1794,13 +1797,13 @@ def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> 
         return (
             f"✅ Заявка #{request_id}: {status_human}\n"
             f"Тариф/пакет: {plan}, сумма: {amount} ₽.\n"
-            "Доступ уже активирован."
+            "Доступ уже активирован. Можно возвращаться в меню."
         )
     if status == "refunded":
         return (
             f"↩️ Заявка #{request_id}: {status_human}\n"
             f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}\n"
-            "Возврат подтвержден."
+            "Возврат подтвержден. Если деньги долго не приходят, напиши в поддержку."
         )
     if status == "canceled":
         return (
@@ -1812,12 +1815,12 @@ def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> 
         return (
             f"🕒 Заявка #{request_id}: {status_human}\n"
             f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}{pay_line}\n"
-            "Платеж уже отправлен на проверку."
+            "Платеж уже отправлен на проверку. Обычно это занимает 1-2 минуты."
         )
     return (
         f"⏳ Заявка #{request_id}: {status_human}\n"
         f"Тариф/пакет: {plan}, сумма: {amount} ₽.{bank_line}{pay_line}\n"
-        "Если уже оплатил — нажми «Я оплатил»."
+        "Открой ссылку на оплату. Если уже оплатил — нажми «Проверить статус»."
     )
 
 
@@ -2125,6 +2128,23 @@ def build_growth_input_keyboard() -> list[dict[str, Any]]:
                 "buttons": [
                     [{"type": "callback", "text": "Отмена", "payload": "growth:input_cancel"}],
                     [{"type": "callback", "text": "Меню", "payload": "action:menu"}],
+                ]
+            },
+        }
+    ]
+
+
+def build_receipt_contact_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [{"type": "callback", "text": "Отмена", "payload": "payment:input_cancel"}],
+                    [
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
                 ]
             },
         }
@@ -3686,11 +3706,10 @@ async def send_help(chat_id: int) -> None:
     help_base = HELP_TEXT
     admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
     text = (
-        f"Справка\n\n"
         f"{help_base}"
         f"{admin_part}"
     )
-    await send_managed_message(chat_id, text, attachments=build_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_MENU)
 
 
 async def send_menu(chat_id: int) -> None:
@@ -3843,14 +3862,14 @@ def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
         return "Заявок пока нет. Используй кнопку «Тарифы».", build_keyboard()
-    lines = ["Твои последние заявки:"]
+    lines = ["Мои оплаты:"]
     for item in rows:
         status = str(item["status"]).lower()
         status_human = payment_status_label(status)
         lines.append(
-            f"#{item['id']} | {item['plan']} | {item['days']} дн | {item['amount_rub']} RUB | {status_human} | {item['created_at'][:19]}"
+            f"#{item['id']} • {item['plan']} • {item['amount_rub']} ₽ • {status_human}"
         )
-    lines.append("\nНажми «Проверить #...», чтобы обновить статус по банку.")
+    lines.append("\nНажми «Проверить #...», чтобы обновить статус.")
     return "\n".join(lines), build_payments_keyboard(rows)
 
 
@@ -4183,24 +4202,23 @@ async def send_credits(chat_id: int) -> None:
     if plan_name not in PAID_PLANS:
         await send_managed_message(
             chat_id,
-            f"🆓 На free каждый день доступно {FREE_DAILY_CREDITS} кредитов. Сейчас у тебя: {int(row.get('credits_balance', 0) or 0)}.",
+            f"🆓 На free каждый день доступно {FREE_DAILY_CREDITS} кредитов.\nСейчас у тебя: {int(row.get('credits_balance', 0) or 0)}.",
             attachments=build_tariffs_keyboard_pricing(),
             page=UI_PAGE_TARIFFS,
         )
         return
     text = (
         f"🪙 Твой баланс: {int(row.get('credits_balance', 0) or 0)} кредитов.\n\n"
-        f"Обычно списывается:\n"
+        "Обычно списывается:\n"
         f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
         f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
         f"• GPT-4o Mini: ~{CREDIT_COST_GPTO + 1}\n"
         f"• Gemini 2.5 Flash: ~{CREDIT_COST_GEMINI + 1}\n"
         f"• GPT-5.4: ~{CREDIT_COST_GPT54 + 2}\n"
         f"• Картинка: {CREDIT_COST_IMAGE}\n"
-        f"• По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT}\n\n"
-        "Точное списание за текст зависит от длины и сложности ответа."
+        f"• По фото: {CREDIT_COST_IMAGE_EDIT}"
     )
-    await send_managed_message(chat_id, text, attachments=build_keyboard())
+    await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_PLAN)
 
 
 async def send_topups(chat_id: int) -> None:
@@ -4275,6 +4293,10 @@ def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
     return email, phone
 
 
+def receipt_return_page(plan: str) -> str:
+    return UI_PAGE_TOPUPS if plan.startswith("topup") else UI_PAGE_TARIFFS
+
+
 async def request_receipt_contact(
     chat_id: int,
     plan: str,
@@ -4283,19 +4305,21 @@ async def request_receipt_contact(
     source_mid: str | None = None,
 ) -> None:
     state.pending_receipt_plan[chat_id] = plan
+    target_label = "подписки" if not plan.startswith("topup") else "пакета кредитов"
     await show_managed_content(
         chat_id,
         (
-            "Перед оплатой нужен контакт для отправки чека.\n"
+            f"Перед оплатой {target_label} нужен контакт для отправки чека.\n"
             "Отправь одним сообщением email или телефон.\n\n"
             "Пример email: user@example.com\n"
             "Пример телефона: +79991234567\n\n"
-            "Чтобы отменить — отправь «отмена»."
+            "Можно нажать «Отмена» ниже."
         ),
-        attachments=build_tariffs_keyboard_pricing(),
+        attachments=build_receipt_contact_keyboard(),
         callback_id=callback_id,
         source_mid=source_mid,
         notification="Нужен контакт для чека",
+        page=UI_PAGE_SUPPORT,
     )
 
 
@@ -4329,12 +4353,15 @@ async def send_buy_consent(
         return False
 
     amount, days = plan_price_and_days(plan)
+    row = user_profile(chat_id)
+    receipt_email, receipt_phone = effective_receipt_contact(row)
+    receipt_label = receipt_email or receipt_phone or "не указан"
     text = (
         "Перед оплатой нужно согласие на автопродление.\n\n"
         f"Тариф: {plan}\n"
-        f"Сумма списания: {amount} ₽\n"
+        f"Списание: {amount} ₽\n"
         f"Периодичность: каждые {days} дней\n\n"
-        "Нажимая кнопку согласия ниже, ты подтверждаешь регулярные списания по этим условиям.\n"
+        f"Чек придет на: {receipt_label}\n\n"
         "После согласия откроется оплата.\n"
         "Отменить автопродление можно в «Мой план»."
     )
@@ -4686,23 +4713,31 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
             state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
             state.user_store.set_payment_url(request_id, payment_url)
             text = (
-                f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
-                "Оплати по ссылке Т-Банка:\n"
+                f"Заявка #{request_id} создана\n"
+                f"Тариф: {plan}\n"
+                f"Срок: {days} дней\n"
+                f"Сумма: {amount} ₽\n\n"
+                "Ссылка на оплату:\n"
                 f"{payment_url}\n\n"
-                f"Назначение платежа: {payment_purpose}\n"
                 "После успешной оплаты тариф активируется автоматически."
             )
             return request_id, text
         except Exception as exc:
             log.exception("T-Bank Init failed for request %s", request_id)
             text = (
-                f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n"
+                f"Заявка #{request_id} создана\n"
+                f"Тариф: {plan}\n"
+                f"Срок: {days} дней\n"
+                f"Сумма: {amount} ₽\n"
                 f"Автооплата сейчас недоступна ({exc}).\n\n"
                 "Используй ручную оплату ниже."
             )
             return request_id, text
     text = (
-        f"Заявка #{request_id} создана: {plan}, {days} дн, {amount} RUB.\n\n"
+        f"Заявка #{request_id} создана\n"
+        f"Тариф: {plan}\n"
+        f"Срок: {days} дней\n"
+        f"Сумма: {amount} ₽\n\n"
         "Куда оплачивать:\n"
         f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
@@ -4745,24 +4780,32 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
             state.user_store.set_payment_provider_ref(request_id, f"tbank:{payment_id}")
             state.user_store.set_payment_url(request_id, payment_url)
             text = (
-                f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n\n"
-                "Оплати по ссылке Т-Банка:\n"
+                f"Заявка #{request_id} создана\n"
+                f"Пакет: {pack['label']}\n"
+                f"Кредитов: {credits}\n"
+                f"Сумма: {amount} ₽\n\n"
+                "Ссылка на оплату:\n"
                 f"{payment_url}\n\n"
-                f"Назначение платежа: {payment_purpose}\n"
                 "После успешной оплаты кредиты зачислятся автоматически."
             )
             return request_id, text
         except Exception as exc:
             log.exception("T-Bank Init failed for topup request %s", request_id)
             text = (
-                f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n"
+                f"Заявка #{request_id} создана\n"
+                f"Пакет: {pack['label']}\n"
+                f"Кредитов: {credits}\n"
+                f"Сумма: {amount} ₽\n"
                 f"Автооплата сейчас недоступна ({exc}).\n\n"
                 "Используй ручную оплату ниже."
             )
             return request_id, text
 
     text = (
-        f"Заявка #{request_id} создана: пакет {pack['label']}, {credits} кредитов, {amount} RUB.\n\n"
+        f"Заявка #{request_id} создана\n"
+        f"Пакет: {pack['label']}\n"
+        f"Кредитов: {credits}\n"
+        f"Сумма: {amount} ₽\n\n"
         "Куда оплачивать:\n"
         f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
@@ -5159,6 +5202,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "growth:input_cancel":
         clear_growth_pending_inputs(chat_id)
         await show_ui_page(chat_id, UI_PAGE_GROWTH, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        return True
+
+    if payload == "payment:input_cancel":
+        pending_plan = state.pending_receipt_plan.pop(chat_id, "")
+        await show_ui_page(
+            chat_id,
+            receipt_return_page(pending_plan or ""),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            push_history=False,
+        )
         return True
 
     if payload == "growth:channel_bonus":
@@ -5847,23 +5901,27 @@ async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
         return False
     if lowered in {"отмена", "cancel", "/cancel"}:
         state.pending_receipt_plan.pop(chat_id, None)
-        await max_send_message(chat_id, "Покупка отменена. Можно снова выбрать тариф.", attachments=build_tariffs_keyboard_pricing())
+        await show_ui_page(chat_id, receipt_return_page(plan), push_history=False)
         return True
 
     email, phone = parse_receipt_contact(text)
     if not (email or phone):
-        await max_send_message(
+        target_label = "подписки" if not plan.startswith("topup") else "пакета кредитов"
+        await show_managed_content(
             chat_id,
-            "Не удалось распознать контакт. Отправь email (user@example.com) или телефон (+79991234567).",
-            attachments=build_tariffs_keyboard_pricing(),
+            (
+                f"Не удалось распознать контакт для {target_label}.\n"
+                "Отправь email (user@example.com) или телефон (+79991234567).\n\n"
+                "Можно нажать «Отмена» ниже."
+            ),
+            attachments=build_receipt_contact_keyboard(),
+            page=UI_PAGE_SUPPORT,
         )
         return True
 
     user_profile(chat_id)
     state.user_store.set_receipt_contact(chat_id, email=email, phone=phone)
     state.pending_receipt_plan.pop(chat_id, None)
-    label = email or phone
-    await max_send_message(chat_id, f"Контакт для чека сохранен: {label}")
     if plan.startswith("topup_consent:"):
         code = plan.split(":", 1)[1].lower().strip()
         await send_topup_consent(chat_id, code)
