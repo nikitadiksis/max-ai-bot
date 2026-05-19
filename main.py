@@ -59,7 +59,7 @@ DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "300"))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.sqlite3")))
 MAX_TEXT_INPUT_CHARS = int(os.getenv("MAX_TEXT_INPUT_CHARS", "2500"))
 MAX_IMAGE_PROMPT_CHARS = int(os.getenv("MAX_IMAGE_PROMPT_CHARS", "800"))
-MAX_ASSISTANT_OUTPUT_CHARS = int(os.getenv("MAX_ASSISTANT_OUTPUT_CHARS", "1800"))
+MAX_ASSISTANT_OUTPUT_CHARS = int(os.getenv("MAX_ASSISTANT_OUTPUT_CHARS", "1400"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "7000"))
 MESSAGE_COOLDOWN_SECONDS = int(os.getenv("MESSAGE_COOLDOWN_SECONDS", "1"))
 IMAGE_COOLDOWN_SECONDS = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "20"))
@@ -170,7 +170,9 @@ ADMIN_IDS = {
 SYSTEM_PROMPT_BASE = (
     "Ты полезный AI-ассистент в мессенджере MAX. "
     "Отвечай по-русски, если пользователь не попросил иначе. "
-    "Не упоминай внутренние технические детали без необходимости."
+    "Не упоминай внутренние технические детали без необходимости. "
+    "По умолчанию отвечай кратко и легко для чтения: 2-5 коротких абзацев или пунктов. "
+    "Если тема большая, дай сжатый ответ и не обрывай фразу на полуслове."
 )
 
 STYLE_PROMPTS = {
@@ -1396,6 +1398,7 @@ class BotState:
         self.last_low_credits_nudge_at: dict[int, datetime] = {}
         self.error_alert_last_at: dict[str, datetime] = {}
         self.ui_message_mid: dict[int, str] = {}
+        self.onboarding_message_mid: dict[int, str] = {}
         self.ui_current_page: dict[int, str] = {}
         self.ui_back_stack: dict[int, list[str]] = {}
         self.ui_forward_stack: dict[int, list[str]] = {}
@@ -1410,6 +1413,18 @@ class BotState:
 
 
 state = BotState()
+
+
+def clear_growth_pending_inputs(chat_id: int) -> None:
+    state.pending_referral_code_input.discard(chat_id)
+    state.pending_promo_code_input.discard(chat_id)
+
+
+def looks_like_bonus_code(text: str) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    return bool(re.fullmatch(r"[A-Za-zА-Яа-я0-9_-]{3,40}", value))
 
 
 def init_sentry_if_enabled() -> None:
@@ -1912,7 +1927,18 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
 def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+    candidate = text[:limit].rstrip()
+    sentence_marks = [candidate.rfind(mark) for mark in (". ", "! ", "? ", ".\n", "!\n", "?\n")]
+    split_at = max(sentence_marks)
+    if split_at >= int(limit * 0.65):
+        return candidate[: split_at + 1].rstrip()
+    split_at = candidate.rfind("\n")
+    if split_at >= int(limit * 0.65):
+        return candidate[:split_at].rstrip() + "…"
+    split_at = candidate.rfind(" ")
+    if split_at >= int(limit * 0.65):
+        return candidate[:split_at].rstrip() + "…"
+    return candidate.rstrip() + "…"
 
 
 def extract_first_http_url(text: str) -> str:
@@ -2090,6 +2116,20 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                     [
                         {"type": "callback", "text": "Меню", "payload": "action:menu"},
                     ],
+                ]
+            },
+        }
+    ]
+
+
+def build_growth_input_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [{"type": "callback", "text": "Отмена", "payload": "growth:input_cancel"}],
+                    [{"type": "callback", "text": "Меню", "payload": "action:menu"}],
                 ]
             },
         }
@@ -3960,7 +4000,9 @@ async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> 
             f"{usage_text(row)}\n\n"
             "Нажми «Готово, начать», и открою основное меню."
         )
-    await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=notify)
+    sent_mid = await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=notify)
+    if sent_mid:
+        state.onboarding_message_mid[chat_id] = sent_mid
 
 
 async def show_onboarding_step(
@@ -3995,22 +4037,28 @@ async def show_onboarding_step(
             f"{usage_text(row)}\n\n"
             "Нажми «Готово, начать», и открою основное меню."
         )
-    if source_mid:
-        ok = await max_edit_message(chat_id, source_mid, text, attachments=build_onboarding_keyboard(step))
+    target_mid = source_mid or state.onboarding_message_mid.get(chat_id)
+    if target_mid:
+        ok = await max_edit_message(chat_id, target_mid, text, attachments=build_onboarding_keyboard(step))
         if ok:
+            state.onboarding_message_mid[chat_id] = target_mid
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
-    await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=False)
+    sent_mid = await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=False)
+    if sent_mid:
+        state.onboarding_message_mid[chat_id] = sent_mid
     if callback_id:
         await answer_callback(callback_id, notification)
 
 
 async def close_onboarding_message(chat_id: int, source_mid: str | None, text: str = "Онбординг завершен.") -> None:
-    if not source_mid:
+    target_mid = source_mid or state.onboarding_message_mid.get(chat_id)
+    if not target_mid:
         return
     with suppress(Exception):
-        await max_edit_message(chat_id, source_mid, text, attachments=[])
+        await max_edit_message(chat_id, target_mid, text, attachments=[])
+    state.onboarding_message_mid.pop(chat_id, None)
 
 
 async def send_growth_menu(chat_id: int) -> None:
@@ -4881,6 +4929,9 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await close_onboarding_message(chat_id, source_mid, "Онбординг уже завершен. Используй меню ниже.")
         return True
 
+    if payload not in {"growth:ref_enter", "growth:promo_enter", "growth:input_cancel"}:
+        clear_growth_pending_inputs(chat_id)
+
     if payload == "ui_nav:back":
         target = ui_nav_back(chat_id)
         if target:
@@ -5045,7 +5096,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             "Введи реферальный код одним сообщением (пример: RFABC123). Для отмены отправь «отмена».",
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_input_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
@@ -5058,12 +5109,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             "Введи промокод одним сообщением. Для отмены отправь «отмена».",
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_input_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
             notification="Жду промокод",
         )
+        return True
+
+    if payload == "growth:input_cancel":
+        clear_growth_pending_inputs(chat_id)
+        await show_ui_page(chat_id, UI_PAGE_GROWTH, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "growth:channel_bonus":
@@ -5789,22 +5845,26 @@ async def handle_pending_referral_input(chat_id: int, text: str) -> bool:
     lowered = text.strip().lower()
     if lowered in {"отмена", "cancel", "/cancel"}:
         state.pending_referral_code_input.discard(chat_id)
-        await max_send_message(chat_id, "Ок, отменил ввод реферального кода.", attachments=build_growth_keyboard())
+        await show_ui_page(chat_id, UI_PAGE_GROWTH, push_history=False)
         return True
     if text.strip().startswith("/"):
+        state.pending_referral_code_input.discard(chat_id)
+        return False
+    if not looks_like_bonus_code(text):
         state.pending_referral_code_input.discard(chat_id)
         return False
 
     state.pending_referral_code_input.discard(chat_id)
     ok, info = state.user_store.apply_referral_code(chat_id, text, REFERRAL_BONUS_CREDITS)
     if not ok:
-        await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
         return True
     owner_chat_id = int(info)
-    await max_send_message(
+    await show_managed_content(
         chat_id,
         f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
         attachments=build_growth_keyboard(),
+        page=UI_PAGE_GROWTH,
     )
     with suppress(Exception):
         await max_send_message(
@@ -5822,9 +5882,12 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
     lowered = text.strip().lower()
     if lowered in {"отмена", "cancel", "/cancel"}:
         state.pending_promo_code_input.discard(chat_id)
-        await max_send_message(chat_id, "Ок, отменил ввод промокода.", attachments=build_growth_keyboard())
+        await show_ui_page(chat_id, UI_PAGE_GROWTH, push_history=False)
         return True
     if text.strip().startswith("/"):
+        state.pending_promo_code_input.discard(chat_id)
+        return False
+    if not looks_like_bonus_code(text):
         state.pending_promo_code_input.discard(chat_id)
         return False
     state.pending_promo_code_input.discard(chat_id)
@@ -5832,14 +5895,24 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
     code = normalize_referral_code(text)
     credits, bonus_ttl_days, reason = promo_offer_for_code(code)
     if credits <= 0:
-        await max_send_message(chat_id, reason or "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+        await show_managed_content(
+            chat_id,
+            reason or "Такого промокода нет или он выключен.",
+            attachments=build_growth_keyboard(),
+            page=UI_PAGE_GROWTH,
+        )
         return True
     ok, info = state.user_store.redeem_promo_code(chat_id, code, credits, bonus_ttl_days=bonus_ttl_days)
     if not ok:
-        await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
         return True
     ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
-    await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard())
+    await show_managed_content(
+        chat_id,
+        f"Промокод активирован: +{info} кредитов.{ttl_tail}",
+        attachments=build_growth_keyboard(),
+        page=UI_PAGE_GROWTH,
+    )
     return True
 
 
@@ -5908,6 +5981,7 @@ async def process_update(update: dict[str, Any]) -> None:
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
     if int(row.get("onboarding_done", 0) or 0) == 0 and text.strip().lower() not in {"/start"}:
         state.user_store.set_onboarding_done(chat_id, True)
+        await close_onboarding_message(chat_id, None, "Онбординг завершен.")
     try:
         if await handle_pending_referral_input(chat_id, text):
             return
