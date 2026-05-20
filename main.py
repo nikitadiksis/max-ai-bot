@@ -2571,6 +2571,20 @@ def preset_choice_enabled_for_plan(plan: str, preset: str) -> bool:
     return len(current_aliases) > len(free_aliases)
 
 
+def current_preset_for_chat(chat_id: int) -> str:
+    row = user_profile(chat_id)
+    preset = str(row.get("selected_preset", "") or "").strip().lower()
+    return preset if preset in MODEL_PRESETS else ""
+
+
+def can_pick_models_for_current_preset(chat_id: int) -> bool:
+    preset = current_preset_for_chat(chat_id)
+    if not preset:
+        return False
+    plan = str(user_profile(chat_id).get("plan", "free"))
+    return preset_choice_enabled_for_plan(plan, preset) and len(preset_available_aliases_for_plan(plan, preset)) > 1
+
+
 def preset_model_hint(alias: str) -> str:
     return {
         "deepseek": "самый быстрый и выгодный",
@@ -2759,7 +2773,10 @@ def parse_usage_tokens(data: dict[str, Any]) -> tuple[int, int, int]:
     return max(0, prompt_tokens), max(0, completion_tokens), max(0, total_tokens)
 
 
-def build_keyboard() -> list[dict[str, Any]]:
+def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
+    models_button = {"type": "callback", "text": "Модели", "payload": "action:models"}
+    if chat_id is not None and can_pick_models_for_current_preset(chat_id):
+        models_button = {"type": "callback", "text": "⚙ Модели режима", "payload": "action:preset_models"}
     return [
         {
             "type": "inline_keyboard",
@@ -2776,7 +2793,7 @@ def build_keyboard() -> list[dict[str, Any]]:
                     [
                         {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
                         {"type": "callback", "text": "Мой план", "payload": "action:plan"},
-                        {"type": "callback", "text": "Модели", "payload": "action:models"},
+                        models_button,
                     ],
                     [
                         {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
@@ -4602,7 +4619,7 @@ async def send_help(chat_id: int) -> None:
         f"{help_base}"
         f"{admin_part}"
     )
-    await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_MENU)
+    await send_managed_message(chat_id, text, attachments=build_keyboard(chat_id), page=UI_PAGE_MENU)
 
 
 async def send_menu(chat_id: int) -> None:
@@ -4623,7 +4640,7 @@ async def send_menu(chat_id: int) -> None:
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
     )
-    await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_MENU)
+    await send_managed_message(chat_id, text, attachments=build_keyboard(chat_id), page=UI_PAGE_MENU)
 
 
 UI_PAGE_MENU = "menu"
@@ -4837,9 +4854,9 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
         )
-        return text, build_keyboard()
+        return text, build_keyboard(chat_id)
     if page == UI_PAGE_MODELS:
-        return build_models_text(row["plan"], include_prices=False), build_keyboard()
+        return build_models_text(row["plan"], include_prices=False), build_keyboard(chat_id)
     if page == UI_PAGE_PLAN:
         return f"{usage_text(row)}{recurring_status_text(row)}", build_plan_keyboard(row)
     if page == UI_PAGE_TARIFFS:
@@ -4886,10 +4903,10 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         )
         return text, build_growth_keyboard()
     if page == UI_PAGE_SUPPORT:
-        return support_help_text(), build_keyboard()
+        return support_help_text(), build_keyboard(chat_id)
     if page == UI_PAGE_IMAGE_MENU:
         return build_image_menu_text(chat_id), build_image_menu_keyboard(chat_id)
-    return "Открой меню и выбери раздел.", build_keyboard()
+    return "Открой меню и выбери раздел.", build_keyboard(chat_id)
 
 
 async def show_ui_page(
@@ -6149,6 +6166,23 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_ui_page(chat_id, action_page_map[payload], callback_id=callback_id, source_mid=source_mid, push_history=True)
         return True
 
+    if payload == "action:preset_models":
+        preset = current_preset_for_chat(chat_id)
+        if not preset or not can_pick_models_for_current_preset(chat_id):
+            await show_ui_page(chat_id, UI_PAGE_MODELS, callback_id=callback_id, source_mid=source_mid, push_history=True)
+            return True
+        await show_managed_content(
+            chat_id,
+            build_preset_picker_text(chat_id, preset),
+            attachments=build_preset_picker_keyboard(str(user_profile(chat_id).get("plan", "free")), preset),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_MENU,
+            push_history=False,
+            notification="Выбери модель режима",
+        )
+        return True
+
     if payload.startswith("set_preset:"):
         preset = payload.split(":", 1)[1].strip().lower()
         preset_cfg = MODEL_PRESETS.get(preset)
@@ -6159,18 +6193,6 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         try:
             plan = str(user_profile(chat_id).get("plan", "free"))
             aliases = preset_available_aliases_for_plan(plan, preset)
-            if preset_choice_enabled_for_plan(plan, preset) and len(aliases) > 1:
-                await show_managed_content(
-                    chat_id,
-                    build_preset_picker_text(chat_id, preset),
-                    attachments=build_preset_picker_keyboard(plan, preset),
-                    callback_id=callback_id,
-                    source_mid=source_mid,
-                    page=UI_PAGE_MENU,
-                    push_history=False,
-                    notification=f"{preset_cfg['label']}",
-                )
-                return True
             alias = aliases[0]
             label = await set_user_model(chat_id, alias)
             state.user_store.set_selected_preset(chat_id, preset)
