@@ -2609,12 +2609,15 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
     if not isinstance(prefs, dict):
         prefs = {}
     mode = str(prefs.get("mode", "")).strip().lower()
+    panel = str(prefs.get("panel", "root")).strip().lower()
     style = str(prefs.get("style", DEFAULT_IMAGE_STYLE)).strip().lower()
     aspect = str(prefs.get("aspect", DEFAULT_IMAGE_ASPECT)).strip().lower()
     preset = str(prefs.get("preset", "")).strip().lower()
     edit_preset = str(prefs.get("edit_preset", "")).strip().lower()
     if mode not in {"", "generate", "edit"}:
         mode = ""
+    if panel not in {"root", "scenario", "style"}:
+        panel = "root"
     if style not in IMAGE_STYLE_OPTIONS:
         style = DEFAULT_IMAGE_STYLE
     if aspect not in IMAGE_ASPECT_OPTIONS:
@@ -2623,7 +2626,7 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
         preset = ""
     if edit_preset not in IMAGE_EDIT_PRESET_OPTIONS:
         edit_preset = ""
-    normalized = {"mode": mode, "style": style, "aspect": aspect, "preset": preset, "edit_preset": edit_preset}
+    normalized = {"mode": mode, "panel": panel, "style": style, "aspect": aspect, "preset": preset, "edit_preset": edit_preset}
     state.image_request_prefs[chat_id] = normalized
     return normalized
 
@@ -2631,10 +2634,26 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
 def set_image_mode(chat_id: int, mode: str) -> dict[str, str]:
     prefs = get_image_prefs(chat_id)
     prefs["mode"] = mode if mode in {"generate", "edit"} else ""
+    prefs["panel"] = "root"
     if prefs["mode"] != "generate":
         prefs["preset"] = ""
     if prefs["mode"] != "edit":
         prefs["edit_preset"] = ""
+    state.image_request_prefs[chat_id] = prefs
+    return prefs
+
+
+def set_image_panel(chat_id: int, panel: str) -> dict[str, str]:
+    prefs = get_image_prefs(chat_id)
+    prefs["panel"] = panel if panel in {"root", "scenario", "style"} else "root"
+    state.image_request_prefs[chat_id] = prefs
+    return prefs
+
+
+def clear_image_preset(chat_id: int) -> dict[str, str]:
+    prefs = get_image_prefs(chat_id)
+    prefs["preset"] = ""
+    prefs["edit_preset"] = ""
     state.image_request_prefs[chat_id] = prefs
     return prefs
 
@@ -2678,6 +2697,7 @@ def image_preset_summary_lines(chat_id: int) -> list[str]:
 def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
     prefs = get_image_prefs(chat_id)
     current_mode = prefs.get("mode", "")
+    current_panel = prefs.get("panel", "root")
     current_style = prefs["style"]
     current_aspect = prefs["aspect"]
     current_preset = prefs.get("preset", "")
@@ -2721,12 +2741,46 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
     if current_mode == "generate":
+        if current_panel == "scenario":
+            buttons = [
+                preset_buttons[:2],
+                preset_buttons[2:],
+                [
+                    {"type": "callback", "text": "Без сценария", "payload": "image_preset:none"},
+                ],
+                [
+                    {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                    {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                ],
+                [
+                    {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                ],
+            ]
+            return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+        if current_panel == "style":
+            buttons = [
+                style_buttons[:2],
+                style_buttons[2:],
+                aspect_buttons,
+                [
+                    {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                    {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                ],
+                [
+                    {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                ],
+            ]
+            return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
         buttons = [
-            preset_buttons[:2],
-            preset_buttons[2:],
-            style_buttons[:2],
-            style_buttons[2:],
-            aspect_buttons,
+            [
+                {"type": "callback", "text": "✨ Сценарии", "payload": "image_panel:scenario"},
+                {"type": "callback", "text": "🎛 Стиль и формат", "payload": "image_panel:style"},
+            ],
+            [
+                {"type": "callback", "text": "Без сценария", "payload": "image_preset:none"},
+            ],
             [
                 {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
             ],
@@ -2740,12 +2794,46 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         ]
         return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
+    if current_panel == "scenario":
+        buttons = [
+            edit_preset_buttons[:2],
+            edit_preset_buttons[2:],
+            [
+                {"type": "callback", "text": "Без сценария", "payload": "image_edit_preset:none"},
+            ],
+            [
+                {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            ],
+            [
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ],
+        ]
+        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+    if current_panel == "style":
+        buttons = [
+            style_buttons[:2],
+            style_buttons[2:],
+            aspect_buttons,
+            [
+                {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            ],
+            [
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ],
+        ]
+        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
     buttons = [
-        edit_preset_buttons[:2],
-        edit_preset_buttons[2:],
-        style_buttons[:2],
-        style_buttons[2:],
-        aspect_buttons,
+        [
+            {"type": "callback", "text": "✨ Сценарии", "payload": "image_panel:scenario"},
+            {"type": "callback", "text": "🎛 Стиль и формат", "payload": "image_panel:style"},
+        ],
+        [
+            {"type": "callback", "text": "Без сценария", "payload": "image_edit_preset:none"},
+        ],
         [
             {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
         ],
@@ -2801,6 +2889,7 @@ def image_availability_text(chat_id: int) -> str:
 def build_image_menu_text(chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
     mode = prefs.get("mode", "")
+    panel = prefs.get("panel", "root")
     if not mode:
         return (
             "🎨 Картинки\n\n"
@@ -2812,24 +2901,46 @@ def build_image_menu_text(chat_id: int) -> str:
             "• изменить фото"
         )
     if mode == "generate":
+        if panel == "scenario":
+            return (
+                "✨ Сценарии генерации\n\n"
+                "Выбери готовый сценарий или нажми «Без сценария».\n\n"
+                f"{image_params_summary(chat_id)}\n\n"
+                "Сценарий помогает быстрее получить нужный тип картинки."
+            )
+        if panel == "style":
+            return (
+                "🎛 Стиль и формат\n\n"
+                "Здесь можно настроить внешний вид картинки вручную.\n\n"
+                f"{image_params_summary(chat_id)}"
+            )
         return (
             "🎨 Генерация картинки\n\n"
-            "Готовые сценарии:\n"
-            "• 👤 Аватар • 🎨 Арт-портрет • 📦 Товар • 🎬 Постер\n\n"
             f"{image_params_summary(chat_id)}\n\n"
             f"{image_availability_text(chat_id)}\n"
             f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n\n"
-            "Выбери сценарий или настрой стиль и формат вручную.\n"
+            "Сначала выбери сценарии или стиль и формат.\n"
             "Потом нажми «✅ Сгенерировать»."
+        )
+    if panel == "scenario":
+        return (
+            "🖼 Сценарии для фото\n\n"
+            "Выбери готовый сценарий для редактирования фото или нажми «Без сценария».\n\n"
+            f"{image_params_summary(chat_id)}\n\n"
+            "Сценарий подсказывает модели, что именно ты хочешь изменить."
+        )
+    if panel == "style":
+        return (
+            "🎛 Стиль и формат фото\n\n"
+            "Здесь можно вручную выбрать стиль результата и формат кадра.\n\n"
+            f"{image_params_summary(chat_id)}"
         )
     return (
         "🖼 Редактирование фото\n\n"
-        "Готовые сценарии:\n"
-        "• 🌸 Аниме по фото • 🫧 Сменить фон • ✨ Улучшить фото • 🖼 Арт по фото\n\n"
         f"{image_params_summary(chat_id)}\n\n"
         f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
         f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}.\n\n"
-        "Выбери сценарий или настрой стиль и формат вручную.\n"
+        "Сначала выбери сценарии или стиль и формат.\n"
         "Потом нажми «🖼 Редактировать фото» и пришли фото."
     )
 
@@ -6110,6 +6221,21 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Выбор режима")
         return True
 
+    if payload == "image_panel:root":
+        set_image_panel(chat_id, "root")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Назад")
+        return True
+
+    if payload == "image_panel:scenario":
+        set_image_panel(chat_id, "scenario")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарии")
+        return True
+
+    if payload == "image_panel:style":
+        set_image_panel(chat_id, "style")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Стиль и формат")
+        return True
+
     if payload.startswith("image_style:"):
         style = payload.split(":", 1)[1].strip().lower()
         if style not in IMAGE_STYLE_OPTIONS:
@@ -6140,6 +6266,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload.startswith("image_preset:"):
         preset_key = payload.split(":", 1)[1].strip().lower()
+        if preset_key == "none":
+            clear_image_preset(chat_id)
+            await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Без сценария")
+            return True
         if preset_key not in IMAGE_PRESET_OPTIONS:
             if callback_id:
                 await answer_callback(callback_id, "Неизвестный сценарий")
@@ -6150,6 +6280,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload.startswith("image_edit_preset:"):
         preset_key = payload.split(":", 1)[1].strip().lower()
+        if preset_key == "none":
+            clear_image_preset(chat_id)
+            await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Без сценария")
+            return True
         if preset_key not in IMAGE_EDIT_PRESET_OPTIONS:
             if callback_id:
                 await answer_callback(callback_id, "Неизвестный сценарий")
