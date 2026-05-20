@@ -112,6 +112,10 @@ LOW_CREDITS_NUDGE_THRESHOLD_FREE = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_FR
 LOW_CREDITS_NUDGE_THRESHOLD_PAID = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_PAID", "120"))
 LOW_CREDITS_NUDGE_COOLDOWN_HOURS = int(os.getenv("LOW_CREDITS_NUDGE_COOLDOWN_HOURS", "18"))
 ANALYTICS_USD_TO_RUB = float(os.getenv("ANALYTICS_USD_TO_RUB", "95"))
+ANALYTICS_PAYMENT_FEE_PCT = float(os.getenv("ANALYTICS_PAYMENT_FEE_PCT", "2.5"))
+ANALYTICS_RECEIPT_FEE_PCT = float(os.getenv("ANALYTICS_RECEIPT_FEE_PCT", "1.5"))
+ANALYTICS_TAX_PCT = float(os.getenv("ANALYTICS_TAX_PCT", "6.0"))
+ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB = float(os.getenv("ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB", "0.03"))
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -516,6 +520,25 @@ def estimate_text_cost_usd(model: ModelInfo | None, prompt_tokens: int, completi
         prompt = int(total * 0.65)
         completion = max(0, total - prompt)
     return (prompt / 1_000_000.0) * input_price + (completion / 1_000_000.0) * output_price
+
+
+def expected_unit_economics(price_rub: int, credits: int) -> dict[str, float]:
+    revenue = float(max(0, int(price_rub or 0)))
+    expected_cost = float(max(0, int(credits or 0))) * ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB
+    payment_fee = revenue * (ANALYTICS_PAYMENT_FEE_PCT / 100.0)
+    receipt_fee = revenue * (ANALYTICS_RECEIPT_FEE_PCT / 100.0)
+    tax = revenue * (ANALYTICS_TAX_PCT / 100.0)
+    margin = revenue - expected_cost - payment_fee - receipt_fee - tax
+    margin_pct = (margin * 100.0 / revenue) if revenue > 0 else 0.0
+    return {
+        "revenue_rub": revenue,
+        "expected_cost_rub": expected_cost,
+        "payment_fee_rub": payment_fee,
+        "receipt_fee_rub": receipt_fee,
+        "tax_rub": tax,
+        "margin_rub": margin,
+        "margin_pct": margin_pct,
+    }
 
 
 def configure_logging() -> logging.Logger:
@@ -7488,6 +7511,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
 
     economics_plan_rows = []
+    unit_margin_rows = []
     for plan in ("lite", "start", "pro"):
         amount, period_days = plan_price_and_days(plan)
         credits = credits_for_plan(plan)
@@ -7509,6 +7533,20 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
             f"<td>{esc(models_text)}</td>"
             "</tr>"
         )
+        econ = expected_unit_economics(amount, credits)
+        unit_margin_rows.append(
+            "<tr>"
+            f"<td>{esc(plan)}</td>"
+            f"<td>{money(amount)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
+            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['tax_rub'])} ₽</td>"
+            f"<td>{money(econ['margin_rub'])} ₽</td>"
+            f"<td>{econ['margin_pct']:.1f}%</td>"
+            "</tr>"
+        )
 
     economics_pack_rows = []
     for code in ("small", "medium", "large"):
@@ -7521,6 +7559,20 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
             f"<td>{money(price_rub)} ₽</td>"
             f"<td>{money(credits)}</td>"
             f"<td>{credits_per_rub(credits, price_rub)}</td>"
+            "</tr>"
+        )
+        econ = expected_unit_economics(price_rub, credits)
+        unit_margin_rows.append(
+            "<tr>"
+            f"<td>{esc(str(pack['label']))}</td>"
+            f"<td>{money(price_rub)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
+            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['tax_rub'])} ₽</td>"
+            f"<td>{money(econ['margin_rub'])} ₽</td>"
+            f"<td>{econ['margin_pct']:.1f}%</td>"
             "</tr>"
         )
 
@@ -7683,8 +7735,17 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
           <h3>Расчётные допущения</h3>
           <p>Курс для аналитики: {money(ANALYTICS_USD_TO_RUB)} ₽ за $1.</p>
           <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
-          <p>Если захочешь скорректировать курс, просто обнови <code>ANALYTICS_USD_TO_RUB</code> в server <code>.env</code>.</p>
+          <p>Для бумажной экономики используем: эквайринг {ANALYTICS_PAYMENT_FEE_PCT:.2f}%, Т-Чеки {ANALYTICS_RECEIPT_FEE_PCT:.2f}%, налог {ANALYTICS_TAX_PCT:.2f}%, ожидаемая себестоимость 1 кредита {ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB:.3f} ₽.</p>
+          <p>Если захочешь скорректировать допущения, обнови <code>ANALYTICS_USD_TO_RUB</code>, <code>ANALYTICS_PAYMENT_FEE_PCT</code>, <code>ANALYTICS_RECEIPT_FEE_PCT</code>, <code>ANALYTICS_TAX_PCT</code> и <code>ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB</code> в server <code>.env</code>.</p>
         </div>
+      </div>
+      <div class="card table-card">
+        <h3>Ожидаемая юнит-экономика</h3>
+        <p>Это уже "бумажная прибыль": цена минус ожидаемая себестоимость кредитов, эквайринг, Т-Чеки и налог. Нужна, чтобы понимать, остаётся ли прибыль вообще до масштабирования.</p>
+        <table>
+          <tr><th>Продукт</th><th>Цена</th><th>Кредитов</th><th>Себестоимость</th><th>Эквайринг</th><th>Т-Чеки</th><th>Налог</th><th>Маржа</th><th>Маржа %</th></tr>
+          {''.join(unit_margin_rows)}
+        </table>
       </div>
       <div class="card table-card">
         <h3>Оценка маржи по тарифам</h3>
