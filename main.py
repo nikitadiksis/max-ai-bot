@@ -3232,53 +3232,6 @@ def build_tariffs_text() -> str:
     )
 
 
-def format_kpi_report(report: dict[str, Any]) -> str:
-    days = int(report.get("days", 30) or 30)
-    active_users = int(report.get("active_users", 0) or 0)
-    payers = int(report.get("payers", 0) or 0)
-    revenue_rub = int(report.get("revenue_rub", 0) or 0)
-    refunds_rub = int(report.get("refunds_rub", 0) or 0)
-    net_rub = revenue_rub + refunds_rub
-    text_requests = int(report.get("text_requests", 0) or 0)
-    image_requests = int(report.get("image_requests", 0) or 0)
-    text_credits = int(report.get("text_credits", 0) or 0)
-    image_credits = int(report.get("image_credits", 0) or 0)
-    total_credits_spent = int(report.get("total_credits_spent", 0) or 0)
-    text_tokens = int(report.get("text_tokens", 0) or 0)
-
-    arpu_active = (net_rub / active_users) if active_users > 0 else 0.0
-    arppu = (net_rub / payers) if payers > 0 else 0.0
-    pay_share = (payers * 100.0 / active_users) if active_users > 0 else 0.0
-    avg_tokens = (text_tokens / text_requests) if text_requests > 0 else 0.0
-
-    lines = [
-        f"📊 KPI за {days} дней",
-        f"• Активные пользователи: {active_users}",
-        f"• Плательщики: {payers} ({pay_share:.1f}%)",
-        f"• Выручка: {revenue_rub} ₽",
-        f"• Возвраты: {refunds_rub} ₽",
-        f"• Чистая выручка: {net_rub} ₽",
-        f"• ARPU (по активным): {arpu_active:.1f} ₽",
-        f"• ARPPU (по плательщикам): {arppu:.1f} ₽",
-        "",
-        f"🧠 Текст: {text_requests} запросов, {text_credits} кредитов, ср. токены/запрос: {avg_tokens:.0f}",
-        f"🎨 Картинки: {image_requests} запросов, {image_credits} кредитов",
-        f"🪙 Всего списано кредитов: {total_credits_spent}",
-    ]
-
-    models = report.get("models") or []
-    if isinstance(models, list) and models:
-        lines.append("")
-        lines.append("Топ моделей по текстовым запросам:")
-        for item in models[:5]:
-            alias = str(item.get("model_alias", "") or "-")
-            cnt = int(item.get("cnt", 0) or 0)
-            credits = int(item.get("credits", 0) or 0)
-            lines.append(f"• {alias}: {cnt} запросов, {credits} кредитов")
-
-    return "\n".join(lines)
-
-
 def recurring_terms_for_plan(plan: str) -> str:
     amount, days = plan_price_and_days(plan)
     return (
@@ -4739,6 +4692,186 @@ async def send_payments(chat_id: int) -> None:
     await send_managed_message(chat_id, "\n".join(lines), attachments=build_payments_keyboard(rows), page=UI_PAGE_PAYMENTS)
 
 
+def payment_item_human_name(plan: str) -> str:
+    if is_topup_plan(plan):
+        code = topup_code_from_plan(plan)
+        pack = topup_spec(code)
+        return f"Пакет {pack['label']}" if pack else "Пакет кредитов"
+    return f"Тариф {plan.capitalize()}"
+
+
+def payment_return_target(plan: str) -> tuple[str, str]:
+    if is_topup_plan(plan):
+        return "action:topups", "К пакетам"
+    return "action:tariffs", "К тарифам"
+
+
+def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> list[dict[str, Any]]:
+    payment = state.user_store.get_payment(request_id) or {}
+    plan = str(payment.get("plan", "") or "")
+    return_payload, return_label = payment_return_target(plan)
+    buttons: list[list[dict[str, Any]]] = []
+    if payment_url:
+        buttons.append([{"type": "link", "text": "Оплатить", "url": payment_url}])
+    buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
+    buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
+    buttons.append(
+        [
+            {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
+            {"type": "callback", "text": return_label, "payload": return_payload},
+        ]
+    )
+    buttons.append(
+        [
+            {"type": "callback", "text": "Мой план", "payload": "action:plan"},
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ]
+    )
+    buttons.append([{"type": "callback", "text": "Меню", "payload": "action:menu"}])
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
+def build_payments_keyboard(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buttons: list[list[dict[str, Any]]] = []
+    for item in rows[:5]:
+        request_id = int(item.get("id", 0) or 0)
+        if request_id <= 0:
+            continue
+        status = str(item.get("status", "")).lower()
+        buttons.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"Открыть #{request_id}" if status in PAYMENT_FINAL_STATUSES else f"Проверить #{request_id}",
+                    "payload": f"payment_status:{request_id}",
+                }
+            ]
+        )
+    buttons.append(
+        [
+            {"type": "callback", "text": "Мой план", "payload": "action:plan"},
+            {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
+        ]
+    )
+    buttons.append(
+        [
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ]
+    )
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
+def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
+    rows = state.user_store.list_user_payments(chat_id, limit=8)
+    if not rows:
+        return "Моих оплат пока нет.\nОткрой «Тарифы» или «Пакеты кредитов», чтобы создать первую заявку.", build_keyboard()
+    lines = ["💳 Мои оплаты"]
+    for item in rows:
+        status = str(item.get("status", "")).lower()
+        status_human = payment_status_label(status)
+        item_name = payment_item_human_name(str(item.get("plan", "") or ""))
+        amount = int(item.get("amount_rub", 0) or 0)
+        created_at = parse_iso_datetime(str(item.get("created_at", "") or ""))
+        created_text = format_msk_datetime(created_at) if created_at else "-"
+        lines.append(f"• #{item['id']} — {item_name} • {amount} ₽ • {status_human} • {created_text}")
+    lines.append("\nНажми на заявку ниже, чтобы открыть её статус, оплату или вернуться к покупке.")
+    return "\n".join(lines), build_payments_keyboard(rows)
+
+
+def usage_text(row: dict[str, Any]) -> str:
+    plan_name = str(row.get("plan", "free"))
+    cfg = PLAN_CONFIGS.get(plan_name, PLAN_CONFIGS["free"])
+    gpt54_used = int(row.get("daily_gpt54_used", 0) or 0)
+    gpt54_left = max(0, cfg.daily_gpt54_limit - gpt54_used)
+    expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "") or ""))
+    balance = int(row.get("credits_balance", 0) or 0)
+    bonus_total, bonus_expires = state.user_store.active_bonus_credits_summary(int(row.get("chat_id", 0) or 0))
+
+    lines = [f"План: {plan_name}", f"Кредиты: {balance}"]
+    if plan_name != "free":
+        lines.insert(1, f"Доступ до: {format_msk_datetime(expires_at)}")
+    if bonus_total > 0 and bonus_expires:
+        bonus_dt = parse_iso_datetime(bonus_expires)
+        lines.append(f"🎁 Бонус: {bonus_total} кредитов до {format_msk_datetime(bonus_dt)}")
+    if plan_name == "free":
+        lines.append(f"Free-бонус в день: {FREE_DAILY_CREDITS} кредитов")
+        next_at = free_image_next_available_at(row)
+        if free_image_is_available(row):
+            lines.append("Картинка на Free: доступна сейчас")
+        else:
+            lines.append(f"Картинка на Free: через {format_remaining_time(next_at)}")
+            lines.append(f"Точное время: {format_msk_datetime(next_at)}")
+    if cfg.daily_gpt54_limit > 0:
+        lines.append(f"GPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})")
+    return "\n".join(lines)
+
+
+def recurring_status_text(row: dict[str, Any]) -> str:
+    plan_name = str(row.get("plan", "free"))
+    if plan_name == "free":
+        return ""
+    expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "") or ""))
+    expires_text = format_msk_datetime(expires_at)
+    if recurring_enabled_for_row(row):
+        return (
+            "\n\nАвтопродление: включено.\n"
+            f"Следующее списание не раньше {expires_text}.\n"
+            "Отключить можно кнопкой «Отменить подписку»."
+        )
+    canceled_at_raw = str(row.get("recurring_canceled_at", ""))
+    if not canceled_at_raw:
+        return "\n\nАвтопродление: не подключено."
+    cancel_from = parse_iso_datetime(str(row.get("recurring_cancel_from", "") or ""))
+    cancel_text = format_msk_datetime(cancel_from) if cancel_from else expires_text
+    return (
+        "\n\nАвтопродление: отключено.\n"
+        f"Доступ сохранится до {expires_text}.\n"
+        f"Повторных списаний не будет с {cancel_text}."
+    )
+
+
+def payment_user_status_text(payment: dict[str, Any], bank_status: str = "") -> str:
+    request_id = int(payment.get("id", 0) or 0)
+    status = str(payment.get("status", "pending")).lower()
+    status_human = payment_status_label(status)
+    plan = str(payment.get("plan", "") or "")
+    amount = int(payment.get("amount_rub", 0) or 0)
+    payment_url = str(payment.get("payment_url", "") or "").strip()
+    item_name = payment_item_human_name(plan)
+    bank_line = f"\nСтатус банка: {bank_status}" if bank_status else ""
+    pay_line = f"\nСсылка на оплату: {payment_url}" if payment_url and status in {"pending", "claimed"} else ""
+    if status == "paid":
+        return (
+            f"✅ Заявка #{request_id}: {status_human}\n"
+            f"{item_name} • {amount} ₽\n"
+            "Доступ уже активирован. Проверь «Мой план»."
+        )
+    if status == "refunded":
+        return (
+            f"↩️ Заявка #{request_id}: {status_human}\n"
+            f"{item_name} • {amount} ₽{bank_line}\n"
+            "Возврат подтвержден. Если деньги долго не приходят, напиши в поддержку."
+        )
+    if status == "canceled":
+        return (
+            f"❌ Заявка #{request_id}: {status_human}\n"
+            f"{item_name} • {amount} ₽{bank_line}\n"
+            "Оплата не завершена. Можно вернуться к покупке и создать новую заявку."
+        )
+    if status == "claimed":
+        return (
+            f"🕒 Заявка #{request_id}: {status_human}\n"
+            f"{item_name} • {amount} ₽{bank_line}{pay_line}\n"
+            "Платеж уже ушел на проверку. Обычно подтверждение занимает 1–2 минуты."
+        )
+    return (
+        f"⏳ Заявка #{request_id}: {status_human}\n"
+        f"{item_name} • {amount} ₽{bank_line}{pay_line}\n"
+        "Открой оплату по кнопке ниже. После оплаты нажми «Проверить статус»."
+    )
+
+
 def effective_receipt_contact(row: dict[str, Any]) -> tuple[str, str]:
     email = str(row.get("receipt_email", "")).strip()
     phone = str(row.get("receipt_phone", "")).strip()
@@ -5066,7 +5199,7 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
     with suppress(Exception):
         await max_send_message(
             target,
-            f"Оплата подтверждена автоматически ({source}). Тариф {plan} активирован до {expires_at[:16]} UTC.",
+            f"Оплата подтверждена автоматически ({source}). Тариф {plan} активирован до {format_msk_datetime(parse_iso_datetime(expires_at))}.",
             attachments=build_keyboard(),
         )
     return True, expires_at
@@ -5166,11 +5299,11 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
             state.user_store.set_payment_url(request_id, payment_url)
             text = (
                 f"Заявка #{request_id} создана\n"
-                f"Тариф: {plan}\n"
+                f"{payment_item_human_name(plan)}\n"
                 f"Срок: {days} дней\n"
-                f"Сумма: {amount} ₽\n\n"
-                "Ссылка на оплату:\n"
-                f"{payment_url}\n\n"
+                f"Сумма: {amount} ₽\n"
+                f"Чек: {receipt_email or receipt_phone}\n\n"
+                "Открой оплату по кнопке ниже.\n"
                 "После успешной оплаты тариф активируется автоматически."
             )
             return request_id, text
@@ -5178,8 +5311,7 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
             log.exception("T-Bank Init failed for request %s", request_id)
             text = (
                 f"Заявка #{request_id} создана\n"
-                f"Тариф: {plan}\n"
-                f"Срок: {days} дней\n"
+                f"{payment_item_human_name(plan)}\n"
                 f"Сумма: {amount} ₽\n"
                 f"Автооплата сейчас недоступна ({exc}).\n\n"
                 "Используй ручную оплату ниже."
@@ -5187,9 +5319,10 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
             return request_id, text
     text = (
         f"Заявка #{request_id} создана\n"
-        f"Тариф: {plan}\n"
+        f"{payment_item_human_name(plan)}\n"
         f"Срок: {days} дней\n"
-        f"Сумма: {amount} ₽\n\n"
+        f"Сумма: {amount} ₽\n"
+        f"Чек: {receipt_email or receipt_phone}\n\n"
         "Куда оплачивать:\n"
         f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
@@ -5233,11 +5366,11 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
             state.user_store.set_payment_url(request_id, payment_url)
             text = (
                 f"Заявка #{request_id} создана\n"
-                f"Пакет: {pack['label']}\n"
+                f"{payment_item_human_name(topup_plan_code(code))}\n"
                 f"Кредитов: {credits}\n"
-                f"Сумма: {amount} ₽\n\n"
-                "Ссылка на оплату:\n"
-                f"{payment_url}\n\n"
+                f"Сумма: {amount} ₽\n"
+                f"Чек: {receipt_email or receipt_phone}\n\n"
+                "Открой оплату по кнопке ниже.\n"
                 "После успешной оплаты кредиты зачислятся автоматически."
             )
             return request_id, text
@@ -5245,8 +5378,7 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
             log.exception("T-Bank Init failed for topup request %s", request_id)
             text = (
                 f"Заявка #{request_id} создана\n"
-                f"Пакет: {pack['label']}\n"
-                f"Кредитов: {credits}\n"
+                f"{payment_item_human_name(topup_plan_code(code))}\n"
                 f"Сумма: {amount} ₽\n"
                 f"Автооплата сейчас недоступна ({exc}).\n\n"
                 "Используй ручную оплату ниже."
@@ -5255,9 +5387,10 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
 
     text = (
         f"Заявка #{request_id} создана\n"
-        f"Пакет: {pack['label']}\n"
+        f"{payment_item_human_name(topup_plan_code(code))}\n"
         f"Кредитов: {credits}\n"
-        f"Сумма: {amount} ₽\n\n"
+        f"Сумма: {amount} ₽\n"
+        f"Чек: {receipt_email or receipt_phone}\n\n"
         "Куда оплачивать:\n"
         f"{PAYMENT_DETAILS_TEXT}\n\nНазначение платежа: {payment_purpose}\nchat_id указывать не нужно.\n\n"
         "После оплаты нажми кнопку «Я оплатил»."
@@ -5405,16 +5538,6 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             limit = max(1, int(parts[3]))
         sent, total = await send_reengage_nudges(days=days, limit=limit)
         await max_send_message(chat_id, f"Реактивация: отправлено {sent}/{total} (dormant_days={days}, limit={limit})")
-        return True
-
-    if action == "__legacy_panel_removed__":
-        if not admin_panel_enabled():
-            await max_send_message(chat_id, "ADMIN_PANEL_TOKEN не задан. Панель выключена.")
-            return True
-        if not PUBLIC_BASE_URL:
-            await max_send_message(chat_id, "PUBLIC_BASE_URL не задан, ссылку на панель сформировать нельзя.")
-            return True
-        await max_send_message(chat_id, f"Панель: {PUBLIC_BASE_URL}/admin/panel?token={ADMIN_PANEL_TOKEN}")
         return True
 
     await max_send_message(chat_id, "Неизвестная админ-команда. Используй /admin help")
@@ -5878,20 +6001,29 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if row.get("plan") == "free" or not recurring_enabled_for_row(row):
             if callback_id:
                 await answer_callback(callback_id, "Нечего отменять")
-            await max_send_message(chat_id, "Автопродление уже отключено или подписка не активна.", attachments=build_plan_keyboard(row), notify=False)
+            await show_managed_content(
+                chat_id,
+                "Автопродление уже отключено или подписка не активна.",
+                attachments=build_plan_keyboard(row),
+                callback_id=callback_id,
+                source_mid=source_mid,
+                page=UI_PAGE_PLAN,
+                notification="Нечего отменять",
+            )
             return True
 
         expires_at = parse_iso_datetime(str(row.get("subscription_expires_at", "")))
-        expires_text = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "конца текущего периода"
-        if callback_id:
-            await answer_callback(callback_id, "Подтверди отмену")
-        await max_send_message(
+        expires_text = format_msk_datetime(expires_at) if expires_at else "конца текущего периода"
+        await show_managed_content(
             chat_id,
             "Подтвердить отмену автопродления?\n\n"
             f"Подписка будет работать до {expires_text}.\n"
             f"Отмена автосписаний вступит в силу с {expires_text}.",
             attachments=build_cancel_subscription_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_PLAN,
+            notification="Подтверди отмену",
         )
         return True
 
@@ -5908,14 +6040,15 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         state.user_store.cancel_recurring(chat_id, cancel_from)
         row = user_profile(chat_id)
         cancel_dt = parse_iso_datetime(cancel_from)
-        cancel_text = cancel_dt.strftime("%Y-%m-%d %H:%M UTC") if cancel_dt else cancel_from
-        if callback_id:
-            await answer_callback(callback_id, "Отменено")
-        await max_send_message(
+        cancel_text = format_msk_datetime(cancel_dt) if cancel_dt else cancel_from
+        await show_managed_content(
             chat_id,
             f"Автопродление отключено.\nПодписка действует до конца оплаченного периода.\nОтмена с {cancel_text}.",
             attachments=build_plan_keyboard(row),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_PLAN,
+            notification="Отменено",
         )
         return True
 
@@ -5936,10 +6069,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
+        payment_url = str((state.user_store.get_payment(request_id) or {}).get("payment_url", "") or "")
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю оплату",
@@ -6011,10 +6145,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
+        payment_url = str((state.user_store.get_payment(request_id) or {}).get("payment_url", "") or "")
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю быструю покупку",
@@ -6027,10 +6162,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if request_id is None:
             await max_send_message(chat_id, msg, attachments=build_topups_keyboard(), notify=False)
             return True
+        payment_url = str((state.user_store.get_payment(request_id) or {}).get("payment_url", "") or "")
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=extract_first_http_url(msg)),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю оплату",
@@ -6062,10 +6198,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 log.exception("T-Bank GetState failed from status button for request_id=%s", request_id)
 
         refreshed_status = str((payment or {}).get("status", "pending")).lower()
+        payment_url = str((payment or {}).get("payment_url", "") or "")
         await show_managed_content(
             chat_id,
             payment_user_status_text(payment or {}, bank_status=bank_status),
-            attachments=build_payment_request_keyboard(request_id) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
             notification=payment_status_label(refreshed_status),
