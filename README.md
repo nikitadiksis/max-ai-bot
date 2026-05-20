@@ -113,6 +113,7 @@ REFERRAL_BONUS_CREDITS=120
 PROMO_WELCOME_CREDITS=0
 PROMO_CODES=
 ADMIN_PANEL_TOKEN=change_me_strong_token
+ADMIN_MAX_USER_IDS=
 PROCESSED_UPDATE_TTL_HOURS=72
 BACKUP_KEEP_FILES=12
 AUTO_BACKUP_ENABLED=1
@@ -151,7 +152,7 @@ REFERENCE_IMAGE_TTL_MINUTES=180
 - `/image_ref <prompt>`
 - `/clear`
 
-Admin (`ADMIN_IDS` only):
+Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
 - `/admin help`
 - `/admin user <chat_id>`
 - `/admin plan <chat_id> <free|lite|start|pro>`

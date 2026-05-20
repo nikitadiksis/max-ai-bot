@@ -178,6 +178,11 @@ ADMIN_IDS = {
     for value in os.getenv("ADMIN_IDS", "").split(",")
     if value.strip().isdigit()
 }
+ADMIN_MAX_USER_IDS = {
+    int(value.strip())
+    for value in os.getenv("ADMIN_MAX_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 
 SYSTEM_PROMPT_BASE = (
     "Ты полезный AI-ассистент в мессенджере MAX. "
@@ -294,7 +299,7 @@ HELP_TEXT = (
     "Основной способ пользоваться ботом — кнопки ниже.\n"
     "Команды пригодятся, если нужно быстрое действие:\n\n"
     "/start или /menu — меню\n"
-    "/id — твой chat_id\n"
+    "/id — твой chat_id и user_id\n"
     "/models — версии и описание моделей\n"
     "/plan — твой тариф и остатки\n"
     "/preset <fast|balanced|quality|expert> — выбрать режим\n"
@@ -326,7 +331,7 @@ ADMIN_HELP_TEXT = (
     "/admin backup\n"
     "/admin nudge [days] [limit]\n"
     "/costs — модели и цены\n"
-    "/id — твой chat_id"
+    "/id — твой chat_id и user_id"
 )
 
 TARIFFS_TEXT = (
@@ -1295,6 +1300,14 @@ class UserStore:
             row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
             return dict(row) if row else None
 
+    def get_user_by_max_user_id(self, max_user_id: int) -> dict[str, Any] | None:
+        identity = max(0, int(max_user_id or 0))
+        if identity <= 0:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE max_user_id = ? LIMIT 1", (identity,)).fetchone()
+            return dict(row) if row else None
+
     def list_recent_payments(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1987,14 +2000,14 @@ def capture_exception_safe(exc: Exception) -> None:
 
 
 async def notify_admin_alert(key: str, text: str) -> None:
-    if not ERROR_ALERTS_ENABLED or not ADMIN_IDS:
+    if not ERROR_ALERTS_ENABLED:
         return
     now = datetime.utcnow()
     last = state.error_alert_last_at.get(key)
     if last and (now - last).total_seconds() < max(10, ERROR_ALERT_COOLDOWN_SEC):
         return
     state.error_alert_last_at[key] = now
-    for admin_id in ADMIN_IDS:
+    for admin_id in admin_target_chat_ids():
         with suppress(Exception):
             await max_send_message(admin_id, f"⚠️ ALERT [{key}]\n{text}", notify=False)
 
@@ -2424,7 +2437,23 @@ def text_model_allowed_for_plan(plan: str, model_alias: str) -> bool:
 
 
 def is_admin(chat_id: int) -> bool:
-    return chat_id in ADMIN_IDS
+    if chat_id in ADMIN_IDS:
+        return True
+    row = state.user_store.get_user(chat_id)
+    max_user_id = int((row or {}).get("max_user_id", 0) or 0)
+    return max_user_id > 0 and max_user_id in ADMIN_MAX_USER_IDS
+
+
+def admin_target_chat_ids() -> set[int]:
+    targets = {int(value) for value in ADMIN_IDS if int(value) > 0}
+    for max_user_id in ADMIN_MAX_USER_IDS:
+        row = state.user_store.get_user_by_max_user_id(max_user_id)
+        if not row:
+            continue
+        chat_id = int(row.get("chat_id", 0) or 0)
+        if chat_id > 0:
+            targets.add(chat_id)
+    return targets
 
 
 def best_default_alias_for_plan(plan: str) -> str:
@@ -5433,7 +5462,8 @@ async def create_buy_request(chat_id: int, plan: str) -> str:
 
 
 async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, Any]) -> None:
-    if not ADMIN_IDS:
+    targets = admin_target_chat_ids()
+    if not targets:
         return
     target = int(payment["chat_id"])
     plan = str(payment["plan"])
@@ -5451,7 +5481,7 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
         f"Проверка: /admin pay {request_id} paid\n"
         f"Отмена: /admin pay {request_id} cancel"
     )
-    for admin_id in ADMIN_IDS:
+    for admin_id in targets:
         with suppress(Exception):
             await max_send_message(admin_id, text)
 
@@ -5868,7 +5898,7 @@ async def set_user_model(chat_id: int, alias: str) -> str:
 
 
 async def handle_admin(chat_id: int, text: str) -> bool:
-    if chat_id not in ADMIN_IDS:
+    if not is_admin(chat_id):
         return False
 
     parts = text.strip().split()
@@ -6876,7 +6906,14 @@ async def handle_command(chat_id: int, text: str) -> bool:
         return True
 
     if command == "/id":
-        await max_send_message(chat_id, f"Твой chat_id: {chat_id}")
+        row = user_profile(chat_id)
+        max_user_id = int(row.get("max_user_id", 0) or 0)
+        text = f"Твой chat_id: {chat_id}"
+        if max_user_id > 0:
+            text += f"\nТвой max_user_id: {max_user_id}"
+        else:
+            text += "\nТвой max_user_id пока не определён."
+        await max_send_message(chat_id, text)
         return True
 
     if command == "/tariffs":
