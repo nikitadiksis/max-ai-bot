@@ -5995,8 +5995,15 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, "Используй: /admin plan <chat_id> <free|lite|start|pro>")
             return True
         user_profile(target)
-        state.user_store.set_plan(target, new_plan)
         selected = best_default_alias_for_plan(new_plan)
+        if new_plan in PAID_PLANS:
+            expires_at = state.user_store.set_subscription(target, new_plan, 30, selected, recurring_enabled=False)
+            await max_send_message(
+                chat_id,
+                f"Подписка пользователя {target} -> {new_plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}.",
+            )
+            return True
+        state.user_store.set_plan(target, new_plan)
         state.user_store.set_selected_model(target, selected)
         state.user_store.set_credits(target, credits_for_plan(new_plan))
         await max_send_message(
@@ -8009,11 +8016,21 @@ async def admin_panel_action(
             message = f"Реактивация: отправлено {sent}/{total}"
         elif action == "set_plan" and chat_id is not None and plan in PLAN_CONFIGS:
             user_profile(chat_id)
-            state.user_store.set_plan(chat_id, plan)
-            state.user_store.set_selected_model(chat_id, best_default_alias_for_plan(plan))
+            selected = best_default_alias_for_plan(plan)
             if plan in PAID_PLANS:
+                expires_at = state.user_store.set_subscription(
+                    chat_id,
+                    plan,
+                    30,
+                    selected,
+                    recurring_enabled=False,
+                )
+                message = f"Подписка пользователя {chat_id} -> {plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}"
+            else:
+                state.user_store.set_plan(chat_id, plan)
+                state.user_store.set_selected_model(chat_id, selected)
                 state.user_store.set_credits(chat_id, credits_for_plan(plan))
-            message = f"План пользователя {chat_id} -> {plan}"
+                message = f"План пользователя {chat_id} -> {plan}"
         elif action == "set_sub" and chat_id is not None and plan in PAID_PLANS:
             user_profile(chat_id)
             expires_at = state.user_store.set_subscription(
@@ -8276,10 +8293,7 @@ def render_admin_panel_html_v2(
         action_block = (
             "<h3>Ручная корректировка</h3>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='free'))}'>План free</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='lite'))}'>План lite</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='start'))}'>План start</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='pro'))}'>План pro</a>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='free'))}'>Вернуть на free</a>"
             "</p>"
             "<p>"
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='lite'))}'>Lite на 30 дней</a> | "
