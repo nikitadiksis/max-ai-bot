@@ -7422,6 +7422,11 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     def money(value: int | float) -> str:
         return f"{int(round(value)):,}".replace(",", " ")
 
+    def credits_per_rub(credits: int, price_rub: int) -> str:
+        if price_rub <= 0:
+            return "0.00"
+        return f"{credits / float(price_rub):.2f}"
+
     active_users = int(report.get("active_users", 0) or 0)
     payers = int(report.get("payers", 0) or 0)
     revenue_rub = int(report.get("revenue_rub", 0) or 0)
@@ -7439,6 +7444,43 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     text_tokens = int(report.get("text_tokens", 0) or 0)
     avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
     estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
+
+    economics_plan_rows = []
+    for plan in ("lite", "start", "pro"):
+        amount, period_days = plan_price_and_days(plan)
+        credits = credits_for_plan(plan)
+        ratio = credits_per_rub(credits, amount)
+        daily_credits = credits / max(1, period_days)
+        models_text = {
+            "lite": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash",
+            "start": f"DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4 в «Эксперт» до {PLAN_CONFIGS['start'].daily_gpt54_limit}/день",
+            "pro": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4",
+        }[plan]
+        economics_plan_rows.append(
+            "<tr>"
+            f"<td>{esc(plan)}</td>"
+            f"<td>{money(amount)} ₽</td>"
+            f"<td>{period_days}</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{daily_credits:.0f}</td>"
+            f"<td>{ratio}</td>"
+            f"<td>{esc(models_text)}</td>"
+            "</tr>"
+        )
+
+    economics_pack_rows = []
+    for code in ("small", "medium", "large"):
+        pack = TOPUP_PACKS[code]
+        credits = int(pack["credits"])
+        price_rub = int(pack["price_rub"])
+        economics_pack_rows.append(
+            "<tr>"
+            f"<td>{esc(str(pack['label']))}</td>"
+            f"<td>{money(price_rub)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{credits_per_rub(credits, price_rub)}</td>"
+            "</tr>"
+        )
 
     period_links = " ".join(
         f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
@@ -7546,10 +7588,45 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         {''.join(plan_rows)}
       </table>
     </div>
+    <div class="card table-card">
+      <h2>Экономика проекта</h2>
+      <p>Закрытая шпаргалка по текущей сетке. Здесь удобно держать опорные цифры: цены, кредиты, модели и курс для оценки себестоимости.</p>
+      <div class="grid">
+        <div class="card table-card">
+          <h3>Подписки</h3>
+          <table>
+            <tr><th>Тариф</th><th>Цена</th><th>Дней</th><th>Кредитов</th><th>В день</th><th>Кр/₽</th><th>Модели</th></tr>
+            {''.join(economics_plan_rows)}
+          </table>
+        </div>
+        <div class="card table-card">
+          <h3>Пакеты кредитов</h3>
+          <table>
+            <tr><th>Пакет</th><th>Цена</th><th>Кредитов</th><th>Кр/₽</th></tr>
+            {''.join(economics_pack_rows)}
+          </table>
+          <p>Подписки должны быть выгоднее пакетов по курсу кредитов. Сейчас ориентир соблюдается относительно Small/Medium/Large.</p>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card table-card">
+          <h3>Free и лимиты</h3>
+          <p>Free: {FREE_DAILY_CREDITS} кредитов в день и 1 картинка каждые 7 дней.</p>
+          <p>Картинка: {image_credit_cost()} кредитов. Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.</p>
+          <p>Макс. переменная доплата за текст: {MAX_VARIABLE_CREDITS_PER_TEXT} кредита.</p>
+        </div>
+        <div class="card table-card">
+          <h3>Расчётные допущения</h3>
+          <p>Курс для аналитики: {money(ANALYTICS_USD_TO_RUB)} ₽ за $1.</p>
+          <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
+          <p>Если захочешь скорректировать курс, просто обнови <code>ANALYTICS_USD_TO_RUB</code> в server <code>.env</code>.</p>
+        </div>
+      </div>
+    </div>
     <div class="grid">
       <div class="card table-card">
         <h2>Расход по моделям</h2>
-        <p>Текстовая себестоимость считается по prompt/completion токенам и текущим ценам из реестра моделей. Для картинок токен-стоимость не считаем, поэтому там может быть 0 ₽.</p>
+        <p>Текстовая себестоимость считается по prompt/completion токенам и текущим ценам из реестра моделей. Для картинок токен-стоимость здесь не считаем, поэтому в таблице стоит «—».</p>
         <table>
           <tr><th>Модель</th><th>Тип</th><th>Запросов</th><th>Токенов</th><th>Ср./запрос</th><th>Кредитов</th><th>Себестоимость</th></tr>
           {''.join(models_rows)}
