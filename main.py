@@ -6262,9 +6262,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if prefs.get("preset", "") in IMAGE_PRESET_OPTIONS:
             chosen = IMAGE_PRESET_OPTIONS[prefs["preset"]]
             preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
-        if callback_id:
-            await answer_callback(callback_id, "Жду описание")
-        await max_send_message(
+        await show_managed_content(
             chat_id,
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{preset_hint}"
@@ -6272,7 +6270,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n"
             "Чтобы отменить — нажми «Отмена» или отправь /cancel",
             attachments=build_image_prompt_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_IMAGE_MENU,
+            notification="Жду описание",
         )
         return True
 
@@ -6294,9 +6295,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if prefs.get("edit_preset", "") in IMAGE_EDIT_PRESET_OPTIONS:
             chosen = IMAGE_EDIT_PRESET_OPTIONS[prefs["edit_preset"]]
             preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
-        if callback_id:
-            await answer_callback(callback_id, "Жду фото")
-        await max_send_message(
+        await show_managed_content(
             chat_id,
             (
                 "Пришли фото и коротко опиши, что сделать.\n"
@@ -6305,7 +6304,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 "Если фото уже отправлено — просто напиши описание (например: «нарисуй её в стиле аниме»)."
             ),
             attachments=build_image_prompt_keyboard(),
-            notify=False,
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_IMAGE_MENU,
+            notification="Жду фото",
         )
         return True
 
