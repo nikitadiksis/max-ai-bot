@@ -57,6 +57,7 @@ DEFAULT_IMAGE_MODEL_ALIAS = os.getenv("DEFAULT_IMAGE_MODEL", "image").strip().lo
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MAX_MESSAGE_LEN = int(os.getenv("MAX_MESSAGE_LEN", str(DEFAULT_MAX_MESSAGE_LEN)))
 DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "300"))
+PROCESSED_UPDATE_TTL_HOURS = int(os.getenv("PROCESSED_UPDATE_TTL_HOURS", "72"))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.sqlite3")))
 MAX_TEXT_INPUT_CHARS = int(os.getenv("MAX_TEXT_INPUT_CHARS", "2500"))
 MAX_IMAGE_PROMPT_CHARS = int(os.getenv("MAX_IMAGE_PROMPT_CHARS", "800"))
@@ -163,6 +164,8 @@ ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
 ADMIN_SESSION_COOKIE = "aimax_admin_session"
 ADMIN_SESSION_MAX_AGE = 60 * 60 * 24 * 14
 BACKUP_KEEP_FILES = int(os.getenv("BACKUP_KEEP_FILES", "12"))
+AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+AUTO_BACKUP_INTERVAL_HOURS = int(os.getenv("AUTO_BACKUP_INTERVAL_HOURS", "24"))
 ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("ERROR_ALERT_COOLDOWN_SEC", "120"))
 ERROR_ALERTS_ENABLED = os.getenv("ERROR_ALERTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 REENGAGE_DORMANT_DAYS = int(os.getenv("REENGAGE_DORMANT_DAYS", "5"))
@@ -771,6 +774,14 @@ class UserStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_updates (
+                    fingerprint TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "max_user_id", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
@@ -804,6 +815,9 @@ class UserStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_promo_bonus_grants_expiry ON promo_bonus_grants(chat_id, expires_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_processed_updates_created_at ON processed_updates(created_at)"
             )
             conn.commit()
 
@@ -1637,6 +1651,29 @@ class UserStore:
             )
             conn.commit()
 
+    def remember_processed_update(self, fingerprint: str) -> bool:
+        if not fingerprint:
+            return False
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM processed_updates WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+            if row:
+                return False
+            conn.execute(
+                "INSERT INTO processed_updates (fingerprint, created_at) VALUES (?, ?)",
+                (fingerprint, now),
+            )
+            cutoff = (datetime.utcnow() - timedelta(hours=max(1, PROCESSED_UPDATE_TTL_HOURS))).isoformat()
+            conn.execute(
+                "DELETE FROM processed_updates WHERE created_at < ?",
+                (cutoff,),
+            )
+            conn.commit()
+        return True
+
     def kpi_report(self, days: int = 30) -> dict[str, Any]:
         period_days = max(1, min(int(days), 365))
         since = (datetime.utcnow() - timedelta(days=period_days)).isoformat()
@@ -1834,6 +1871,7 @@ class BotState:
         self.ui_forward_stack: dict[int, list[str]] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
+        self.backup_task: asyncio.Task[None] | None = None
         self.user_store = UserStore(DB_PATH)
 
     def history(self, chat_id: int) -> deque[dict[str, str]]:
@@ -3388,6 +3426,8 @@ def build_update_fingerprint(update: dict[str, Any]) -> str:
 def remember_update(update: dict[str, Any]) -> bool:
     fingerprint = build_update_fingerprint(update)
     if fingerprint in state.processed_lookup:
+        return False
+    if not state.user_store.remember_processed_update(fingerprint):
         return False
     state.processed_updates.append(fingerprint)
     state.processed_lookup.add(fingerprint)
@@ -7360,6 +7400,22 @@ async def polling_loop() -> None:
             await asyncio.sleep(3)
 
 
+async def backup_loop() -> None:
+    interval_seconds = max(3600, AUTO_BACKUP_INTERVAL_HOURS * 3600)
+    log.info("Backup loop started, interval=%ss", interval_seconds)
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            backup_file = create_db_backup()
+            log.info("Automatic DB backup created: %s", backup_file)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Automatic backup failed")
+            capture_exception_safe(exc)
+            await notify_admin_alert("db_backup", f"Automatic DB backup failed: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     require_env()
@@ -7368,6 +7424,8 @@ async def lifespan(_: FastAPI):
     await get_session()
     if RUN_MODE == "polling":
         state.polling_task = asyncio.create_task(polling_loop())
+    if AUTO_BACKUP_ENABLED:
+        state.backup_task = asyncio.create_task(backup_loop())
     try:
         yield
     finally:
@@ -7375,6 +7433,10 @@ async def lifespan(_: FastAPI):
             state.polling_task.cancel()
             with suppress(asyncio.CancelledError):
                 await state.polling_task
+        if state.backup_task:
+            state.backup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.backup_task
         if state.session and not state.session.closed:
             await state.session.close()
 
