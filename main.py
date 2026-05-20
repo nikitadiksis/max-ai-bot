@@ -78,6 +78,7 @@ FREE_DAILY_IMAGES_LIMIT = int(os.getenv("FREE_DAILY_IMAGES_LIMIT", "0"))
 LITE_DAILY_IMAGES_LIMIT = int(os.getenv("LITE_DAILY_IMAGES_LIMIT", "1"))
 START_DAILY_IMAGES_LIMIT = int(os.getenv("START_DAILY_IMAGES_LIMIT", "3"))
 PRO_DAILY_IMAGES_LIMIT = int(os.getenv("PRO_DAILY_IMAGES_LIMIT", "8"))
+START_DAILY_GPT54_LIMIT = int(os.getenv("START_DAILY_GPT54_LIMIT", "3"))
 PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "0"))
 FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "40"))
 MAX_COMPLETION_TOKENS_FREE = int(os.getenv("MAX_COMPLETION_TOKENS_FREE", "500"))
@@ -365,7 +366,7 @@ PLAN_CONFIGS = {
         name="start",
         daily_messages_limit=START_DAILY_MESSAGES_LIMIT,
         daily_images_limit=START_DAILY_IMAGES_LIMIT,
-        daily_gpt54_limit=0,
+        daily_gpt54_limit=START_DAILY_GPT54_LIMIT,
     ),
     "pro": PlanInfo(
         name="pro",
@@ -2220,6 +2221,17 @@ def plan_allowed(plan: str, min_plan: str) -> bool:
     return PLAN_ORDER[plan] >= PLAN_ORDER[min_plan]
 
 
+def text_model_allowed_for_plan(plan: str, model_alias: str) -> bool:
+    info = TEXT_MODELS.get(model_alias)
+    if not info:
+        return False
+    if plan_allowed(plan, info.min_plan):
+        return True
+    if model_alias == "gpt54" and plan == "start" and PLAN_CONFIGS["start"].daily_gpt54_limit > 0:
+        return True
+    return False
+
+
 def is_admin(chat_id: int) -> bool:
     return chat_id in ADMIN_IDS
 
@@ -2227,11 +2239,10 @@ def is_admin(chat_id: int) -> bool:
 def best_default_alias_for_plan(plan: str) -> str:
     preferred = ["gpt4o", DEFAULT_TEXT_MODEL.alias, "gpt", "deepseek"]
     for alias in preferred:
-        info = TEXT_MODELS.get(alias)
-        if info and plan_allowed(plan, info.min_plan):
+        if text_model_allowed_for_plan(plan, alias):
             return alias
-    for alias, info in TEXT_MODELS.items():
-        if plan_allowed(plan, info.min_plan):
+    for alias in TEXT_MODELS:
+        if text_model_allowed_for_plan(plan, alias):
             return alias
     return DEFAULT_TEXT_MODEL.alias
 
@@ -2241,8 +2252,7 @@ def resolve_preset_alias_for_plan(plan: str, preset: str) -> str:
     if not preset_cfg:
         return best_default_alias_for_plan(plan)
     for alias in preset_cfg.get("aliases", []):
-        info = TEXT_MODELS.get(alias)
-        if info and plan_allowed(plan, info.min_plan):
+        if text_model_allowed_for_plan(plan, alias):
             return alias
     return best_default_alias_for_plan(plan)
 
@@ -2261,7 +2271,7 @@ def preset_available_aliases_for_plan(plan: str, preset: str) -> list[str]:
         if not alias or alias in seen:
             continue
         info = TEXT_MODELS.get(alias)
-        if not info or not plan_allowed(plan, info.min_plan):
+        if not info or not text_model_allowed_for_plan(plan, alias):
             continue
         seen.add(alias)
         aliases.append(alias)
@@ -3197,8 +3207,12 @@ def model_line(model: ModelInfo, include_prices: bool) -> str:
 
 def build_models_text(user_plan: str, include_prices: bool = False) -> str:
     lines = [f"Текстовые модели (твой план: {user_plan}):"]
-    for model in TEXT_MODELS.values():
-        prefix = "✅" if plan_allowed(user_plan, model.min_plan) else f"нужно {plan_access_human(model.min_plan)}"
+    start_gpt54_limit = PLAN_CONFIGS["start"].daily_gpt54_limit
+    for alias, model in TEXT_MODELS.items():
+        if alias == "gpt54" and user_plan == "start" and start_gpt54_limit > 0:
+            prefix = f"✅ до {start_gpt54_limit}/день"
+        else:
+            prefix = "✅" if text_model_allowed_for_plan(user_plan, alias) else f"нужно {plan_access_human(model.min_plan)}"
         lines.append(f"\n[{prefix}]\n{model_line(model, include_prices)}")
     image_model = DEFAULT_IMAGE_MODEL
     if user_plan == "free":
@@ -3489,7 +3503,9 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
 
 
 def build_tariffs_text() -> str:
+    start_cfg = PLAN_CONFIGS["start"]
     pro_cfg = PLAN_CONFIGS["pro"]
+    start_gpt54_line = f" + GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день" if start_cfg.daily_gpt54_limit > 0 else ""
     pro_gpt54_line = f" (GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день)" if pro_cfg.daily_gpt54_limit > 0 else ""
     free_nano_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_GPT))
     free_ds_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_DEEPSEEK))
@@ -3497,7 +3513,7 @@ def build_tariffs_text() -> str:
         "💠 Тарифы:\n"
         f"• 🆓 free: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов) + 1 картинка / 7 дней\n"
         f"• 🍬 lite: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash\n"
-        f"• 👌 start: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash\n"
+        f"• 👌 start: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash{start_gpt54_line}\n"
         f"• 🚀 pro: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4{pro_gpt54_line}\n\n"
         "🪙 Обычно списывается:\n"
         f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
@@ -3513,7 +3529,8 @@ def build_tariffs_text() -> str:
         "Отменить автопродление можно в разделе «Мой план».\n\n"
         "Модели по тарифам:\n"
         "• free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
-        "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
+        f"• lite: + GPT-4o Mini и Gemini 2.5 Flash\n"
+        f"• start: + GPT-4o Mini, Gemini 2.5 Flash и GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день\n"
         "• pro: + GPT-5.4"
     )
 
@@ -3675,7 +3692,7 @@ def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
     info = TEXT_MODELS.get(model_alias)
     if not info:
         return False, "Неизвестная модель. Используй /models"
-    if not plan_allowed(plan, info.min_plan):
+    if not text_model_allowed_for_plan(plan, model_alias):
         return False, f"Модель {info.label} доступна с тарифа {info.min_plan}."
     return True, ""
 
