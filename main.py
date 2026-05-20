@@ -1288,6 +1288,42 @@ class UserStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def search_users(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+        needle = str(query or "").strip()
+        if not needle:
+            return self.list_recent_users(limit=limit)
+        like_value = f"%{needle.lower()}%"
+        with self._connect() as conn:
+            if needle.isdigit():
+                rows = conn.execute(
+                    """
+                    SELECT chat_id, max_user_id, plan, credits_balance,
+                           recurring_enabled, subscription_expires_at,
+                           daily_messages_used, daily_images_used, last_active_at, updated_at
+                    FROM users
+                    WHERE chat_id = ? OR max_user_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (int(needle), int(needle), limit),
+                ).fetchall()
+                if rows:
+                    return [dict(row) for row in rows]
+            rows = conn.execute(
+                """
+                SELECT chat_id, max_user_id, plan, credits_balance,
+                       recurring_enabled, subscription_expires_at,
+                       daily_messages_used, daily_images_used, last_active_at, updated_at
+                FROM users
+                WHERE lower(plan) LIKE ?
+                   OR lower(referral_code) LIKE ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (like_value, like_value, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def suspicious_users_report(self, limit: int = 25) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1369,6 +1405,36 @@ class UserStore:
                 LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def search_payments(self, query: str = "", status: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        needle = str(query or "").strip()
+        status_filter = str(status or "").strip().lower()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if needle:
+            if needle.isdigit():
+                conditions.append("(id = ? OR chat_id = ?)")
+                params.extend([int(needle), int(needle)])
+            else:
+                like_value = f"%{needle.lower()}%"
+                conditions.append("lower(plan) LIKE ?")
+                params.append(like_value)
+        if status_filter:
+            conditions.append("lower(status) = ?")
+            params.append(status_filter)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, chat_id, plan, amount_rub, status, provider_ref, created_at, paid_at, activated_at
+                FROM payment_requests
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1749,6 +1815,8 @@ class UserStore:
                     COUNT(DISTINCT chat_id) AS active_users,
                     SUM(CASE WHEN event_type = 'payment' THEN rub_amount ELSE 0 END) AS revenue_rub,
                     SUM(CASE WHEN event_type = 'refund' THEN rub_amount ELSE 0 END) AS refunds_rub,
+                    SUM(CASE WHEN event_type = 'payment' AND rub_amount > 0 THEN 1 ELSE 0 END) AS payments_count,
+                    SUM(CASE WHEN event_type = 'refund' THEN 1 ELSE 0 END) AS refunds_count,
                     SUM(CASE WHEN event_type = 'text_request' THEN 1 ELSE 0 END) AS text_requests,
                     SUM(CASE WHEN event_type = 'image_request' THEN 1 ELSE 0 END) AS image_requests,
                     SUM(CASE WHEN event_type = 'text_request' THEN credits_spent ELSE 0 END) AS text_credits,
@@ -1895,6 +1963,8 @@ class UserStore:
                 "active_users": int((summary["active_users"] or 0) if summary else 0),
                 "revenue_rub": int((summary["revenue_rub"] or 0) if summary else 0),
                 "refunds_rub": int((summary["refunds_rub"] or 0) if summary else 0),
+                "payments_count": int((summary["payments_count"] or 0) if summary else 0),
+                "refunds_count": int((summary["refunds_count"] or 0) if summary else 0),
                 "text_requests": int((summary["text_requests"] or 0) if summary else 0),
                 "image_requests": int((summary["image_requests"] or 0) if summary else 0),
                 "text_credits": int((summary["text_credits"] or 0) if summary else 0),
@@ -5256,28 +5326,56 @@ def payment_return_target(plan: str) -> tuple[str, str]:
     return "action:tariffs", "К тарифам"
 
 
-def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> list[dict[str, Any]]:
+def build_payment_request_keyboard(request_id: int, payment_url: str = "", status: str = "pending") -> list[dict[str, Any]]:
     payment = state.user_store.get_payment(request_id) or {}
     plan = str(payment.get("plan", "") or "")
     return_payload, return_label = payment_return_target(plan)
     buttons: list[list[dict[str, Any]]] = []
-    if payment_url:
+    status_lc = str(status or "").lower()
+    if payment_url and status_lc in {"pending", "claimed"}:
         buttons.append([{"type": "link", "text": "Оплатить", "url": payment_url}])
-    buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
-    buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
-    buttons.append(
-        [
-            {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
-            {"type": "callback", "text": return_label, "payload": return_payload},
-        ]
-    )
-    buttons.append(
-        [
-            {"type": "callback", "text": "Мой план", "payload": "action:plan"},
-            {"type": "callback", "text": "Помощь", "payload": "action:support"},
-        ]
-    )
-    buttons.append([{"type": "callback", "text": "Меню", "payload": "action:menu"}])
+    if status_lc in {"pending", "claimed"}:
+        buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
+        buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
+        buttons.append(
+            [
+                {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
+                {"type": "callback", "text": return_label, "payload": return_payload},
+            ]
+        )
+        buttons.append(
+            [
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            ]
+        )
+    elif status_lc == "paid":
+        primary_payload, primary_label = ("action:topups", "Пакеты кредитов") if is_topup_plan(plan) else ("action:plan", "Мой план")
+        buttons.append(
+            [
+                {"type": "callback", "text": primary_label, "payload": primary_payload},
+                {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
+            ]
+        )
+        buttons.append(
+            [
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ]
+        )
+    else:
+        buttons.append(
+            [
+                {"type": "callback", "text": return_label, "payload": return_payload},
+                {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
+            ]
+        )
+        buttons.append(
+            [
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ]
+        )
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -6708,7 +6806,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url, status="pending"),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю оплату",
@@ -6784,7 +6882,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url, status="pending"),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю быструю покупку",
@@ -6801,7 +6899,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             msg,
-            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url, status="pending"),
             callback_id=callback_id,
             source_mid=source_mid,
             notification="Открываю оплату",
@@ -6837,7 +6935,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             payment_user_status_text(payment or {}, bank_status=bank_status),
-            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url) if refreshed_status in {"pending", "claimed"} else build_keyboard(),
+            attachments=build_payment_request_keyboard(request_id, payment_url=payment_url, status=refreshed_status),
             callback_id=callback_id,
             source_mid=source_mid,
             notification=payment_status_label(refreshed_status),
@@ -7667,10 +7765,14 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     revenue_rub = int(report.get("revenue_rub", 0) or 0)
     refunds_raw = int(report.get("refunds_rub", 0) or 0)
     refunds_abs = abs(refunds_raw)
+    payments_count = int(report.get("payments_count", 0) or 0)
+    refunds_count = int(report.get("refunds_count", 0) or 0)
     net_rub = revenue_rub + refunds_raw if refunds_raw < 0 else revenue_rub - refunds_abs
     pay_share = (payers * 100.0 / active_users) if active_users else 0.0
     arpu = (net_rub / active_users) if active_users else 0.0
     arppu = (net_rub / payers) if payers else 0.0
+    avg_check = (revenue_rub / payments_count) if payments_count else 0.0
+    refund_rate_pct = (refunds_count * 100.0 / payments_count) if payments_count else 0.0
     text_requests = int(report.get("text_requests", 0) or 0)
     image_requests = int(report.get("image_requests", 0) or 0)
     text_credits = int(report.get("text_credits", 0) or 0)
@@ -7681,6 +7783,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
     estimated_text_contribution_rub = net_rub - estimated_text_cost_rub
     estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
+    text_cost_share_pct = (estimated_text_cost_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
 
     economics_plan_rows = []
     unit_margin_rows = []
@@ -7861,10 +7964,11 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">Плательщики</div><div class="metric-value">{payers}</div><div class="metric-note">{pay_share:.1f}% от активных</div></div>
         <div class="metric"><div class="metric-label">Активные пользователи</div><div class="metric-value">{active_users}</div><div class="metric-note">За выбранный период</div></div>
         <div class="metric"><div class="metric-label">ARPU / ARPPU</div><div class="metric-value">{money(arpu)} / {money(arppu)} ₽</div><div class="metric-note">На активного и на платящего</div></div>
+        <div class="metric"><div class="metric-label">Средний чек</div><div class="metric-value">{money(avg_check)} ₽</div><div class="metric-note">{payments_count} оплат, refund rate {refund_rate_pct:.1f}%</div></div>
         <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
         <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Израсходовано {image_credits} кредитов</div></div>
         <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
-        <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">Оценка по токенам и прайсам моделей</div></div>
+        <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">Оценка по токенам и прайсам моделей, {text_cost_share_pct:.1f}% от чистой выручки</div></div>
         <div class="metric"><div class="metric-label">Маржа после текста</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, без учёта image-cost</div></div>
         <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
       </div>
@@ -7982,11 +8086,26 @@ async def analytics_logout() -> RedirectResponse:
 
 
 @app.get("/admin/panel", response_class=HTMLResponse)
-async def admin_panel(request: Request, token: str = "", chat_id: int | None = None, request_id: int | None = None) -> HTMLResponse:
+async def admin_panel(
+    request: Request,
+    token: str = "",
+    chat_id: int | None = None,
+    request_id: int | None = None,
+    q: str = "",
+    payment_status: str = "",
+) -> HTMLResponse:
     auth_token = resolve_admin_token(request, token)
     if not auth_token:
         raise HTTPException(status_code=403, detail="forbidden")
-    response = HTMLResponse(render_admin_panel_html_v2(token="", chat_id=chat_id, request_id=request_id))
+    response = HTMLResponse(
+        render_admin_panel_html_v2(
+            token="",
+            chat_id=chat_id,
+            request_id=request_id,
+            q=q,
+            payment_status=payment_status,
+        )
+    )
     set_admin_cookie(response, auth_token)
     return response
 
@@ -8223,9 +8342,13 @@ def render_admin_panel_html_v2(
     chat_id: int | None = None,
     request_id: int | None = None,
     message: str = "",
+    q: str = "",
+    payment_status: str = "",
 ) -> str:
-    users = state.user_store.list_recent_users(limit=25)
-    payments = state.user_store.list_recent_payments(limit=25)
+    query = str(q or "").strip()
+    status_filter = str(payment_status or "").strip().lower()
+    users = state.user_store.search_users(query, limit=50) if query else state.user_store.list_recent_users(limit=25)
+    payments = state.user_store.search_payments(query=query, status=status_filter, limit=50) if (query or status_filter) else state.user_store.list_recent_payments(limit=25)
     suspicious_users = state.user_store.suspicious_users_report(limit=20)
     selected_user = state.user_store.get_user(chat_id) if chat_id else None
     selected_payment = state.user_store.get_payment(request_id) if request_id else None
@@ -8286,6 +8409,26 @@ def render_admin_panel_html_v2(
     if not suspicious_rows:
         suspicious_rows.append("<tr><td colspan='7'>Явных подозрительных кейсов пока нет.</td></tr>")
 
+    users_count = len(users)
+    payments_count = len(payments)
+    suspicious_count = len(suspicious_users)
+    search_form = (
+        "<form class='actions' method='get' action='/admin/panel'>"
+        f"<input type='hidden' name='token' value='{esc(token)}'/>"
+        f"<input class='input' type='text' name='q' value='{esc(query)}' placeholder='chat_id / user_id / тариф / заявка'/>"
+        "<select class='input' name='payment_status'>"
+        f"<option value='' {'selected' if not status_filter else ''}>Все статусы платежей</option>"
+        f"<option value='pending' {'selected' if status_filter == 'pending' else ''}>Ожидает оплату</option>"
+        f"<option value='claimed' {'selected' if status_filter == 'claimed' else ''}>Проверка оплаты</option>"
+        f"<option value='paid' {'selected' if status_filter == 'paid' else ''}>Оплачено</option>"
+        f"<option value='canceled' {'selected' if status_filter == 'canceled' else ''}>Отменено</option>"
+        f"<option value='refunded' {'selected' if status_filter == 'refunded' else ''}>Возврат</option>"
+        "</select>"
+        "<button class='btn btn-primary' type='submit'>Искать</button>"
+        f"<a class='btn' href='{esc(admin_url('/admin/panel', token))}'>Сбросить</a>"
+        "</form>"
+    )
+
     action_block = ""
     if selected_user:
         cid = int(selected_user["chat_id"])
@@ -8337,6 +8480,10 @@ def render_admin_panel_html_v2(
     th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fbfdff; border:1px solid #e1e8f5; border-radius:12px; padding:12px; }}
     .notice {{ padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#f8fbff; }}
+    .mini-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:10px; margin:14px 0; }}
+    .mini-metric {{ border:1px solid var(--line); border-radius:12px; padding:12px; background:#fcfdff; }}
+    .mini-metric strong {{ display:block; font-size:22px; margin-top:4px; }}
+    .input {{ min-height:42px; border:1px solid var(--line); border-radius:12px; padding:0 12px; background:#fff; color:var(--text); }}
   </style>
 </head>
 <body>
@@ -8352,6 +8499,12 @@ def render_admin_panel_html_v2(
         <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='backup'))}">Создать бэкап БД</a>
         <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='nudge'))}">Реактивировать free</a>
         <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
+      </div>
+      {search_form}
+      <div class="mini-grid">
+        <div class="mini-metric">Пользователи в выдаче<strong>{users_count}</strong></div>
+        <div class="mini-metric">Платежи в выдаче<strong>{payments_count}</strong></div>
+        <div class="mini-metric">Подозрительные кейсы<strong>{suspicious_count}</strong></div>
       </div>
       {info_block}
       {action_block}
