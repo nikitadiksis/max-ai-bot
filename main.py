@@ -202,6 +202,66 @@ IMAGE_ASPECT_OPTIONS: dict[str, tuple[str, str]] = {
     "portrait": ("9:16", "vertical composition"),
     "landscape": ("16:9", "horizontal composition"),
 }
+IMAGE_PRESET_OPTIONS: dict[str, dict[str, str]] = {
+    "avatar": {
+        "label": "👤 Аватар",
+        "style": "photo",
+        "aspect": "square",
+        "hint": "аватар, портрет, лицо крупно",
+        "prompt": "avatar portrait, subject centered, clean background, expressive face",
+    },
+    "art_portrait": {
+        "label": "🎨 Арт-портрет",
+        "style": "art",
+        "aspect": "square",
+        "hint": "арт-портрет, яркий стиль, атмосферно",
+        "prompt": "stylized art portrait, cinematic mood, detailed illustration",
+    },
+    "product": {
+        "label": "📦 Товар",
+        "style": "photo",
+        "aspect": "square",
+        "hint": "товар, чистый фон, акцент на продукте",
+        "prompt": "commercial product shot, clean background, focus on product details",
+    },
+    "poster": {
+        "label": "🎬 Постер",
+        "style": "art",
+        "aspect": "portrait",
+        "hint": "постер, заглавный кадр, выразительная композиция",
+        "prompt": "poster composition, dramatic framing, bold focal point",
+    },
+}
+IMAGE_EDIT_PRESET_OPTIONS: dict[str, dict[str, str]] = {
+    "anime_ref": {
+        "label": "🌸 Аниме по фото",
+        "style": "anime",
+        "aspect": "square",
+        "hint": "перерисовать в стиле аниме",
+        "prompt": "convert the reference photo into clean anime artwork while preserving identity",
+    },
+    "background_ref": {
+        "label": "🫧 Сменить фон",
+        "style": "photo",
+        "aspect": "portrait",
+        "hint": "заменить фон или перенести в новую сцену",
+        "prompt": "replace the background cleanly while keeping the main subject natural",
+    },
+    "enhance_ref": {
+        "label": "✨ Улучшить фото",
+        "style": "photo",
+        "aspect": "square",
+        "hint": "улучшить качество, свет, детали",
+        "prompt": "improve photo quality, lighting, clarity and skin tones while keeping it natural",
+    },
+    "art_ref": {
+        "label": "🖼 Арт по фото",
+        "style": "art",
+        "aspect": "square",
+        "hint": "сделать художественную версию фото",
+        "prompt": "turn the reference photo into polished digital art with strong composition",
+    },
+}
 DEFAULT_IMAGE_STYLE = "auto"
 DEFAULT_IMAGE_ASPECT = "square"
 
@@ -2550,19 +2610,61 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
         prefs = {}
     style = str(prefs.get("style", DEFAULT_IMAGE_STYLE)).strip().lower()
     aspect = str(prefs.get("aspect", DEFAULT_IMAGE_ASPECT)).strip().lower()
+    preset = str(prefs.get("preset", "")).strip().lower()
+    edit_preset = str(prefs.get("edit_preset", "")).strip().lower()
     if style not in IMAGE_STYLE_OPTIONS:
         style = DEFAULT_IMAGE_STYLE
     if aspect not in IMAGE_ASPECT_OPTIONS:
         aspect = DEFAULT_IMAGE_ASPECT
-    normalized = {"style": style, "aspect": aspect}
+    if preset not in IMAGE_PRESET_OPTIONS:
+        preset = ""
+    if edit_preset not in IMAGE_EDIT_PRESET_OPTIONS:
+        edit_preset = ""
+    normalized = {"style": style, "aspect": aspect, "preset": preset, "edit_preset": edit_preset}
     state.image_request_prefs[chat_id] = normalized
     return normalized
+
+
+def apply_image_preset(chat_id: int, preset_key: str) -> dict[str, str]:
+    prefs = get_image_prefs(chat_id)
+    preset = IMAGE_PRESET_OPTIONS[preset_key]
+    prefs["style"] = preset["style"]
+    prefs["aspect"] = preset["aspect"]
+    prefs["preset"] = preset_key
+    prefs["edit_preset"] = ""
+    state.image_request_prefs[chat_id] = prefs
+    return prefs
+
+
+def apply_image_edit_preset(chat_id: int, preset_key: str) -> dict[str, str]:
+    prefs = get_image_prefs(chat_id)
+    preset = IMAGE_EDIT_PRESET_OPTIONS[preset_key]
+    prefs["style"] = preset["style"]
+    prefs["aspect"] = preset["aspect"]
+    prefs["preset"] = ""
+    prefs["edit_preset"] = preset_key
+    state.image_request_prefs[chat_id] = prefs
+    return prefs
+
+
+def image_preset_summary_lines(chat_id: int) -> list[str]:
+    prefs = get_image_prefs(chat_id)
+    lines: list[str] = []
+    preset_key = prefs.get("preset", "")
+    edit_preset_key = prefs.get("edit_preset", "")
+    if preset_key in IMAGE_PRESET_OPTIONS:
+        lines.append(f"Сценарий: {IMAGE_PRESET_OPTIONS[preset_key]['label']}")
+    if edit_preset_key in IMAGE_EDIT_PRESET_OPTIONS:
+        lines.append(f"По фото: {IMAGE_EDIT_PRESET_OPTIONS[edit_preset_key]['label']}")
+    return lines
 
 
 def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
     prefs = get_image_prefs(chat_id)
     current_style = prefs["style"]
     current_aspect = prefs["aspect"]
+    current_preset = prefs.get("preset", "")
+    current_edit_preset = prefs.get("edit_preset", "")
 
     style_buttons: list[dict[str, Any]] = []
     for key in ("auto", "photo", "anime", "art"):
@@ -2576,11 +2678,27 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         prefix = "● " if key == current_aspect else ""
         aspect_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_aspect:{key}"})
 
+    preset_buttons: list[dict[str, Any]] = []
+    for key in ("avatar", "art_portrait", "product", "poster"):
+        label = IMAGE_PRESET_OPTIONS[key]["label"]
+        prefix = "● " if key == current_preset else ""
+        preset_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_preset:{key}"})
+
+    edit_preset_buttons: list[dict[str, Any]] = []
+    for key in ("anime_ref", "background_ref", "enhance_ref", "art_ref"):
+        label = IMAGE_EDIT_PRESET_OPTIONS[key]["label"]
+        prefix = "● " if key == current_edit_preset else ""
+        edit_preset_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_edit_preset:{key}"})
+
     return [
         {
             "type": "inline_keyboard",
             "payload": {
                 "buttons": [
+                    preset_buttons[:2],
+                    preset_buttons[2:],
+                    edit_preset_buttons[:2],
+                    edit_preset_buttons[2:],
                     style_buttons[:2],
                     style_buttons[2:],
                     aspect_buttons,
@@ -2615,18 +2733,66 @@ def build_image_prompt_keyboard() -> list[dict[str, Any]]:
     ]
 
 
+def image_availability_text(chat_id: int) -> str:
+    row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free"))
+    if plan_name == "free":
+        if not free_image_is_available(row):
+            next_at = free_image_next_available_at(row)
+            return (
+                f"На тарифе Free: не более 1 картинки каждые 7 дней. "
+                f"Осталось {format_remaining_time(next_at)}. "
+                f"Новая будет доступна с {format_msk_datetime(next_at)}."
+            )
+        return "На тарифе Free: доступна 1 картинка каждые 7 дней."
+
+    cfg = PLAN_CONFIGS.get(plan_name)
+    if cfg and int(cfg.daily_images_limit or 0) > 0:
+        used = int(row.get("daily_images_used", 0) or 0)
+        daily_limit = int(cfg.daily_images_limit or 0)
+        left = max(0, daily_limit - used)
+        return f"Лимит на сегодня: {used}/{daily_limit} (осталось {left})."
+
+    return f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
+
+
+def build_image_menu_text(chat_id: int) -> str:
+    return (
+        "🎨 Картинки\n\n"
+        "Быстрые сценарии:\n"
+        "• 👤 Аватар • 🎨 Арт-портрет • 📦 Товар • 🎬 Постер\n"
+        "• 🌸 Аниме по фото • 🫧 Сменить фон • ✨ Улучшить фото • 🖼 Арт по фото\n\n"
+        f"{image_params_summary(chat_id)}\n\n"
+        f"{image_availability_text(chat_id)}\n"
+        f"Генерация: {CREDIT_COST_IMAGE} кредитов.\n"
+        f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n\n"
+        "Сначала выбери сценарий сверху или настрой стиль вручную.\n"
+        "Потом нажми «✅ Сгенерировать» или «🖼 Редактировать фото»."
+    )
+
+
 def image_params_summary(chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
     style_label = IMAGE_STYLE_OPTIONS[prefs["style"]][0]
     aspect_label = IMAGE_ASPECT_OPTIONS[prefs["aspect"]][0]
-    return f"Стиль: {style_label}\nФормат: {aspect_label}"
+    lines = image_preset_summary_lines(chat_id)
+    lines.append(f"Стиль: {style_label}")
+    lines.append(f"Формат: {aspect_label}")
+    return "\n".join(lines)
 
 
 def build_image_prompt(user_text: str, chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
     style_instruction = IMAGE_STYLE_OPTIONS[prefs["style"]][1]
     aspect_instruction = IMAGE_ASPECT_OPTIONS[prefs["aspect"]][1]
-    instructions = [part for part in (style_instruction, aspect_instruction) if part]
+    preset_instruction = ""
+    preset_key = prefs.get("preset", "")
+    edit_preset_key = prefs.get("edit_preset", "")
+    if preset_key in IMAGE_PRESET_OPTIONS:
+        preset_instruction = IMAGE_PRESET_OPTIONS[preset_key]["prompt"]
+    elif edit_preset_key in IMAGE_EDIT_PRESET_OPTIONS:
+        preset_instruction = IMAGE_EDIT_PRESET_OPTIONS[edit_preset_key]["prompt"]
+    instructions = [part for part in (style_instruction, aspect_instruction, preset_instruction) if part]
     if not instructions:
         return user_text
     return f"{user_text}\n\nStyle constraints: {', '.join(instructions)}."
@@ -3833,38 +3999,9 @@ def current_model_display(chat_id: int) -> str:
 
 
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
-    row = user_profile(chat_id)
-    plan_name = str(row.get("plan", "free"))
-    availability_line = f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
-    if plan_name == "free":
-        if not free_image_is_available(row):
-            next_at = free_image_next_available_at(row)
-            availability_line = (
-                f"На free лимит: 1 картинка каждые 7 дней. "
-                f"Осталось {format_remaining_time(next_at)}. "
-                f"Новая будет доступна с {format_msk_datetime(next_at)}."
-            )
-        else:
-            availability_line = "На тарифе Free доступна 1 картинка каждые 7 дней."
-    else:
-        cfg = PLAN_CONFIGS.get(plan_name)
-        if cfg and int(cfg.daily_images_limit or 0) > 0:
-            used = int(row.get("daily_images_used", 0) or 0)
-            daily_limit = int(cfg.daily_images_limit or 0)
-            left = max(0, daily_limit - used)
-            availability_line = f"Лимит на сегодня: {used}/{daily_limit} (осталось {left})."
-
-    text = (
-        "Генерация картинки\n\n"
-        f"{image_params_summary(chat_id)}\n\n"
-        f"{availability_line}\n"
-        f"Стоимость: {CREDIT_COST_IMAGE} кредитов за 1 генерацию.\n\n"
-        f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов (с тарифа {DEFAULT_IMAGE_MODEL.min_plan}).\n\n"
-        "Выбери стиль и формат, затем нажми «✅ Сгенерировать» или «🖼 Редактировать фото»."
-    )
     await show_managed_content(
         chat_id,
-        text,
+        build_image_menu_text(chat_id),
         attachments=build_image_menu_keyboard(chat_id),
         page=UI_PAGE_IMAGE_MENU,
         push_history=False,
@@ -4347,15 +4484,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
     if page == UI_PAGE_SUPPORT:
         return support_help_text(), build_keyboard()
     if page == UI_PAGE_IMAGE_MENU:
-        text = (
-            "Режим «Картинка»\n"
-            "Переключи стиль и формат, потом нажми «✅ Сгенерировать».\n"
-            f"Списание: {CREDIT_COST_IMAGE} кредитов/картинка.\n"
-            f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
-            "На тарифе Free: не более 1 картинки каждые 7 дней.\n\n"
-            f"{image_params_summary(chat_id)}"
-        )
-        return text, build_image_menu_keyboard(chat_id)
+        return build_image_menu_text(chat_id), build_image_menu_keyboard(chat_id)
     return "Открой меню и выбери раздел.", build_keyboard()
 
 
@@ -5912,6 +6041,8 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             return True
         prefs = get_image_prefs(chat_id)
         prefs["style"] = style
+        prefs["preset"] = ""
+        prefs["edit_preset"] = ""
         state.image_request_prefs[chat_id] = prefs
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
@@ -5924,8 +6055,30 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             return True
         prefs = get_image_prefs(chat_id)
         prefs["aspect"] = aspect
+        prefs["preset"] = ""
+        prefs["edit_preset"] = ""
         state.image_request_prefs[chat_id] = prefs
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
+        return True
+
+    if payload.startswith("image_preset:"):
+        preset_key = payload.split(":", 1)[1].strip().lower()
+        if preset_key not in IMAGE_PRESET_OPTIONS:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный сценарий")
+            return True
+        apply_image_preset(chat_id, preset_key)
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарий выбран")
+        return True
+
+    if payload.startswith("image_edit_preset:"):
+        preset_key = payload.split(":", 1)[1].strip().lower()
+        if preset_key not in IMAGE_EDIT_PRESET_OPTIONS:
+            if callback_id:
+                await answer_callback(callback_id, "Неизвестный сценарий")
+            return True
+        apply_image_edit_preset(chat_id, preset_key)
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарий выбран")
         return True
 
     if payload == "image_prompt:start":
@@ -5948,11 +6101,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             await max_send_message(chat_id, reason_limit, attachments=build_tariffs_keyboard_pricing(), notify=False)
             return True
         state.pending_image_prompt.add(chat_id)
+        prefs = get_image_prefs(chat_id)
+        preset_hint = ""
+        if prefs.get("preset", "") in IMAGE_PRESET_OPTIONS:
+            chosen = IMAGE_PRESET_OPTIONS[prefs["preset"]]
+            preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
         if callback_id:
             await answer_callback(callback_id, "Жду описание")
         await max_send_message(
             chat_id,
             "Напиши, что нарисовать одним сообщением.\n\n"
+            f"{preset_hint}"
             f"{image_params_summary(chat_id)}\n"
             f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n"
             "Чтобы отменить — нажми «Отмена» или отправь /cancel",
@@ -5974,12 +6133,18 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             )
             return True
         state.pending_image_ref_prompt.add(chat_id)
+        prefs = get_image_prefs(chat_id)
+        preset_hint = ""
+        if prefs.get("edit_preset", "") in IMAGE_EDIT_PRESET_OPTIONS:
+            chosen = IMAGE_EDIT_PRESET_OPTIONS[prefs["edit_preset"]]
+            preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
         if callback_id:
             await answer_callback(callback_id, "Жду фото")
         await max_send_message(
             chat_id,
             (
                 "Пришли фото и коротко опиши, что сделать.\n"
+                f"{preset_hint}"
                 f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
                 "Если фото уже отправлено — просто напиши описание (например: «нарисуй её в стиле аниме»)."
             ),
