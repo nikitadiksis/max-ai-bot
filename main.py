@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import sqlite3
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from dotenv import load_dotenv
@@ -650,6 +650,20 @@ def referral_code_from_start_payload(update: dict[str, Any]) -> str:
             raw = raw[len(prefix):]
             break
     return normalize_referral_code(raw) if is_referral_code(raw) else ""
+
+
+def referral_share_message(code: str) -> str:
+    normalized = normalize_referral_code(code)
+    return (
+        "Попробуй моего AI-бота в MAX.\n"
+        f"Канал с обновлениями: {channel_url_value()}\n"
+        f"После запуска бота введи: /ref {normalized}\n"
+        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
+    )
+
+
+def max_share_url(text: str) -> str:
+    return f"https://max.ru/:share?text={quote(str(text or ''), safe='')}"
 
 
 def parse_date_ymd(value: str) -> date | None:
@@ -3031,7 +3045,14 @@ def build_reply_shortcuts_keyboard(chat_id: int) -> list[dict[str, Any]]:
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
-def build_growth_keyboard() -> list[dict[str, Any]]:
+def build_growth_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
+    share_button: dict[str, Any]
+    if chat_id:
+        row = user_profile(chat_id)
+        code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        share_button = {"type": "link", "text": "🔗 Поделиться", "url": max_share_url(referral_share_message(code))}
+    else:
+        share_button = {"type": "callback", "text": "🔗 Поделиться", "payload": "growth:ref_share"}
     return [
         {
             "type": "inline_keyboard",
@@ -3039,7 +3060,7 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                 "buttons": [
                     [
                         {"type": "callback", "text": "👥 Мой реф-код", "payload": "growth:ref_show"},
-                        {"type": "callback", "text": "🔗 Поделиться", "payload": "growth:ref_share"},
+                        share_button,
                     ],
                     [
                         {"type": "callback", "text": "🎟 Ввести реф-код", "payload": "growth:ref_enter"},
@@ -5079,7 +5100,6 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
         invited = int(row.get("referrals_invited", 0) or 0)
         referred_by = int(row.get("referred_by_chat_id", 0) or 0)
-        referral_link = referral_deep_link(referral_code)
         promo_items = sorted(promo_catalog().items())
         promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
         channel = channel_promo_meta()
@@ -5102,18 +5122,17 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         text = (
             "🎁 Бонусы и приглашения\n\n"
             f"Твой реф-код: {referral_code}\n"
-            f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
             f"Приглашено друзей: {invited}\n"
             f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
             f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-            f"{'Друг запускает бота по ссылке выше или вводит /ref <код>.\\n\\n' if referral_link else 'Друг активирует код командой: /ref <код>\\n\\n'}"
+            "Нажми «Поделиться», чтобы открыть шторку MAX с готовым приглашением.\n\n"
             f"{channel_block}\n\n"
             "Доступные промокоды:\n"
             f"{promo_block}\n\n"
             f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
             "Обновления и кейсы: в нашем канале."
         )
-        return text, build_growth_keyboard()
+        return text, build_growth_keyboard(chat_id)
     if page == UI_PAGE_SUPPORT:
         return support_help_text(), build_keyboard(chat_id)
     if page == UI_PAGE_IMAGE_MENU:
@@ -5291,7 +5310,6 @@ async def send_growth_menu(chat_id: int) -> None:
     referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
     invited = int(row.get("referrals_invited", 0) or 0)
     referred_by = int(row.get("referred_by_chat_id", 0) or 0)
-    referral_link = referral_deep_link(referral_code)
     promo_items = sorted(promo_catalog().items())
     promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
     channel = channel_promo_meta()
@@ -5306,17 +5324,16 @@ async def send_growth_menu(chat_id: int) -> None:
     text = (
         "🎁 Бонусы и приглашения\n\n"
         f"Твой реф-код: {referral_code}\n"
-        f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
         f"Приглашено друзей: {invited}\n"
         f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
         f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-        f"{'Друг запускает бота по ссылке выше или вводит /ref <код>.\\n\\n' if referral_link else 'Друг активирует код командой: /ref <код>\\n\\n'}"
+        "Нажми «Поделиться», чтобы открыть шторку MAX с готовым приглашением.\n\n"
         "Доступные промокоды:\n"
         f"{promo_block}\n\n"
         f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
         "Обновления и кейсы: в нашем канале."
     )
-    await send_managed_message(chat_id, text, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+    await send_managed_message(chat_id, text, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
 
 
 async def send_channel(chat_id: int) -> None:
@@ -5354,7 +5371,7 @@ async def notify_referral_success(friend_chat_id: int, owner_chat_id: int, sourc
     await show_managed_content(
         friend_chat_id,
         f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.{source_tail}",
-        attachments=build_growth_keyboard(),
+        attachments=build_growth_keyboard(friend_chat_id),
         page=UI_PAGE_GROWTH,
     )
     with suppress(Exception):
@@ -6628,7 +6645,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             f"📣 Канал проекта:\n{channel_url_value()}",
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
@@ -6640,17 +6657,15 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
         invited = int(row.get("referrals_invited", 0) or 0)
-        referral_link = referral_deep_link(code)
         await show_managed_content(
             chat_id,
             (
                 f"👥 Твой реф-код: {code}\n"
-                f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
                 f"Приглашено друзей: {invited}\n\n"
-                f"{'Пригласи друга: он запускает бота по ссылке выше.' if referral_link else f'Пригласи друга: он вводит /ref {code}'}\n"
+                f"Пригласи друга через кнопку «Поделиться» или попроси его ввести /ref {code}\n"
                 f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
             ),
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
@@ -6661,16 +6676,14 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "growth:ref_share":
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
-        share_text = referral_share_message(code)
-        hint = (
-            "Скопируй и перешли это другу. Если настроена стартовая ссылка, код применится сам."
-            if referral_deep_link(code)
-            else "Скопируй и перешли это другу. Пока прямую стартовую ссылку не настроили, поэтому друг просто введёт код вручную."
-        )
         await show_managed_content(
             chat_id,
-            f"🔗 Готовый текст для приглашения\n\n{share_text}\n\n{hint}",
-            attachments=build_growth_keyboard(),
+            (
+                "🔗 Поделиться приглашением\n\n"
+                "Для новых экранов кнопка «Поделиться» открывает шторку MAX сразу.\n"
+                "Если ты нажал её на старом сообщении, просто нажми «Поделиться» ещё раз на обновлённой кнопке ниже."
+            ),
+            attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
@@ -6724,7 +6737,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_managed_content(
             chat_id,
             "Бонус за подписку на канал пока отключен: в боте еще нет честной автопроверки подписки.",
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
@@ -7367,6 +7380,20 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not arg:
             code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
             invited = int(row.get("referrals_invited", 0) or 0)
+            await max_send_message(
+                chat_id,
+                (
+                    f"👥 Твой реф-код: {code}\n"
+                    f"Приглашено друзей: {invited}\n"
+                    f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
+                    f"Нажми «Поделиться» или попроси друга ввести: /ref {code}"
+                ),
+                attachments=build_growth_keyboard(chat_id),
+            )
+            return True
+        if not arg:
+            code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+            invited = int(row.get("referrals_invited", 0) or 0)
             referral_link = referral_deep_link(code)
             await max_send_message(
                 chat_id,
@@ -7377,13 +7404,13 @@ async def handle_command(chat_id: int, text: str) -> bool:
                     f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
                     f"{'Другу можно отправить стартовую ссылку выше.' if referral_link else f'Другу нужно отправить: /ref {code}'}"
                 ),
-                attachments=build_growth_keyboard(),
+                attachments=build_growth_keyboard(chat_id),
             )
             return True
 
         ok, info = state.user_store.apply_referral_code(chat_id, arg, REFERRAL_BONUS_CREDITS)
         if not ok:
-            await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+            await max_send_message(chat_id, info, attachments=build_growth_keyboard(chat_id))
             return True
         owner_chat_id = int(info)
         log_referral_activation(chat_id, owner_chat_id, arg, "command")
@@ -7393,19 +7420,19 @@ async def handle_command(chat_id: int, text: str) -> bool:
     if command == "/promo":
         if not arg:
             state.pending_promo_code_input.add(chat_id)
-            await max_send_message(chat_id, "Введи промокод одним сообщением.", attachments=build_growth_keyboard())
+            await max_send_message(chat_id, "Введи промокод одним сообщением.", attachments=build_growth_keyboard(chat_id))
             return True
         code = normalize_referral_code(arg)
         credits, bonus_ttl_days, reason = promo_offer_for_code(code)
         if credits <= 0:
-            await max_send_message(chat_id, reason or "Такого промокода нет или он выключен.", attachments=build_growth_keyboard())
+            await max_send_message(chat_id, reason or "Такого промокода нет или он выключен.", attachments=build_growth_keyboard(chat_id))
             return True
         ok, info = state.user_store.redeem_promo_code(chat_id, code, credits, bonus_ttl_days=bonus_ttl_days)
         if not ok:
-            await max_send_message(chat_id, info, attachments=build_growth_keyboard())
+            await max_send_message(chat_id, info, attachments=build_growth_keyboard(chat_id))
             return True
         ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
-        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard())
+        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard(chat_id))
         return True
 
     if command == "/preset":
@@ -7551,7 +7578,7 @@ async def handle_pending_referral_input(chat_id: int, text: str) -> bool:
     state.pending_referral_code_input.discard(chat_id)
     ok, info = state.user_store.apply_referral_code(chat_id, text, REFERRAL_BONUS_CREDITS)
     if not ok:
-        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
         return True
     owner_chat_id = int(info)
     log_referral_activation(chat_id, owner_chat_id, text, "input")
@@ -7581,19 +7608,19 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
         await show_managed_content(
             chat_id,
             reason or "Такого промокода нет или он выключен.",
-            attachments=build_growth_keyboard(),
+            attachments=build_growth_keyboard(chat_id),
             page=UI_PAGE_GROWTH,
         )
         return True
     ok, info = state.user_store.redeem_promo_code(chat_id, code, credits, bonus_ttl_days=bonus_ttl_days)
     if not ok:
-        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
+        await show_managed_content(chat_id, info, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
         return True
     ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
     await show_managed_content(
         chat_id,
         f"Промокод активирован: +{info} кредитов.{ttl_tail}",
-        attachments=build_growth_keyboard(),
+        attachments=build_growth_keyboard(chat_id),
         page=UI_PAGE_GROWTH,
     )
     return True
