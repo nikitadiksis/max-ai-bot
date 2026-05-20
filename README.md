@@ -167,6 +167,11 @@ Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
 docker compose up -d --build bot
 ```
 
+Data persistence:
+
+- SQLite DB and local backups are stored in `./data`
+- Docker mounts `./data:/app/data`, so user plans, credits, and payments survive rebuild/restart
+
 Health check:
 
 ```bash
