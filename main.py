@@ -2301,7 +2301,7 @@ def preset_model_hint(alias: str) -> str:
 
 
 def build_preset_block(plan: str) -> str:
-    lines = ["🎛 Режимы ответов:"]
+    lines = ["🎛 Режимы ответов для вашего тарифа:"]
     for key in ("fast", "balanced", "quality", "expert"):
         cfg = MODEL_PRESETS[key]
         if preset_choice_enabled_for_plan(plan, key):
