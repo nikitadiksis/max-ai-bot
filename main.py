@@ -2608,10 +2608,13 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
     prefs = state.image_request_prefs.get(chat_id)
     if not isinstance(prefs, dict):
         prefs = {}
+    mode = str(prefs.get("mode", "")).strip().lower()
     style = str(prefs.get("style", DEFAULT_IMAGE_STYLE)).strip().lower()
     aspect = str(prefs.get("aspect", DEFAULT_IMAGE_ASPECT)).strip().lower()
     preset = str(prefs.get("preset", "")).strip().lower()
     edit_preset = str(prefs.get("edit_preset", "")).strip().lower()
+    if mode not in {"", "generate", "edit"}:
+        mode = ""
     if style not in IMAGE_STYLE_OPTIONS:
         style = DEFAULT_IMAGE_STYLE
     if aspect not in IMAGE_ASPECT_OPTIONS:
@@ -2620,14 +2623,26 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
         preset = ""
     if edit_preset not in IMAGE_EDIT_PRESET_OPTIONS:
         edit_preset = ""
-    normalized = {"style": style, "aspect": aspect, "preset": preset, "edit_preset": edit_preset}
+    normalized = {"mode": mode, "style": style, "aspect": aspect, "preset": preset, "edit_preset": edit_preset}
     state.image_request_prefs[chat_id] = normalized
     return normalized
+
+
+def set_image_mode(chat_id: int, mode: str) -> dict[str, str]:
+    prefs = get_image_prefs(chat_id)
+    prefs["mode"] = mode if mode in {"generate", "edit"} else ""
+    if prefs["mode"] != "generate":
+        prefs["preset"] = ""
+    if prefs["mode"] != "edit":
+        prefs["edit_preset"] = ""
+    state.image_request_prefs[chat_id] = prefs
+    return prefs
 
 
 def apply_image_preset(chat_id: int, preset_key: str) -> dict[str, str]:
     prefs = get_image_prefs(chat_id)
     preset = IMAGE_PRESET_OPTIONS[preset_key]
+    prefs["mode"] = "generate"
     prefs["style"] = preset["style"]
     prefs["aspect"] = preset["aspect"]
     prefs["preset"] = preset_key
@@ -2639,6 +2654,7 @@ def apply_image_preset(chat_id: int, preset_key: str) -> dict[str, str]:
 def apply_image_edit_preset(chat_id: int, preset_key: str) -> dict[str, str]:
     prefs = get_image_prefs(chat_id)
     preset = IMAGE_EDIT_PRESET_OPTIONS[preset_key]
+    prefs["mode"] = "edit"
     prefs["style"] = preset["style"]
     prefs["aspect"] = preset["aspect"]
     prefs["preset"] = ""
@@ -2661,6 +2677,7 @@ def image_preset_summary_lines(chat_id: int) -> list[str]:
 
 def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
     prefs = get_image_prefs(chat_id)
+    current_mode = prefs.get("mode", "")
     current_style = prefs["style"]
     current_aspect = prefs["aspect"]
     current_preset = prefs.get("preset", "")
@@ -2690,32 +2707,57 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         prefix = "● " if key == current_edit_preset else ""
         edit_preset_buttons.append({"type": "callback", "text": f"{prefix}{label}", "payload": f"image_edit_preset:{key}"})
 
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {
-                "buttons": [
-                    preset_buttons[:2],
-                    preset_buttons[2:],
-                    edit_preset_buttons[:2],
-                    edit_preset_buttons[2:],
-                    style_buttons[:2],
-                    style_buttons[2:],
-                    aspect_buttons,
-                    [
-                        {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
-                    ],
-                    [
-                        {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
-                    ],
-                    [
-                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
-                    ],
-                ]
-            },
-        }
+    if not current_mode:
+        buttons = [
+            [
+                {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_mode:generate"},
+                {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_mode:edit"},
+            ],
+            [
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ],
+        ]
+        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+    if current_mode == "generate":
+        buttons = [
+            preset_buttons[:2],
+            preset_buttons[2:],
+            style_buttons[:2],
+            style_buttons[2:],
+            aspect_buttons,
+            [
+                {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
+            ],
+            [
+                {"type": "callback", "text": "◀ Выбор режима", "payload": "image_mode:back"},
+                {"type": "callback", "text": "Меню", "payload": "action:menu"},
+            ],
+            [
+                {"type": "callback", "text": "Помощь", "payload": "action:support"},
+            ],
+        ]
+        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+    buttons = [
+        edit_preset_buttons[:2],
+        edit_preset_buttons[2:],
+        style_buttons[:2],
+        style_buttons[2:],
+        aspect_buttons,
+        [
+            {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
+        ],
+        [
+            {"type": "callback", "text": "◀ Выбор режима", "payload": "image_mode:back"},
+            {"type": "callback", "text": "Меню", "payload": "action:menu"},
+        ],
+        [
+            {"type": "callback", "text": "Помощь", "payload": "action:support"},
+        ],
     ]
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
 def build_image_prompt_keyboard() -> list[dict[str, Any]]:
@@ -2757,17 +2799,38 @@ def image_availability_text(chat_id: int) -> str:
 
 
 def build_image_menu_text(chat_id: int) -> str:
+    prefs = get_image_prefs(chat_id)
+    mode = prefs.get("mode", "")
+    if not mode:
+        return (
+            "🎨 Картинки\n\n"
+            f"{image_availability_text(chat_id)}\n"
+            f"Генерация: {CREDIT_COST_IMAGE} кредитов.\n"
+            f"Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n\n"
+            "Сначала выбери, что хочешь сделать:\n"
+            "• создать новую картинку\n"
+            "• изменить фото"
+        )
+    if mode == "generate":
+        return (
+            "🎨 Генерация картинки\n\n"
+            "Готовые сценарии:\n"
+            "• 👤 Аватар • 🎨 Арт-портрет • 📦 Товар • 🎬 Постер\n\n"
+            f"{image_params_summary(chat_id)}\n\n"
+            f"{image_availability_text(chat_id)}\n"
+            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n\n"
+            "Выбери сценарий или настрой стиль и формат вручную.\n"
+            "Потом нажми «✅ Сгенерировать»."
+        )
     return (
-        "🎨 Картинки\n\n"
-        "Быстрые сценарии:\n"
-        "• 👤 Аватар • 🎨 Арт-портрет • 📦 Товар • 🎬 Постер\n"
+        "🖼 Редактирование фото\n\n"
+        "Готовые сценарии:\n"
         "• 🌸 Аниме по фото • 🫧 Сменить фон • ✨ Улучшить фото • 🖼 Арт по фото\n\n"
         f"{image_params_summary(chat_id)}\n\n"
-        f"{image_availability_text(chat_id)}\n"
-        f"Генерация: {CREDIT_COST_IMAGE} кредитов.\n"
-        f"Редактировать фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n\n"
-        "Сначала выбери сценарий сверху или настрой стиль вручную.\n"
-        "Потом нажми «✅ Сгенерировать» или «🖼 Редактировать фото»."
+        f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+        f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}.\n\n"
+        "Выбери сценарий или настрой стиль и формат вручную.\n"
+        "Потом нажми «🖼 Редактировать фото» и пришли фото."
     )
 
 
@@ -3999,6 +4062,7 @@ def current_model_display(chat_id: int) -> str:
 
 
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
+    set_image_mode(chat_id, "")
     await show_managed_content(
         chat_id,
         build_image_menu_text(chat_id),
@@ -6028,9 +6092,22 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload == "action:image_menu":
-        if callback_id:
-            await answer_callback(callback_id, "Параметры картинки")
         await send_image_menu(chat_id)
+        return True
+
+    if payload == "image_mode:generate":
+        set_image_mode(chat_id, "generate")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Режим генерации")
+        return True
+
+    if payload == "image_mode:edit":
+        set_image_mode(chat_id, "edit")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Режим редактирования")
+        return True
+
+    if payload == "image_mode:back":
+        set_image_mode(chat_id, "")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Выбор режима")
         return True
 
     if payload.startswith("image_style:"):
