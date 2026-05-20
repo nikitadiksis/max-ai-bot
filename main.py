@@ -2634,7 +2634,7 @@ def get_image_prefs(chat_id: int) -> dict[str, str]:
 def set_image_mode(chat_id: int, mode: str) -> dict[str, str]:
     prefs = get_image_prefs(chat_id)
     prefs["mode"] = mode if mode in {"generate", "edit"} else ""
-    prefs["panel"] = "root"
+    prefs["panel"] = "scenario" if prefs["mode"] else "root"
     if prefs["mode"] != "generate":
         prefs["preset"] = ""
     if prefs["mode"] != "edit":
@@ -2741,30 +2741,16 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
     if current_mode == "generate":
-        if current_panel == "scenario":
-            buttons = [
-                preset_buttons[:2],
-                preset_buttons[2:],
-                [
-                    {"type": "callback", "text": "Без сценария", "payload": "image_preset:none"},
-                ],
-                [
-                    {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
-                    {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                ],
-                [
-                    {"type": "callback", "text": "Помощь", "payload": "action:support"},
-                ],
-            ]
-            return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-
         if current_panel == "style":
             buttons = [
                 style_buttons[:2],
                 style_buttons[2:],
                 aspect_buttons,
                 [
-                    {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                    {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
+                ],
+                [
+                    {"type": "callback", "text": "◀ Назад к сценариям", "payload": "image_panel:scenario"},
                     {"type": "callback", "text": "Меню", "payload": "action:menu"},
                 ],
                 [
@@ -2774,35 +2760,13 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
             return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
         buttons = [
-            [
-                {"type": "callback", "text": "✨ Сценарии", "payload": "image_panel:scenario"},
-                {"type": "callback", "text": "🎛 Стиль и формат", "payload": "image_panel:style"},
-            ],
+            preset_buttons[:2],
+            preset_buttons[2:],
             [
                 {"type": "callback", "text": "Без сценария", "payload": "image_preset:none"},
             ],
             [
-                {"type": "callback", "text": "✅ Сгенерировать", "payload": "image_prompt:start"},
-            ],
-            [
                 {"type": "callback", "text": "◀ Выбор режима", "payload": "image_mode:back"},
-                {"type": "callback", "text": "Меню", "payload": "action:menu"},
-            ],
-            [
-                {"type": "callback", "text": "Помощь", "payload": "action:support"},
-            ],
-        ]
-        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-
-    if current_panel == "scenario":
-        buttons = [
-            edit_preset_buttons[:2],
-            edit_preset_buttons[2:],
-            [
-                {"type": "callback", "text": "Без сценария", "payload": "image_edit_preset:none"},
-            ],
-            [
-                {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
                 {"type": "callback", "text": "Меню", "payload": "action:menu"},
             ],
             [
@@ -2817,7 +2781,10 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
             style_buttons[2:],
             aspect_buttons,
             [
-                {"type": "callback", "text": "◀ Назад", "payload": "image_panel:root"},
+                {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
+            ],
+            [
+                {"type": "callback", "text": "◀ Назад к сценариям", "payload": "image_panel:scenario"},
                 {"type": "callback", "text": "Меню", "payload": "action:menu"},
             ],
             [
@@ -2827,15 +2794,10 @@ def build_image_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
         return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
     buttons = [
-        [
-            {"type": "callback", "text": "✨ Сценарии", "payload": "image_panel:scenario"},
-            {"type": "callback", "text": "🎛 Стиль и формат", "payload": "image_panel:style"},
-        ],
+        edit_preset_buttons[:2],
+        edit_preset_buttons[2:],
         [
             {"type": "callback", "text": "Без сценария", "payload": "image_edit_preset:none"},
-        ],
-        [
-            {"type": "callback", "text": "🖼 Редактировать фото", "payload": "image_ref:start"},
         ],
         [
             {"type": "callback", "text": "◀ Выбор режима", "payload": "image_mode:back"},
@@ -2901,13 +2863,6 @@ def build_image_menu_text(chat_id: int) -> str:
             "• изменить фото"
         )
     if mode == "generate":
-        if panel == "scenario":
-            return (
-                "✨ Сценарии генерации\n\n"
-                "Выбери готовый сценарий или нажми «Без сценария».\n\n"
-                f"{image_params_summary(chat_id)}\n\n"
-                "Сценарий помогает быстрее получить нужный тип картинки."
-            )
         if panel == "style":
             return (
                 "🎛 Стиль и формат\n\n"
@@ -2915,19 +2870,11 @@ def build_image_menu_text(chat_id: int) -> str:
                 f"{image_params_summary(chat_id)}"
             )
         return (
-            "🎨 Генерация картинки\n\n"
-            f"{image_params_summary(chat_id)}\n\n"
+            "✨ Сценарии генерации\n\n"
+            "Выбери готовый сценарий или не выбирай его.\n"
+            "После этого откроется шаг со стилем и форматом.\n\n"
             f"{image_availability_text(chat_id)}\n"
-            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n\n"
-            "Сначала выбери сценарии или стиль и формат.\n"
-            "Потом нажми «✅ Сгенерировать»."
-        )
-    if panel == "scenario":
-        return (
-            "🖼 Сценарии для фото\n\n"
-            "Выбери готовый сценарий для редактирования фото или нажми «Без сценария».\n\n"
-            f"{image_params_summary(chat_id)}\n\n"
-            "Сценарий подсказывает модели, что именно ты хочешь изменить."
+            f"Стоимость: {CREDIT_COST_IMAGE} кредитов."
         )
     if panel == "style":
         return (
@@ -2936,12 +2883,11 @@ def build_image_menu_text(chat_id: int) -> str:
             f"{image_params_summary(chat_id)}"
         )
     return (
-        "🖼 Редактирование фото\n\n"
-        f"{image_params_summary(chat_id)}\n\n"
+        "🖼 Сценарии для фото\n\n"
+        "Выбери готовый сценарий для редактирования фото или не выбирай его.\n"
+        "После этого откроется шаг со стилем и форматом.\n\n"
         f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
-        f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}.\n\n"
-        "Сначала выбери сценарии или стиль и формат.\n"
-        "Потом нажми «🖼 Редактировать фото» и пришли фото."
+        f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
     )
 
 
@@ -6221,14 +6167,9 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Выбор режима")
         return True
 
-    if payload == "image_panel:root":
-        set_image_panel(chat_id, "root")
-        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Назад")
-        return True
-
     if payload == "image_panel:scenario":
         set_image_panel(chat_id, "scenario")
-        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарии")
+        await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Назад")
         return True
 
     if payload == "image_panel:style":
@@ -6268,6 +6209,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         preset_key = payload.split(":", 1)[1].strip().lower()
         if preset_key == "none":
             clear_image_preset(chat_id)
+            set_image_panel(chat_id, "style")
             await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Без сценария")
             return True
         if preset_key not in IMAGE_PRESET_OPTIONS:
@@ -6275,6 +6217,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Неизвестный сценарий")
             return True
         apply_image_preset(chat_id, preset_key)
+        set_image_panel(chat_id, "style")
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарий выбран")
         return True
 
@@ -6282,6 +6225,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         preset_key = payload.split(":", 1)[1].strip().lower()
         if preset_key == "none":
             clear_image_preset(chat_id)
+            set_image_panel(chat_id, "style")
             await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Без сценария")
             return True
         if preset_key not in IMAGE_EDIT_PRESET_OPTIONS:
@@ -6289,6 +6233,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Неизвестный сценарий")
             return True
         apply_image_edit_preset(chat_id, preset_key)
+        set_image_panel(chat_id, "style")
         await show_ui_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False, notification="Сценарий выбран")
         return True
 
