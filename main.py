@@ -2533,6 +2533,23 @@ def resolve_preset_alias_for_chat(chat_id: int, preset: str) -> str:
     return resolve_preset_alias_for_plan(plan, preset)
 
 
+def allowed_text_aliases_for_plan(plan: str) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    preferred = ["deepseek", "gpt", "gpt4o", "gemini", "gpt54"]
+    for alias in preferred:
+        if alias in seen or not text_model_allowed_for_plan(plan, alias):
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    for alias in TEXT_MODELS:
+        if alias in seen or not text_model_allowed_for_plan(plan, alias):
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
+
+
 def preset_available_aliases_for_plan(plan: str, preset: str) -> list[str]:
     preset_cfg = MODEL_PRESETS.get(preset) or {}
     aliases: list[str] = []
@@ -2564,11 +2581,8 @@ def current_preset_for_chat(chat_id: int) -> str:
 
 
 def can_pick_models_for_current_preset(chat_id: int) -> bool:
-    preset = current_preset_for_chat(chat_id)
-    if not preset:
-        return False
     plan = str(user_profile(chat_id).get("plan", "free"))
-    return preset_choice_enabled_for_plan(plan, preset)
+    return len(allowed_text_aliases_for_plan(plan)) > 1
 
 
 def preset_model_hint(alias: str) -> str:
@@ -2761,7 +2775,7 @@ def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
         {"type": "callback", "text": "Мой план", "payload": "action:plan"},
     ]
     if chat_id is not None and can_pick_models_for_current_preset(chat_id):
-        plan_buttons.append({"type": "callback", "text": "⚙ Модели режима", "payload": "action:preset_models"})
+        plan_buttons.append({"type": "callback", "text": "⚙ Модели", "payload": "action:preset_models"})
     return [
         {
             "type": "inline_keyboard",
@@ -4753,27 +4767,30 @@ def managed_page_text_format(page: str | None) -> str | None:
     return None
 
 
-def build_preset_picker_text(chat_id: int, preset: str) -> str:
+def build_model_picker_text(chat_id: int) -> str:
     row = user_profile(chat_id)
     plan = str(row.get("plan", "free"))
-    cfg = MODEL_PRESETS.get(preset, {})
-    title = str(cfg.get("label", preset))
-    description = str(cfg.get("description", "")).strip()
-    aliases = preset_available_aliases_for_plan(plan, preset)
-    lines = [f"{title}", description, "", "Выбери модель для этого режима:"]
-    for alias in aliases:
+    current_alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan))
+    lines = ["⚙ Модели", "", "Выбери модель для своего тарифа:"]
+    if current_alias:
+        current_label = TEXT_MODELS.get(current_alias, DEFAULT_TEXT_MODEL).label
+        lines.extend(["", f"Сейчас выбрана: {current_label}"])
+    for alias in allowed_text_aliases_for_plan(plan):
         info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
-        lines.append(f"• {info.label} — {preset_model_hint(alias)}")
+        prefix = "•"
+        if alias == current_alias:
+            prefix = "✅"
+        lines.append(f"{prefix} {info.label} — {preset_model_hint(alias)}")
     lines.append("")
     lines.append("После выбора бот вернёт тебя в Главное меню.")
     return "\n".join(part for part in lines if part is not None)
 
 
-def build_preset_picker_keyboard(plan: str, preset: str) -> list[dict[str, Any]]:
+def build_model_picker_keyboard(plan: str) -> list[dict[str, Any]]:
     rows: list[list[dict[str, Any]]] = []
-    for alias in preset_available_aliases_for_plan(plan, preset):
+    for alias in allowed_text_aliases_for_plan(plan):
         info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
-        rows.append([{"type": "callback", "text": info.label, "payload": f"preset_pick:{preset}:{alias}"}])
+        rows.append([{"type": "callback", "text": info.label, "payload": f"set_model:{alias}"}])
     rows.append(
         [
             {"type": "callback", "text": "Меню", "payload": "action:menu"},
@@ -6157,19 +6174,19 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload == "action:preset_models":
-        preset = current_preset_for_chat(chat_id)
-        if not preset or not can_pick_models_for_current_preset(chat_id):
+        plan = str(user_profile(chat_id).get("plan", "free"))
+        if not can_pick_models_for_current_preset(chat_id):
             await show_ui_page(chat_id, UI_PAGE_MODELS, callback_id=callback_id, source_mid=source_mid, push_history=True)
             return True
         await show_managed_content(
             chat_id,
-            build_preset_picker_text(chat_id, preset),
-            attachments=build_preset_picker_keyboard(str(user_profile(chat_id).get("plan", "free")), preset),
+            build_model_picker_text(chat_id),
+            attachments=build_model_picker_keyboard(plan),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_MENU,
             push_history=False,
-            notification="Выбери модель режима",
+            notification="Выбери модель",
         )
         return True
 
@@ -6216,8 +6233,8 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 await answer_callback(callback_id, "Модель недоступна")
             await show_managed_content(
                 chat_id,
-                build_preset_picker_text(chat_id, preset),
-                attachments=build_preset_picker_keyboard(plan, preset),
+                build_model_picker_text(chat_id),
+                attachments=build_model_picker_keyboard(plan),
                 callback_id=None,
                 source_mid=source_mid,
                 page=UI_PAGE_MENU,
