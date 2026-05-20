@@ -71,14 +71,6 @@ PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "2490"))
 LITE_PLAN_DAYS = int(os.getenv("LITE_PLAN_DAYS", "30"))
 START_PLAN_DAYS = int(os.getenv("START_PLAN_DAYS", "30"))
 PRO_PLAN_DAYS = int(os.getenv("PRO_PLAN_DAYS", "30"))
-FREE_DAILY_MESSAGES_LIMIT = int(os.getenv("FREE_DAILY_MESSAGES_LIMIT", "40"))
-LITE_DAILY_MESSAGES_LIMIT = int(os.getenv("LITE_DAILY_MESSAGES_LIMIT", "80"))
-START_DAILY_MESSAGES_LIMIT = int(os.getenv("START_DAILY_MESSAGES_LIMIT", "120"))
-PRO_DAILY_MESSAGES_LIMIT = int(os.getenv("PRO_DAILY_MESSAGES_LIMIT", "300"))
-FREE_DAILY_IMAGES_LIMIT = int(os.getenv("FREE_DAILY_IMAGES_LIMIT", "0"))
-LITE_DAILY_IMAGES_LIMIT = int(os.getenv("LITE_DAILY_IMAGES_LIMIT", "1"))
-START_DAILY_IMAGES_LIMIT = int(os.getenv("START_DAILY_IMAGES_LIMIT", "3"))
-PRO_DAILY_IMAGES_LIMIT = int(os.getenv("PRO_DAILY_IMAGES_LIMIT", "8"))
 START_DAILY_GPT54_LIMIT = int(os.getenv("START_DAILY_GPT54_LIMIT", "3"))
 PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "0"))
 FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "40"))
@@ -365,26 +357,26 @@ class PlanInfo:
 PLAN_CONFIGS = {
     "free": PlanInfo(
         name="free",
-        daily_messages_limit=FREE_DAILY_MESSAGES_LIMIT,
-        daily_images_limit=FREE_DAILY_IMAGES_LIMIT,
+        daily_messages_limit=0,
+        daily_images_limit=0,
         daily_gpt54_limit=0,
     ),
     "lite": PlanInfo(
         name="lite",
-        daily_messages_limit=LITE_DAILY_MESSAGES_LIMIT,
-        daily_images_limit=LITE_DAILY_IMAGES_LIMIT,
+        daily_messages_limit=0,
+        daily_images_limit=0,
         daily_gpt54_limit=0,
     ),
     "start": PlanInfo(
         name="start",
-        daily_messages_limit=START_DAILY_MESSAGES_LIMIT,
-        daily_images_limit=START_DAILY_IMAGES_LIMIT,
+        daily_messages_limit=0,
+        daily_images_limit=0,
         daily_gpt54_limit=START_DAILY_GPT54_LIMIT,
     ),
     "pro": PlanInfo(
         name="pro",
-        daily_messages_limit=PRO_DAILY_MESSAGES_LIMIT,
-        daily_images_limit=PRO_DAILY_IMAGES_LIMIT,
+        daily_messages_limit=0,
+        daily_images_limit=0,
         daily_gpt54_limit=PRO_DAILY_GPT54_LIMIT,
     ),
 }
@@ -3065,17 +3057,10 @@ def image_availability_text(chat_id: int) -> str:
                 f"На тарифе Free: не более 1 картинки каждые 7 дней. "
                 f"Осталось {format_remaining_time(next_at)}. "
                 f"Новая будет доступна с {format_msk_datetime(next_at)}."
-            )
+        )
         return "На тарифе Free: доступна 1 картинка каждые 7 дней."
 
-    cfg = PLAN_CONFIGS.get(plan_name)
-    if cfg and int(cfg.daily_images_limit or 0) > 0:
-        used = int(row.get("daily_images_used", 0) or 0)
-        daily_limit = int(cfg.daily_images_limit or 0)
-        left = max(0, daily_limit - used)
-        return f"Лимит на сегодня: {used}/{daily_limit} (осталось {left})."
-
-    return f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
+    return "На платных тарифах картинки доступны по кредитам, без дневного лимита."
 
 
 def build_image_menu_text(chat_id: int) -> str:
