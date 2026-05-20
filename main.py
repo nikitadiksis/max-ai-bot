@@ -1648,7 +1648,7 @@ class UserStore:
 
             request_rows = conn.execute(
                 """
-                SELECT event_type, model_alias, credits_spent, tokens_total, details
+                SELECT event_type, plan, model_alias, credits_spent, tokens_total, details
                 FROM usage_events
                 WHERE created_at >= ? AND event_type IN ('text_request', 'image_request')
                 """,
@@ -1683,8 +1683,10 @@ class UserStore:
             ).fetchall()
 
             model_stats: dict[str, dict[str, Any]] = {}
+            plan_cost_stats: dict[str, dict[str, Any]] = {}
             for raw_row in request_rows:
                 alias = str(raw_row["model_alias"] or "").strip() or "-"
+                plan_name = str(raw_row["plan"] or "").strip() or "free"
                 label, kind_label, model_info = model_info_for_alias(alias)
                 stat = model_stats.setdefault(
                     alias,
@@ -1708,12 +1710,27 @@ class UserStore:
                 stat["tokens"] += total_tokens
                 stat["prompt_tokens"] += prompt_tokens
                 stat["completion_tokens"] += completion_tokens
-                stat["estimated_cost_usd"] += estimate_text_cost_usd(
+                estimated_cost_usd = estimate_text_cost_usd(
                     model_info,
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
                 )
+                stat["estimated_cost_usd"] += estimated_cost_usd
+                plan_stat = plan_cost_stats.setdefault(
+                    plan_name,
+                    {
+                        "plan": plan_name,
+                        "text_requests": 0,
+                        "image_requests": 0,
+                        "estimated_text_cost_usd": 0.0,
+                    },
+                )
+                if kind_label == "Текст":
+                    plan_stat["text_requests"] += 1
+                    plan_stat["estimated_text_cost_usd"] += estimated_cost_usd
+                elif kind_label == "Картинка":
+                    plan_stat["image_requests"] += 1
 
             estimated_text_cost_usd = sum(float(row.get("estimated_cost_usd", 0.0) or 0.0) for row in model_stats.values())
             model_rows = sorted(
@@ -1724,6 +1741,28 @@ class UserStore:
                     -int(row.get("requests", 0) or 0),
                 ),
             )[:12]
+            payment_revenue_by_plan = {
+                str(row["plan"] or "").strip() or "-": int(row["revenue"] or 0)
+                for row in plan_rows
+            }
+            margin_rows: list[dict[str, Any]] = []
+            for plan_name in ("lite", "start", "pro", "small", "medium", "large"):
+                revenue = int(payment_revenue_by_plan.get(plan_name, 0) or 0)
+                plan_stat = plan_cost_stats.get(plan_name, {})
+                text_cost_rub = float(plan_stat.get("estimated_text_cost_usd", 0.0) or 0.0) * ANALYTICS_USD_TO_RUB
+                contribution_rub = revenue - text_cost_rub
+                margin_pct = (contribution_rub * 100.0 / revenue) if revenue > 0 else 0.0
+                margin_rows.append(
+                    {
+                        "plan": plan_name,
+                        "revenue_rub": revenue,
+                        "estimated_text_cost_rub": text_cost_rub,
+                        "contribution_rub": contribution_rub,
+                        "margin_pct": margin_pct,
+                        "text_requests": int(plan_stat.get("text_requests", 0) or 0),
+                        "image_requests": int(plan_stat.get("image_requests", 0) or 0),
+                    }
+                )
 
             return {
                 "days": period_days,
@@ -1743,6 +1782,7 @@ class UserStore:
                 "estimated_text_cost_rub": estimated_text_cost_usd * ANALYTICS_USD_TO_RUB,
                 "models": model_rows,
                 "plans": [dict(row) for row in plan_rows],
+                "margins": margin_rows,
                 "daily": [dict(row) for row in daily_rows],
             }
 
@@ -7444,6 +7484,8 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     text_tokens = int(report.get("text_tokens", 0) or 0)
     avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
     estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
+    estimated_text_contribution_rub = net_rub - estimated_text_cost_rub
+    estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
 
     economics_plan_rows = []
     for plan in ("lite", "start", "pro"):
@@ -7481,6 +7523,27 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
             f"<td>{credits_per_rub(credits, price_rub)}</td>"
             "</tr>"
         )
+
+    margin_rows = []
+    for row in report.get("margins", []):
+        revenue = int(row.get("revenue_rub", 0) or 0)
+        text_cost = float(row.get("estimated_text_cost_rub", 0.0) or 0.0)
+        contribution = float(row.get("contribution_rub", 0.0) or 0.0)
+        if revenue <= 0 and text_cost <= 0:
+            continue
+        margin_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('plan', '-') or '-'))}</td>"
+            f"<td>{money(revenue)} ₽</td>"
+            f"<td>{money(text_cost)} ₽</td>"
+            f"<td>{money(contribution)} ₽</td>"
+            f"<td>{float(row.get('margin_pct', 0.0) or 0.0):.1f}%</td>"
+            f"<td>{int(row.get('text_requests', 0) or 0)}</td>"
+            f"<td>{int(row.get('image_requests', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not margin_rows:
+        margin_rows.append("<tr><td colspan='7'>Пока недостаточно данных для оценки маржи по тарифам.</td></tr>")
 
     period_links = " ".join(
         f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
@@ -7578,6 +7641,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Израсходовано {image_credits} кредитов</div></div>
         <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
         <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">Оценка по токенам и прайсам моделей</div></div>
+        <div class="metric"><div class="metric-label">Маржа после текста</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, без учёта image-cost</div></div>
         <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
       </div>
     </div>
@@ -7621,6 +7685,14 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
           <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
           <p>Если захочешь скорректировать курс, просто обнови <code>ANALYTICS_USD_TO_RUB</code> в server <code>.env</code>.</p>
         </div>
+      </div>
+      <div class="card table-card">
+        <h3>Оценка маржи по тарифам</h3>
+        <p>Это управленческая оценка: выручка минус текстовая себестоимость по токенам. Затраты на картинки и эквайринг сюда пока не включены.</p>
+        <table>
+          <tr><th>Тариф</th><th>Выручка</th><th>Себестоимость текста</th><th>Маржа</th><th>Маржа %</th><th>Текстов</th><th>Картинок</th></tr>
+          {''.join(margin_rows)}
+        </table>
       </div>
     </div>
     <div class="grid">
