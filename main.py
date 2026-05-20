@@ -6267,8 +6267,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{preset_hint}"
             f"{image_params_summary(chat_id)}\n"
-            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.\n"
-            "Чтобы отменить — нажми «Отмена» или отправь /cancel",
+            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.",
             attachments=build_image_prompt_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
