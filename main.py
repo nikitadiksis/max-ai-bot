@@ -111,6 +111,7 @@ TOPUP_QUICK_CODE = os.getenv("TOPUP_QUICK_CODE", "medium").strip().lower() or "m
 LOW_CREDITS_NUDGE_THRESHOLD_FREE = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_FREE", "10"))
 LOW_CREDITS_NUDGE_THRESHOLD_PAID = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_PAID", "120"))
 LOW_CREDITS_NUDGE_COOLDOWN_HOURS = int(os.getenv("LOW_CREDITS_NUDGE_COOLDOWN_HOURS", "18"))
+ANALYTICS_USD_TO_RUB = float(os.getenv("ANALYTICS_USD_TO_RUB", "95"))
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -468,6 +469,53 @@ class ModelInfo:
     min_plan: str
     description: str
     prompt_style: str
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_usage_details_blob(details: str) -> tuple[int, int]:
+    value = str(details or "")
+    prompt_match = re.search(r"(?:^|;)prompt=(\d+)", value)
+    completion_match = re.search(r"(?:^|;)completion=(\d+)", value)
+    prompt_tokens = int(prompt_match.group(1)) if prompt_match else 0
+    completion_tokens = int(completion_match.group(1)) if completion_match else 0
+    return max(0, prompt_tokens), max(0, completion_tokens)
+
+
+def model_info_for_alias(alias: str) -> tuple[str, str, ModelInfo | None]:
+    raw_alias = str(alias or "").strip()
+    if not raw_alias:
+        return "-", "—", None
+    base_alias, _, suffix = raw_alias.partition(":")
+    text_model = TEXT_MODELS.get(base_alias)
+    if text_model:
+        return text_model.label, "Текст", text_model
+    image_model = IMAGE_MODELS.get(base_alias)
+    if image_model:
+        label = image_model.label
+        if suffix == "edit":
+            label = f"{label} (ред. фото)"
+        return label, "Картинка", image_model
+    return raw_alias, "—", None
+
+
+def estimate_text_cost_usd(model: ModelInfo | None, prompt_tokens: int, completion_tokens: int, total_tokens: int) -> float:
+    if not model or model.kind != "text":
+        return 0.0
+    input_price = safe_float(model.input_price_usd_per_m)
+    output_price = safe_float(model.output_price_usd_per_m)
+    prompt = max(0, int(prompt_tokens or 0))
+    completion = max(0, int(completion_tokens or 0))
+    total = max(0, int(total_tokens or 0))
+    if prompt <= 0 and completion <= 0 and total > 0:
+        prompt = int(total * 0.65)
+        completion = max(0, total - prompt)
+    return (prompt / 1_000_000.0) * input_price + (completion / 1_000_000.0) * output_price
 
 
 def configure_logging() -> logging.Logger:
@@ -1598,14 +1646,11 @@ class UserStore:
                 (since,),
             ).fetchone()
 
-            model_rows = conn.execute(
+            request_rows = conn.execute(
                 """
-                SELECT model_alias, COUNT(*) AS cnt, SUM(credits_spent) AS credits
+                SELECT event_type, model_alias, credits_spent, tokens_total, details
                 FROM usage_events
-                WHERE created_at >= ? AND event_type = 'text_request'
-                GROUP BY model_alias
-                ORDER BY cnt DESC
-                LIMIT 10
+                WHERE created_at >= ? AND event_type IN ('text_request', 'image_request')
                 """,
                 (since,),
             ).fetchall()
@@ -1637,6 +1682,49 @@ class UserStore:
                 (since,),
             ).fetchall()
 
+            model_stats: dict[str, dict[str, Any]] = {}
+            for raw_row in request_rows:
+                alias = str(raw_row["model_alias"] or "").strip() or "-"
+                label, kind_label, model_info = model_info_for_alias(alias)
+                stat = model_stats.setdefault(
+                    alias,
+                    {
+                        "model_alias": alias,
+                        "label": label,
+                        "kind": kind_label,
+                        "requests": 0,
+                        "credits": 0,
+                        "tokens": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "estimated_cost_usd": 0.0,
+                    },
+                )
+                stat["requests"] += 1
+                credits = int(raw_row["credits_spent"] or 0)
+                total_tokens = int(raw_row["tokens_total"] or 0)
+                prompt_tokens, completion_tokens = parse_usage_details_blob(str(raw_row["details"] or ""))
+                stat["credits"] += credits
+                stat["tokens"] += total_tokens
+                stat["prompt_tokens"] += prompt_tokens
+                stat["completion_tokens"] += completion_tokens
+                stat["estimated_cost_usd"] += estimate_text_cost_usd(
+                    model_info,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+
+            estimated_text_cost_usd = sum(float(row.get("estimated_cost_usd", 0.0) or 0.0) for row in model_stats.values())
+            model_rows = sorted(
+                model_stats.values(),
+                key=lambda row: (
+                    -float(row.get("estimated_cost_usd", 0.0) or 0.0),
+                    -int(row.get("tokens", 0) or 0),
+                    -int(row.get("requests", 0) or 0),
+                ),
+            )[:12]
+
             return {
                 "days": period_days,
                 "since": since,
@@ -1651,7 +1739,9 @@ class UserStore:
                 "total_credits_spent": int((summary["total_credits_spent"] or 0) if summary else 0),
                 "text_tokens": int((summary["text_tokens"] or 0) if summary else 0),
                 "payers": int((payers_row["payers"] or 0) if payers_row else 0),
-                "models": [dict(row) for row in model_rows],
+                "estimated_text_cost_usd": estimated_text_cost_usd,
+                "estimated_text_cost_rub": estimated_text_cost_usd * ANALYTICS_USD_TO_RUB,
+                "models": model_rows,
                 "plans": [dict(row) for row in plan_rows],
                 "daily": [dict(row) for row in daily_rows],
             }
@@ -7348,6 +7438,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     total_credits = int(report.get("total_credits_spent", 0) or 0)
     text_tokens = int(report.get("text_tokens", 0) or 0)
     avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
+    estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
 
     period_links = " ".join(
         f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
@@ -7356,17 +7447,27 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
 
     models_rows = []
     for row in report.get("models", []):
-        alias = str(row.get("model_alias", "") or "")
-        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label if alias else "-"
+        label = str(row.get("label", "") or "-")
+        kind = str(row.get("kind", "") or "—")
+        requests_count = int(row.get("requests", 0) or 0)
+        tokens = int(row.get("tokens", 0) or 0)
+        credits = int(row.get("credits", 0) or 0)
+        avg_model_tokens = (tokens / requests_count) if requests_count else 0.0
+        estimated_cost_rub = float(row.get("estimated_cost_usd", 0.0) or 0.0) * ANALYTICS_USD_TO_RUB
+        estimated_cost_cell = f"{money(estimated_cost_rub)} ₽" if kind == "Текст" else "—"
         models_rows.append(
             "<tr>"
             f"<td>{esc(label)}</td>"
-            f"<td>{int(row.get('cnt', 0) or 0)}</td>"
-            f"<td>{int(row.get('credits', 0) or 0)}</td>"
+            f"<td>{esc(kind)}</td>"
+            f"<td>{requests_count}</td>"
+            f"<td>{money(tokens)}</td>"
+            f"<td>{money(avg_model_tokens)}</td>"
+            f"<td>{credits}</td>"
+            f"<td>{estimated_cost_cell}</td>"
             "</tr>"
         )
     if not models_rows:
-        models_rows.append("<tr><td colspan='3'>Пока нет данных по моделям.</td></tr>")
+        models_rows.append("<tr><td colspan='7'>Пока нет данных по моделям.</td></tr>")
 
     plan_rows = []
     for row in report.get("plans", []):
@@ -7434,6 +7535,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
         <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Израсходовано {image_credits} кредитов</div></div>
         <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
+        <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">Оценка по токенам и прайсам моделей</div></div>
         <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
       </div>
     </div>
@@ -7446,9 +7548,10 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     </div>
     <div class="grid">
       <div class="card table-card">
-        <h2>Топ моделей</h2>
+        <h2>Расход по моделям</h2>
+        <p>Текстовая себестоимость считается по prompt/completion токенам и текущим ценам из реестра моделей. Для картинок токен-стоимость не считаем, поэтому там может быть 0 ₽.</p>
         <table>
-          <tr><th>Модель</th><th>Запросов</th><th>Кредитов</th></tr>
+          <tr><th>Модель</th><th>Тип</th><th>Запросов</th><th>Токенов</th><th>Ср./запрос</th><th>Кредитов</th><th>Себестоимость</th></tr>
           {''.join(models_rows)}
         </table>
       </div>
