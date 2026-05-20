@@ -153,8 +153,6 @@ Admin (`ADMIN_IDS` only):
 - `/admin templates`
 - `/admin backup`
 - `/admin nudge [days] [limit]`
-- `/admin panel`
-- `/admin kpi [days]`
 - `/costs`
 
 Закрытая веб-аналитика:

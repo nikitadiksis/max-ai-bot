@@ -256,8 +256,6 @@ ADMIN_HELP_TEXT = (
     "/admin templates\n"
     "/admin backup\n"
     "/admin nudge [days] [limit]\n"
-    "/admin kpi [days]\n"
-    "/admin panel\n"
     "/costs — модели и цены\n"
     "/id — твой chat_id"
 )
@@ -2010,10 +2008,6 @@ def support_admin_templates_text() -> str:
         "«Получили запрос на оспаривание платежа по заявке #{request_id}. "
         "Для проверки пришлите дату/время оплаты и скрин подтверждения операции.»"
     )
-
-
-def admin_panel_enabled() -> bool:
-    return bool(ADMIN_PANEL_TOKEN)
 
 
 def admin_panel_authorized(token: str) -> bool:
@@ -5296,9 +5290,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             "/admin pay <request_id> <paid|cancel>\n"
             "/admin templates\n"
             "/admin backup\n"
-            "/admin nudge [days] [limit]\n"
-            "/admin kpi [days]\n"
-            "/admin panel",
+            "/admin nudge [days] [limit]",
         )
         return True
 
@@ -5387,16 +5379,12 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         )
         return True
 
-    if action == "kpi":
-        days = 30
-        if len(parts) >= 3 and parts[2].isdigit():
-            days = int(parts[2])
-        report = state.user_store.kpi_report(days=days)
-        await max_send_message(chat_id, format_kpi_report(report))
-        return True
-
     if action == "templates":
         await max_send_message(chat_id, support_admin_templates_text())
+        return True
+
+    if action in {"panel", "kpi"}:
+        await max_send_message(chat_id, "Веб-аналитика и админка теперь открываются только через сайт: /analytics")
         return True
 
     if action == "backup":
@@ -5419,7 +5407,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         await max_send_message(chat_id, f"Реактивация: отправлено {sent}/{total} (dormant_days={days}, limit={limit})")
         return True
 
-    if action == "panel":
+    if action == "__legacy_panel_removed__":
         if not admin_panel_enabled():
             await max_send_message(chat_id, "ADMIN_PANEL_TOKEN не задан. Панель выключена.")
             return True
