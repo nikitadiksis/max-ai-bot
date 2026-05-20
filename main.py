@@ -1277,10 +1277,69 @@ class UserStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT chat_id, plan, is_blocked, onboarding_done, credits_balance,
+                SELECT chat_id, max_user_id, plan, is_blocked, onboarding_done, credits_balance,
+                       recurring_enabled, subscription_expires_at,
                        daily_messages_used, daily_images_used, last_active_at, updated_at
                 FROM users
                 ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def suspicious_users_report(self, limit: int = 25) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    u.chat_id,
+                    u.max_user_id,
+                    u.plan,
+                    u.credits_balance,
+                    u.subscription_expires_at,
+                    u.recurring_enabled,
+                    u.last_active_at,
+                    CASE
+                        WHEN u.plan != 'free'
+                             AND NOT EXISTS (
+                                SELECT 1
+                                FROM payment_requests p
+                                WHERE p.chat_id = u.chat_id
+                                  AND p.status = 'paid'
+                                  AND p.plan = u.plan
+                             )
+                        THEN 'Платный план без оплаченной заявки'
+                        WHEN u.plan != 'free'
+                             AND EXISTS (
+                                SELECT 1
+                                FROM usage_events e
+                                WHERE e.chat_id = u.chat_id
+                                  AND e.event_type = 'payment'
+                                  AND e.details LIKE '%source=admin panel%'
+                             )
+                        THEN 'Оплата подтверждена вручную через админку'
+                        ELSE ''
+                    END AS risk_reason
+                FROM users u
+                WHERE u.plan != 'free'
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM payment_requests p
+                        WHERE p.chat_id = u.chat_id
+                          AND p.status = 'paid'
+                          AND p.plan = u.plan
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM usage_events e
+                        WHERE e.chat_id = u.chat_id
+                          AND e.event_type = 'payment'
+                          AND e.details LIKE '%source=admin panel%'
+                    )
+                  )
+                ORDER BY u.updated_at DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -7933,13 +7992,26 @@ async def admin_panel_action(
             if plan in PAID_PLANS:
                 state.user_store.set_credits(chat_id, credits_for_plan(plan))
             message = f"План пользователя {chat_id} -> {plan}"
+        elif action == "set_sub" and chat_id is not None and plan in PAID_PLANS:
+            user_profile(chat_id)
+            expires_at = state.user_store.set_subscription(
+                chat_id,
+                plan,
+                30,
+                best_default_alias_for_plan(plan),
+                recurring_enabled=False,
+            )
+            message = f"Подписка пользователя {chat_id} -> {plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}"
         elif action == "add_credits" and chat_id is not None and amount != 0:
             user_profile(chat_id)
             balance = state.user_store.adjust_credits(chat_id, amount)
             message = f"Баланс пользователя {chat_id}: {balance}"
-        elif action == "reset_daily" and chat_id is not None:
-            state.user_store.reset_daily_counters(chat_id)
-            message = f"Дневные лимиты пользователя {chat_id} сброшены"
+        elif action == "cancel_recurring" and chat_id is not None:
+            row = user_profile(chat_id)
+            expires_at = str(row.get("subscription_expires_at", "") or "")
+            cancel_from = expires_at if expires_at else datetime.utcnow().replace(microsecond=0).isoformat()
+            state.user_store.cancel_recurring(chat_id, cancel_from)
+            message = f"Автопродление пользователя {chat_id} отключено"
         elif action == "block" and chat_id is not None and value in {"on", "off"}:
             state.user_store.set_blocked(chat_id, value == "on")
             message = f"Пользователь {chat_id}: block={value}"
@@ -8115,6 +8187,7 @@ def render_admin_panel_html_v2(
 ) -> str:
     users = state.user_store.list_recent_users(limit=25)
     payments = state.user_store.list_recent_payments(limit=25)
+    suspicious_users = state.user_store.suspicious_users_report(limit=20)
     selected_user = state.user_store.get_user(chat_id) if chat_id else None
     selected_payment = state.user_store.get_payment(request_id) if request_id else None
     esc = html.escape
@@ -8130,12 +8203,14 @@ def render_admin_panel_html_v2(
     user_rows = []
     for row in users:
         cid = int(row.get("chat_id", 0) or 0)
+        recurring = "on" if int(row.get("recurring_enabled", 0) or 0) == 1 else "off"
         user_rows.append(
             "<tr>"
             f"<td>{cid}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('plan', '')))}</td>"
             f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
-            f"<td>{int(row.get('daily_messages_used', 0) or 0)}/{int(row.get('daily_images_used', 0) or 0)}</td>"
+            f"<td>{recurring}</td>"
             f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
             f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
@@ -8156,9 +8231,26 @@ def render_admin_panel_html_v2(
             "</tr>"
         )
 
+    suspicious_rows = []
+    for row in suspicious_users:
+        suspicious_rows.append(
+            "<tr>"
+            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('plan', '') or ''))}</td>"
+            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('risk_reason', '') or ''))}</td>"
+            f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=int(row.get('chat_id', 0) or 0)))}'>Открыть</a></td>"
+            "</tr>"
+        )
+    if not suspicious_rows:
+        suspicious_rows.append("<tr><td colspan='7'>Явных подозрительных кейсов пока нет.</td></tr>")
+
     action_block = ""
     if selected_user:
         cid = int(selected_user["chat_id"])
+        recurring_on = int(selected_user.get("recurring_enabled", 0) or 0) == 1
         action_block = (
             "<h3>Ручная корректировка</h3>"
             "<p>"
@@ -8168,9 +8260,19 @@ def render_admin_panel_html_v2(
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='pro'))}'>План pro</a>"
             "</p>"
             "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='lite'))}'>Lite на 30 дней</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='start'))}'>Start на 30 дней</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='pro'))}'>Pro на 30 дней</a>"
+            "</p>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=100))}'>+100 кредитов</a> | "
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=500))}'>+500 кредитов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-500 кредитов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='reset_daily', chat_id=cid))}'>Сброс дневных лимитов</a>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-100))}'>-100 кредитов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-500 кредитов</a>"
+            "</p>"
+            "<p>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='cancel_recurring', chat_id=cid))}'>Отключить автопродление</a>"
+            f"{' ✅' if recurring_on else ' (уже выключено)'}"
             "</p>"
             "<p>"
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='block', chat_id=cid, value='on'))}'>Block ON</a> | "
@@ -8220,8 +8322,15 @@ def render_admin_panel_html_v2(
     </div>
     <div class="card">
       <h2>Последние пользователи</h2>
-      <table><tr><th>chat_id</th><th>plan</th><th>credits</th><th>usage d</th><th>blocked</th><th>last_active_at</th><th></th></tr>
+      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>credits</th><th>recur</th><th>blocked</th><th>last_active_at</th><th></th></tr>
       {''.join(user_rows)}
+      </table>
+    </div>
+    <div class="card">
+      <h2>Подозрительные случаи</h2>
+      <p>Здесь показываются платные аккаунты без успешной оплаченной заявки и случаи, где оплата подтверждалась вручную через админку. Это не приговор, а очередь на проверку.</p>
+      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>credits</th><th>Причина</th><th>last_active_at</th><th></th></tr>
+      {''.join(suspicious_rows)}
       </table>
     </div>
     <div class="card">
