@@ -93,6 +93,7 @@ TOPUP_LARGE_CREDITS=7000
 WEBHOOK_SECRET=strong_random_secret
 PAYMENT_DETAILS_TEXT=Оплата на ИП ...\\nБанк: ...\\nР/с: ...
 PUBLIC_BASE_URL=https://your-domain
+BOT_PUBLIC_URL=
 TBANK_TERMINAL_KEY=
 TBANK_PASSWORD=
 TBANK_INIT_URL=https://securepay.tinkoff.ru/v2/Init
@@ -160,6 +161,11 @@ Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
 Закрытая веб-аналитика:
 - `/analytics`
 - вход по паролю `ADMIN_PANEL_TOKEN`
+
+Рефералка:
+- если задан `BOT_PUBLIC_URL`, бот строит стартовую ссылку вида `https://.../?start=RF...`
+- код можно применить и вручную через `/ref CODE`
+- в аналитике и админке появятся топ рефереров и подозрительные реф-кластеры
 
 ## Deploy (Docker)
 

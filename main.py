@@ -143,6 +143,7 @@ SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши на�
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
+BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").strip().rstrip("/")
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
 PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "0"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
@@ -580,6 +581,75 @@ def referral_code_for_chat(chat_id: int) -> str:
 
 def normalize_referral_code(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", value.strip().upper())
+
+
+def is_referral_code(value: str) -> bool:
+    code = normalize_referral_code(value)
+    return code.startswith("RF") and len(code) >= 8
+
+
+def bot_public_url_value() -> str:
+    return BOT_PUBLIC_URL
+
+
+def referral_deep_link(code: str) -> str:
+    normalized = normalize_referral_code(code)
+    base = bot_public_url_value()
+    if not base or not is_referral_code(normalized):
+        return ""
+    return f"{base}?start={normalized}"
+
+
+def referral_share_message(code: str) -> str:
+    normalized = normalize_referral_code(code)
+    link = referral_deep_link(normalized)
+    if link:
+        return (
+            "Попробуй моего AI-бота в MAX.\n"
+            f"Стартовая ссылка: {link}\n"
+            f"После запуска тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
+        )
+    return (
+        "Попробуй моего AI-бота в MAX.\n"
+        f"Когда зайдёшь, отправь в боте: /ref {normalized}\n"
+        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
+    )
+
+
+def parse_start_payload(update: dict[str, Any]) -> str:
+    candidates: list[Any] = [
+        update.get("payload"),
+        update.get("start_payload"),
+        update.get("start_parameter"),
+        ((update.get("message") or {}).get("body") or {}).get("payload") if isinstance(update.get("message"), dict) else None,
+        ((update.get("message") or {}).get("body") or {}).get("start_payload") if isinstance(update.get("message"), dict) else None,
+        ((update.get("message") or {}).get("body") or {}).get("start_parameter") if isinstance(update.get("message"), dict) else None,
+        ((update.get("chat") or {}).get("payload")) if isinstance(update.get("chat"), dict) else None,
+        ((update.get("chat") or {}).get("start_payload")) if isinstance(update.get("chat"), dict) else None,
+        ((update.get("chat") or {}).get("start_parameter")) if isinstance(update.get("chat"), dict) else None,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def referral_code_from_start_payload(update: dict[str, Any]) -> str:
+    payload = parse_start_payload(update)
+    if not payload:
+        return ""
+    raw = payload.strip()
+    if "=" in raw or "&" in raw:
+        params = dict(parse_qsl(raw, keep_blank_values=True))
+        for key in ("ref", "referral", "code", "r"):
+            value = params.get(key)
+            if isinstance(value, str) and is_referral_code(value):
+                return normalize_referral_code(value)
+    for prefix in ("ref:", "ref=", "referral:", "referral=", "r:", "r="):
+        if raw.lower().startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    return normalize_referral_code(raw) if is_referral_code(raw) else ""
 
 
 def parse_date_ymd(value: str) -> date | None:
@@ -1382,6 +1452,51 @@ class UserStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def top_referrers_report(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    u.chat_id,
+                    u.max_user_id,
+                    u.referral_code,
+                    u.referrals_invited,
+                    SUM(CASE WHEN r.plan != 'free' THEN 1 ELSE 0 END) AS paid_referrals,
+                    MAX(COALESCE(r.created_at, '')) AS last_referral_at
+                FROM users u
+                LEFT JOIN users r ON r.referred_by_chat_id = u.chat_id
+                WHERE u.referrals_invited > 0
+                GROUP BY u.chat_id, u.max_user_id, u.referral_code, u.referrals_invited
+                ORDER BY u.referrals_invited DESC, paid_referrals DESC, last_referral_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def suspicious_referral_report(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    u.chat_id,
+                    u.max_user_id,
+                    u.referral_code,
+                    u.referrals_invited,
+                    SUM(CASE WHEN r.plan != 'free' THEN 1 ELSE 0 END) AS paid_referrals,
+                    SUM(CASE WHEN r.last_active_at >= ? THEN 1 ELSE 0 END) AS active_recent_referrals
+                FROM users u
+                LEFT JOIN users r ON r.referred_by_chat_id = u.chat_id
+                WHERE u.referrals_invited >= 3
+                GROUP BY u.chat_id, u.max_user_id, u.referral_code, u.referrals_invited
+                HAVING paid_referrals = 0
+                ORDER BY u.referrals_invited DESC, active_recent_referrals ASC, u.chat_id DESC
+                LIMIT ?
+                """,
+                ((datetime.utcnow() - timedelta(days=14)).replace(microsecond=0).isoformat(), limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def get_user(self, chat_id: int) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -1819,6 +1934,8 @@ class UserStore:
                     SUM(CASE WHEN event_type = 'refund' THEN 1 ELSE 0 END) AS refunds_count,
                     SUM(CASE WHEN event_type = 'text_request' THEN 1 ELSE 0 END) AS text_requests,
                     SUM(CASE WHEN event_type = 'image_request' THEN 1 ELSE 0 END) AS image_requests,
+                    SUM(CASE WHEN event_type = 'referral_activation' THEN 1 ELSE 0 END) AS referral_activations,
+                    SUM(CASE WHEN event_type IN ('referral_activation', 'referral_reward') THEN credits_spent ELSE 0 END) AS referral_bonus_credits,
                     SUM(CASE WHEN event_type = 'text_request' THEN credits_spent ELSE 0 END) AS text_credits,
                     SUM(CASE WHEN event_type = 'image_request' THEN credits_spent ELSE 0 END) AS image_credits,
                     SUM(CASE WHEN event_type IN ('text_request','image_request') THEN credits_spent ELSE 0 END) AS total_credits_spent,
@@ -1834,6 +1951,19 @@ class UserStore:
                 SELECT COUNT(DISTINCT chat_id) AS payers
                 FROM usage_events
                 WHERE created_at >= ? AND event_type = 'payment' AND rub_amount > 0
+                """,
+                (since,),
+            ).fetchone()
+
+            referred_payers_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT e.chat_id) AS referred_payers
+                FROM usage_events e
+                JOIN users u ON u.chat_id = e.chat_id
+                WHERE e.created_at >= ?
+                  AND e.event_type = 'payment'
+                  AND e.rub_amount > 0
+                  AND u.referred_by_chat_id > 0
                 """,
                 (since,),
             ).fetchone()
@@ -1873,6 +2003,8 @@ class UserStore:
                 """,
                 (since,),
             ).fetchall()
+            top_referrers = self.top_referrers_report(limit=10)
+            suspicious_referrals = self.suspicious_referral_report(limit=10)
 
             model_stats: dict[str, dict[str, Any]] = {}
             plan_cost_stats: dict[str, dict[str, Any]] = {}
@@ -1967,17 +2099,22 @@ class UserStore:
                 "refunds_count": int((summary["refunds_count"] or 0) if summary else 0),
                 "text_requests": int((summary["text_requests"] or 0) if summary else 0),
                 "image_requests": int((summary["image_requests"] or 0) if summary else 0),
+                "referral_activations": int((summary["referral_activations"] or 0) if summary else 0),
+                "referral_bonus_credits": int((summary["referral_bonus_credits"] or 0) if summary else 0),
                 "text_credits": int((summary["text_credits"] or 0) if summary else 0),
                 "image_credits": int((summary["image_credits"] or 0) if summary else 0),
                 "total_credits_spent": int((summary["total_credits_spent"] or 0) if summary else 0),
                 "text_tokens": int((summary["text_tokens"] or 0) if summary else 0),
                 "payers": int((payers_row["payers"] or 0) if payers_row else 0),
+                "referred_payers": int((referred_payers_row["referred_payers"] or 0) if referred_payers_row else 0),
                 "estimated_text_cost_usd": estimated_text_cost_usd,
                 "estimated_text_cost_rub": estimated_text_cost_usd * ANALYTICS_USD_TO_RUB,
                 "models": model_rows,
                 "plans": [dict(row) for row in plan_rows],
                 "margins": margin_rows,
                 "daily": [dict(row) for row in daily_rows],
+                "top_referrers": top_referrers,
+                "suspicious_referrals": suspicious_referrals,
             }
 
 
@@ -2902,6 +3039,9 @@ def build_growth_keyboard() -> list[dict[str, Any]]:
                 "buttons": [
                     [
                         {"type": "callback", "text": "👥 Мой реф-код", "payload": "growth:ref_show"},
+                        {"type": "callback", "text": "🔗 Поделиться", "payload": "growth:ref_share"},
+                    ],
+                    [
                         {"type": "callback", "text": "🎟 Ввести реф-код", "payload": "growth:ref_enter"},
                     ],
                     [
@@ -4939,6 +5079,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
         invited = int(row.get("referrals_invited", 0) or 0)
         referred_by = int(row.get("referred_by_chat_id", 0) or 0)
+        referral_link = referral_deep_link(referral_code)
         promo_items = sorted(promo_catalog().items())
         promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
         channel = channel_promo_meta()
@@ -4961,10 +5102,11 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         text = (
             "🎁 Бонусы и приглашения\n\n"
             f"Твой реф-код: {referral_code}\n"
+            f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
             f"Приглашено друзей: {invited}\n"
             f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
             f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-            "Друг активирует код командой: /ref <код>\n\n"
+            f"{'Друг запускает бота по ссылке выше или вводит /ref <код>.\\n\\n' if referral_link else 'Друг активирует код командой: /ref <код>\\n\\n'}"
             f"{channel_block}\n\n"
             "Доступные промокоды:\n"
             f"{promo_block}\n\n"
@@ -5149,6 +5291,7 @@ async def send_growth_menu(chat_id: int) -> None:
     referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
     invited = int(row.get("referrals_invited", 0) or 0)
     referred_by = int(row.get("referred_by_chat_id", 0) or 0)
+    referral_link = referral_deep_link(referral_code)
     promo_items = sorted(promo_catalog().items())
     promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
     channel = channel_promo_meta()
@@ -5163,10 +5306,11 @@ async def send_growth_menu(chat_id: int) -> None:
     text = (
         "🎁 Бонусы и приглашения\n\n"
         f"Твой реф-код: {referral_code}\n"
+        f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
         f"Приглашено друзей: {invited}\n"
         f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
         f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-        "Друг активирует код командой: /ref <код>\n\n"
+        f"{'Друг запускает бота по ссылке выше или вводит /ref <код>.\\n\\n' if referral_link else 'Друг активирует код командой: /ref <код>\\n\\n'}"
         "Доступные промокоды:\n"
         f"{promo_block}\n\n"
         f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
@@ -5181,6 +5325,59 @@ async def send_channel(chat_id: int) -> None:
         f"📣 Канал проекта:\n{channel_url_value()}",
         attachments=build_keyboard(),
     )
+
+
+def log_referral_activation(friend_chat_id: int, owner_chat_id: int, code: str, source: str) -> None:
+    friend_row = user_profile(friend_chat_id)
+    owner_row = user_profile(owner_chat_id)
+    normalized = normalize_referral_code(code)
+    state.user_store.record_usage_event(
+        chat_id=friend_chat_id,
+        event_type="referral_activation",
+        plan=str(friend_row.get("plan", "")),
+        credits_spent=REFERRAL_BONUS_CREDITS,
+        details=f"code={normalized};owner_chat_id={owner_chat_id};source={source}",
+    )
+    state.user_store.record_usage_event(
+        chat_id=owner_chat_id,
+        event_type="referral_reward",
+        plan=str(owner_row.get("plan", "")),
+        credits_spent=REFERRAL_BONUS_CREDITS,
+        details=f"code={normalized};friend_chat_id={friend_chat_id};source={source}",
+    )
+
+
+async def notify_referral_success(friend_chat_id: int, owner_chat_id: int, source: str) -> None:
+    source_tail = ""
+    if source == "start":
+        source_tail = " Код применился автоматически по стартовой ссылке."
+    await show_managed_content(
+        friend_chat_id,
+        f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.{source_tail}",
+        attachments=build_growth_keyboard(),
+        page=UI_PAGE_GROWTH,
+    )
+    with suppress(Exception):
+        await max_send_message(
+            owner_chat_id,
+            f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+            attachments=build_keyboard(),
+            notify=False,
+        )
+
+
+async def maybe_apply_start_referral(chat_id: int, update: dict[str, Any]) -> bool:
+    code = referral_code_from_start_payload(update)
+    if not code:
+        return False
+    ok, info = state.user_store.apply_referral_code(chat_id, code, REFERRAL_BONUS_CREDITS)
+    if not ok:
+        log.info("Start referral ignored chat_id=%s code=%s reason=%s", chat_id, code, info)
+        return False
+    owner_chat_id = int(info)
+    log_referral_activation(chat_id, owner_chat_id, code, "start")
+    await notify_referral_success(chat_id, owner_chat_id, "start")
+    return True
 
 
 async def send_reengage_nudges(days: int, limit: int) -> tuple[int, int]:
@@ -6443,12 +6640,14 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
         invited = int(row.get("referrals_invited", 0) or 0)
+        referral_link = referral_deep_link(code)
         await show_managed_content(
             chat_id,
             (
                 f"👥 Твой реф-код: {code}\n"
+                f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
                 f"Приглашено друзей: {invited}\n\n"
-                f"Пригласи друга: он вводит /ref {code}\n"
+                f"{'Пригласи друга: он запускает бота по ссылке выше.' if referral_link else f'Пригласи друга: он вводит /ref {code}'}\n"
                 f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
             ),
             attachments=build_growth_keyboard(),
@@ -6456,6 +6655,26 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
             notification="Твой реф-код",
+        )
+        return True
+
+    if payload == "growth:ref_share":
+        row = user_profile(chat_id)
+        code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        share_text = referral_share_message(code)
+        hint = (
+            "Скопируй и перешли это другу. Если настроена стартовая ссылка, код применится сам."
+            if referral_deep_link(code)
+            else "Скопируй и перешли это другу. Пока прямую стартовую ссылку не настроили, поэтому друг просто введёт код вручную."
+        )
+        await show_managed_content(
+            chat_id,
+            f"🔗 Готовый текст для приглашения\n\n{share_text}\n\n{hint}",
+            attachments=build_growth_keyboard(),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_GROWTH,
+            notification="Поделиться",
         )
         return True
 
@@ -7055,6 +7274,15 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command in {"/start", "/menu"}:
         row = user_profile(chat_id)
+        if command == "/start" and arg:
+            start_ref = referral_code_from_start_payload({"payload": arg}) or (normalize_referral_code(arg) if is_referral_code(arg) else "")
+            if start_ref:
+                ok, info = state.user_store.apply_referral_code(chat_id, start_ref, REFERRAL_BONUS_CREDITS)
+                if ok:
+                    owner_chat_id = int(info)
+                    log_referral_activation(chat_id, owner_chat_id, start_ref, "start_command")
+                    await notify_referral_success(chat_id, owner_chat_id, "start")
+                    row = user_profile(chat_id)
         if command == "/start" and int(row.get("onboarding_done", 0) or 0) == 0:
             await send_onboarding(chat_id, step=1)
             return True
@@ -7139,13 +7367,15 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not arg:
             code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
             invited = int(row.get("referrals_invited", 0) or 0)
+            referral_link = referral_deep_link(code)
             await max_send_message(
                 chat_id,
                 (
                     f"👥 Твой реф-код: {code}\n"
+                    f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
                     f"Приглашено друзей: {invited}\n"
                     f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
-                    f"Другу нужно отправить: /ref {code}"
+                    f"{'Другу можно отправить стартовую ссылку выше.' if referral_link else f'Другу нужно отправить: /ref {code}'}"
                 ),
                 attachments=build_growth_keyboard(),
             )
@@ -7156,18 +7386,8 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await max_send_message(chat_id, info, attachments=build_growth_keyboard())
             return True
         owner_chat_id = int(info)
-        await max_send_message(
-            chat_id,
-            f"Готово! Реферальный код принят. Тебе начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
-            attachments=build_growth_keyboard(),
-        )
-        with suppress(Exception):
-            await max_send_message(
-                owner_chat_id,
-                f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
-                attachments=build_keyboard(),
-                notify=False,
-            )
+        log_referral_activation(chat_id, owner_chat_id, arg, "command")
+        await notify_referral_success(chat_id, owner_chat_id, "command")
         return True
 
     if command == "/promo":
@@ -7334,19 +7554,8 @@ async def handle_pending_referral_input(chat_id: int, text: str) -> bool:
         await show_managed_content(chat_id, info, attachments=build_growth_keyboard(), page=UI_PAGE_GROWTH)
         return True
     owner_chat_id = int(info)
-    await show_managed_content(
-        chat_id,
-        f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
-        attachments=build_growth_keyboard(),
-        page=UI_PAGE_GROWTH,
-    )
-    with suppress(Exception):
-        await max_send_message(
-            owner_chat_id,
-            f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
-            attachments=build_keyboard(),
-            notify=False,
-        )
+    log_referral_activation(chat_id, owner_chat_id, text, "input")
+    await notify_referral_success(chat_id, owner_chat_id, "input")
     return True
 
 
@@ -7412,6 +7621,11 @@ async def process_update(update: dict[str, Any]) -> None:
     state.user_store.touch_last_active(chat_id)
     if row["is_blocked"]:
         return
+
+    if update_type in {"bot_started", "user_added", "bot_added"}:
+        referral_applied = await maybe_apply_start_referral(chat_id, update)
+        if referral_applied:
+            row = user_profile(chat_id)
 
     if incoming_image_url:
         try:
@@ -7713,6 +7927,36 @@ def render_admin_login_html(error: str = "") -> str:
     error_block = ""
     if error:
         error_block = f"<p class='error-box'>{esc(error)}</p>"
+    top_referrer_rows = []
+    for row in report.get("top_referrers", []):
+        top_referrer_rows.append(
+            "<tr>"
+            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
+            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
+            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('last_referral_at', '') or '-'))}</td>"
+            "</tr>"
+        )
+    if not top_referrer_rows:
+        top_referrer_rows.append("<tr><td colspan='6'>Пока нет данных по рефералам.</td></tr>")
+
+    suspicious_referral_rows = []
+    for row in report.get("suspicious_referrals", []):
+        suspicious_referral_rows.append(
+            "<tr>"
+            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
+            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
+            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
+            f"<td>{int(row.get('active_recent_referrals', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not suspicious_referral_rows:
+        suspicious_referral_rows.append("<tr><td colspan='6'>Подозрительных реф-кластеров пока нет.</td></tr>")
+
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -7775,11 +8019,15 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
     refund_rate_pct = (refunds_count * 100.0 / payments_count) if payments_count else 0.0
     text_requests = int(report.get("text_requests", 0) or 0)
     image_requests = int(report.get("image_requests", 0) or 0)
+    referral_activations = int(report.get("referral_activations", 0) or 0)
+    referred_payers = int(report.get("referred_payers", 0) or 0)
+    referral_bonus_credits = int(report.get("referral_bonus_credits", 0) or 0)
     text_credits = int(report.get("text_credits", 0) or 0)
     image_credits = int(report.get("image_credits", 0) or 0)
     total_credits = int(report.get("total_credits_spent", 0) or 0)
     text_tokens = int(report.get("text_tokens", 0) or 0)
     avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
+    referral_conversion_pct = (referred_payers * 100.0 / referral_activations) if referral_activations else 0.0
     estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
     estimated_text_contribution_rub = net_rub - estimated_text_cost_rub
     estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
@@ -8054,13 +8302,381 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
 </html>"""
 
 
+def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
+    report = state.user_store.kpi_report(days=days)
+    esc = html.escape
+
+    def money(value: int | float) -> str:
+        return f"{int(round(value)):,}".replace(",", " ")
+
+    def credits_per_rub(credits: int, price_rub: int) -> str:
+        if price_rub <= 0:
+            return "0.00"
+        return f"{credits / float(price_rub):.2f}"
+
+    def fmt_msk(value: Any) -> str:
+        text = str(value or "").strip()
+        dt = parse_iso_datetime(text)
+        return format_msk_datetime(dt) if dt else "-"
+
+    active_users = int(report.get("active_users", 0) or 0)
+    payers = int(report.get("payers", 0) or 0)
+    revenue_rub = int(report.get("revenue_rub", 0) or 0)
+    refunds_raw = int(report.get("refunds_rub", 0) or 0)
+    refunds_abs = abs(refunds_raw)
+    payments_count = int(report.get("payments_count", 0) or 0)
+    refunds_count = int(report.get("refunds_count", 0) or 0)
+    net_rub = revenue_rub + refunds_raw if refunds_raw < 0 else revenue_rub - refunds_abs
+    pay_share = (payers * 100.0 / active_users) if active_users else 0.0
+    arpu = (net_rub / active_users) if active_users else 0.0
+    arppu = (net_rub / payers) if payers else 0.0
+    avg_check = (revenue_rub / payments_count) if payments_count else 0.0
+    refund_rate_pct = (refunds_count * 100.0 / payments_count) if payments_count else 0.0
+    text_requests = int(report.get("text_requests", 0) or 0)
+    image_requests = int(report.get("image_requests", 0) or 0)
+    text_credits = int(report.get("text_credits", 0) or 0)
+    image_credits = int(report.get("image_credits", 0) or 0)
+    total_credits = int(report.get("total_credits_spent", 0) or 0)
+    text_tokens = int(report.get("text_tokens", 0) or 0)
+    avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
+    estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
+    estimated_text_contribution_rub = net_rub - estimated_text_cost_rub
+    estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
+    text_cost_share_pct = (estimated_text_cost_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
+    referral_activations = int(report.get("referral_activations", 0) or 0)
+    referred_payers = int(report.get("referred_payers", 0) or 0)
+    referral_bonus_credits = int(report.get("referral_bonus_credits", 0) or 0)
+    referral_conversion_pct = (referred_payers * 100.0 / referral_activations) if referral_activations else 0.0
+
+    period_links = " ".join(
+        f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
+        for option in (7, 30, 90, 180)
+    )
+
+    plan_rows: list[str] = []
+    for row in report.get("plans", []):
+        plan_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('plan', '-') or '-').title())}</td>"
+            f"<td>{int(row.get('payments', 0) or 0)}</td>"
+            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
+            "</tr>"
+        )
+    if not plan_rows:
+        plan_rows.append("<tr><td colspan='3'>Платежей за выбранный период пока нет.</td></tr>")
+
+    top_referrer_rows: list[str] = []
+    for row in report.get("top_referrers", []):
+        cid = int(row.get("chat_id", 0) or 0)
+        top_referrer_rows.append(
+            "<tr>"
+            f"<td>{cid}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
+            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
+            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
+            f"<td>{esc(fmt_msk(row.get('last_referral_at')))}</td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            "</tr>"
+        )
+    if not top_referrer_rows:
+        top_referrer_rows.append("<tr><td colspan='7'>Пока нет успешных реферальных активаций.</td></tr>")
+
+    suspicious_referral_rows: list[str] = []
+    for row in report.get("suspicious_referrals", []):
+        cid = int(row.get("chat_id", 0) or 0)
+        suspicious_referral_rows.append(
+            "<tr>"
+            f"<td>{cid}</td>"
+            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
+            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
+            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
+            f"<td>{int(row.get('active_recent_referrals', 0) or 0)}</td>"
+            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            "</tr>"
+        )
+    if not suspicious_referral_rows:
+        suspicious_referral_rows.append("<tr><td colspan='7'>Подозрительных реферальных кластеров пока нет.</td></tr>")
+
+    economics_plan_rows: list[str] = []
+    unit_margin_rows: list[str] = []
+    for plan in ("lite", "start", "pro"):
+        amount, period_days = plan_price_and_days(plan)
+        credits = credits_for_plan(plan)
+        ratio = credits_per_rub(credits, amount)
+        daily_credits = credits / max(1, period_days)
+        models_text = {
+            "lite": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash",
+            "start": f"DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4 в режиме «Эксперт» до {PLAN_CONFIGS['start'].daily_gpt54_limit}/день",
+            "pro": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4",
+        }[plan]
+        economics_plan_rows.append(
+            "<tr>"
+            f"<td>{esc(plan.title())}</td>"
+            f"<td>{money(amount)} ₽</td>"
+            f"<td>{period_days}</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{daily_credits:.0f}</td>"
+            f"<td>{ratio}</td>"
+            f"<td>{esc(models_text)}</td>"
+            "</tr>"
+        )
+        econ = expected_unit_economics(amount, credits)
+        unit_margin_rows.append(
+            "<tr>"
+            f"<td>{esc(plan.title())}</td>"
+            f"<td>{money(amount)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
+            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['tax_rub'])} ₽</td>"
+            f"<td>{money(econ['margin_rub'])} ₽</td>"
+            f"<td>{econ['margin_pct']:.1f}%</td>"
+            "</tr>"
+        )
+
+    economics_pack_rows: list[str] = []
+    for code in ("small", "medium", "large"):
+        pack = TOPUP_PACKS[code]
+        credits = int(pack["credits"])
+        price_rub = int(pack["price_rub"])
+        economics_pack_rows.append(
+            "<tr>"
+            f"<td>{esc(str(pack['label']))}</td>"
+            f"<td>{money(price_rub)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{credits_per_rub(credits, price_rub)}</td>"
+            "</tr>"
+        )
+        econ = expected_unit_economics(price_rub, credits)
+        unit_margin_rows.append(
+            "<tr>"
+            f"<td>{esc(str(pack['label']))}</td>"
+            f"<td>{money(price_rub)} ₽</td>"
+            f"<td>{money(credits)}</td>"
+            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
+            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
+            f"<td>{money(econ['tax_rub'])} ₽</td>"
+            f"<td>{money(econ['margin_rub'])} ₽</td>"
+            f"<td>{econ['margin_pct']:.1f}%</td>"
+            "</tr>"
+        )
+
+    margin_rows: list[str] = []
+    for row in report.get("margins", []):
+        revenue = int(row.get("revenue_rub", 0) or 0)
+        text_cost = float(row.get("estimated_text_cost_rub", 0.0) or 0.0)
+        contribution = float(row.get("contribution_rub", 0.0) or 0.0)
+        if revenue <= 0 and text_cost <= 0:
+            continue
+        margin_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('plan', '-') or '-').title())}</td>"
+            f"<td>{money(revenue)} ₽</td>"
+            f"<td>{money(text_cost)} ₽</td>"
+            f"<td>{money(contribution)} ₽</td>"
+            f"<td>{float(row.get('margin_pct', 0.0) or 0.0):.1f}%</td>"
+            f"<td>{int(row.get('text_requests', 0) or 0)}</td>"
+            f"<td>{int(row.get('image_requests', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not margin_rows:
+        margin_rows.append("<tr><td colspan='7'>Пока недостаточно данных для оценки маржи по тарифам.</td></tr>")
+
+    models_rows: list[str] = []
+    for row in report.get("models", []):
+        label = str(row.get("label", "") or "-")
+        kind = str(row.get("kind", "") or "—")
+        requests_count = int(row.get("requests", 0) or 0)
+        tokens = int(row.get("tokens", 0) or 0)
+        credits = int(row.get("credits", 0) or 0)
+        avg_model_tokens = (tokens / requests_count) if requests_count else 0.0
+        estimated_cost_rub = float(row.get("estimated_cost_usd", 0.0) or 0.0) * ANALYTICS_USD_TO_RUB
+        estimated_cost_cell = f"{money(estimated_cost_rub)} ₽" if kind == "Текст" else "—"
+        models_rows.append(
+            "<tr>"
+            f"<td>{esc(label)}</td>"
+            f"<td>{esc(kind)}</td>"
+            f"<td>{requests_count}</td>"
+            f"<td>{money(tokens)}</td>"
+            f"<td>{money(avg_model_tokens)}</td>"
+            f"<td>{credits}</td>"
+            f"<td>{estimated_cost_cell}</td>"
+            "</tr>"
+        )
+    if not models_rows:
+        models_rows.append("<tr><td colspan='7'>Пока нет данных по моделям.</td></tr>")
+
+    daily_rows: list[str] = []
+    for row in report.get("daily", []):
+        daily_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('day', '-') or '-'))}</td>"
+            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
+            f"<td>{int(row.get('active_users', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not daily_rows:
+        daily_rows.append("<tr><td colspan='3'>За период пока нет дневных данных.</td></tr>")
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Аналитика бота</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+  <style>
+    .dash-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-top:16px; }}
+    .metric {{ border:1px solid var(--line); border-radius:16px; padding:16px; background:#fcfdff; }}
+    .metric-label {{ color:var(--muted); font-size:13px; margin-bottom:8px; }}
+    .metric-value {{ font-size:28px; font-weight:800; color:var(--text); }}
+    .metric-note {{ color:var(--muted); font-size:13px; margin-top:6px; }}
+    .panel-nav {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+    .table-card {{ margin-top:14px; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; vertical-align:top; }}
+    .muted {{ color:var(--muted); }}
+    code {{ background:#f3f6fb; border-radius:6px; padding:2px 6px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <span class="badge">Закрытая аналитика</span>
+        <span class="badge">Период: {int(report.get('days', days) or days)} дней</span>
+      </div>
+      <h1>Деньги и метрики</h1>
+      <p>Здесь удобно смотреть выручку, расход по моделям, рефералку и бумажную экономику проекта.</p>
+      <div class="panel-nav">
+        <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
+        <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
+      </div>
+      <div class="actions">{period_links}</div>
+      <div class="dash-grid">
+        <div class="metric"><div class="metric-label">Чистая выручка</div><div class="metric-value">{money(net_rub)} ₽</div><div class="metric-note">Выручка {money(revenue_rub)} ₽, возвраты {money(refunds_abs)} ₽</div></div>
+        <div class="metric"><div class="metric-label">Плательщики</div><div class="metric-value">{payers}</div><div class="metric-note">{pay_share:.1f}% от активных</div></div>
+        <div class="metric"><div class="metric-label">Активные пользователи</div><div class="metric-value">{active_users}</div><div class="metric-note">За выбранный период</div></div>
+        <div class="metric"><div class="metric-label">ARPU / ARPPU</div><div class="metric-value">{money(arpu)} / {money(arppu)} ₽</div><div class="metric-note">На активного и на платящего</div></div>
+        <div class="metric"><div class="metric-label">Средний чек</div><div class="metric-value">{money(avg_check)} ₽</div><div class="metric-note">{payments_count} оплат, refund rate {refund_rate_pct:.1f}%</div></div>
+        <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
+        <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Списано {image_credits} кредитов</div></div>
+        <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
+        <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">{text_cost_share_pct:.1f}% от чистой выручки</div></div>
+        <div class="metric"><div class="metric-label">Оценочная маржа</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, пока без image-cost</div></div>
+        <div class="metric"><div class="metric-label">Реф. активации</div><div class="metric-value">{referral_activations}</div><div class="metric-note">Реф. плательщики: {referred_payers}, конверсия {referral_conversion_pct:.1f}%</div></div>
+        <div class="metric"><div class="metric-label">Бонусы рефералки</div><div class="metric-value">{referral_bonus_credits}</div><div class="metric-note">Выдано кредитов по реферальной механике</div></div>
+      </div>
+    </div>
+    <div class="card table-card">
+      <h2>Выручка по тарифам</h2>
+      <table>
+        <tr><th>Тариф</th><th>Оплат</th><th>Выручка</th></tr>
+        {''.join(plan_rows)}
+      </table>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Топ рефереров</h2>
+        <table>
+          <tr><th>chat_id</th><th>user_id</th><th>Код</th><th>Пригласил</th><th>Платных</th><th>Последний реф</th><th></th></tr>
+          {''.join(top_referrer_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Подозрительные реф-кластеры</h2>
+        <p class="muted">Это не бан-лист, а очередь на проверку: много приглашений, но ноль платных, либо слишком плотная активность по рефералке.</p>
+        <table>
+          <tr><th>chat_id</th><th>user_id</th><th>Код</th><th>Пригласил</th><th>Активно за 14 дней</th><th>Платных</th><th></th></tr>
+          {''.join(suspicious_referral_rows)}
+        </table>
+      </div>
+    </div>
+    <div class="card table-card">
+      <h2>Экономика проекта</h2>
+      <p>Шпаргалка по текущей сетке: цены, кредиты, модели, бумажная маржа и допущения.</p>
+      <div class="grid">
+        <div class="card table-card">
+          <h3>Подписки</h3>
+          <table>
+            <tr><th>Тариф</th><th>Цена</th><th>Дней</th><th>Кредитов</th><th>Средне в день</th><th>Кр/₽</th><th>Модели</th></tr>
+            {''.join(economics_plan_rows)}
+          </table>
+        </div>
+        <div class="card table-card">
+          <h3>Пакеты кредитов</h3>
+          <table>
+            <tr><th>Пакет</th><th>Цена</th><th>Кредитов</th><th>Кр/₽</th></tr>
+            {''.join(economics_pack_rows)}
+          </table>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card table-card">
+          <h3>Free и лимиты</h3>
+          <p>Free: {FREE_DAILY_CREDITS} кредитов в день и 1 картинка каждые 7 дней.</p>
+          <p>Картинка: {image_credit_cost()} кредитов. Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.</p>
+          <p>Макс. переменная доплата за текст: {MAX_VARIABLE_CREDITS_PER_TEXT} кредита.</p>
+        </div>
+        <div class="card table-card">
+          <h3>Расчётные допущения</h3>
+          <p>Курс для аналитики: {money(ANALYTICS_USD_TO_RUB)} ₽ за $1.</p>
+          <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
+          <p>Для бумажной экономики используем: эквайринг {ANALYTICS_PAYMENT_FEE_PCT:.2f}%, Т-Чеки {ANALYTICS_RECEIPT_FEE_PCT:.2f}%, налог {ANALYTICS_TAX_PCT:.2f}%, ожидаемая себестоимость 1 кредита {ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB:.3f} ₽.</p>
+          <p class="muted">Настраивается через <code>ANALYTICS_USD_TO_RUB</code>, <code>ANALYTICS_PAYMENT_FEE_PCT</code>, <code>ANALYTICS_RECEIPT_FEE_PCT</code>, <code>ANALYTICS_TAX_PCT</code> и <code>ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB</code>.</p>
+        </div>
+      </div>
+      <div class="card table-card">
+        <h3>Ожидаемая юнит-экономика</h3>
+        <p>Стрессовый сценарий: считаем, что купленные кредиты будут полностью выбраны. Это помогает видеть, остаётся ли прибыль на бумаге ещё до масштабирования.</p>
+        <table>
+          <tr><th>Продукт</th><th>Цена</th><th>Кредитов</th><th>Себестоимость</th><th>Эквайринг</th><th>Т-Чеки</th><th>Налог</th><th>Маржа</th><th>Маржа %</th></tr>
+          {''.join(unit_margin_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h3>Маржа по тарифам</h3>
+        <p>Это управленческая оценка: выручка минус текстовая себестоимость по фактическим токенам. Картинки и платёжные комиссии в этот блок пока не включены.</p>
+        <table>
+          <tr><th>Тариф</th><th>Выручка</th><th>Себестоимость текста</th><th>Маржа</th><th>Маржа %</th><th>Текстов</th><th>Картинок</th></tr>
+          {''.join(margin_rows)}
+        </table>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Расход по моделям</h2>
+        <p>Для текстовых моделей считаем токены, кредиты и оценочную себестоимость. Для картинок в этой таблице стоимость не считаем, поэтому стоит «—».</p>
+        <table>
+          <tr><th>Модель</th><th>Тип</th><th>Запросов</th><th>Токенов</th><th>Ср./запрос</th><th>Кредитов</th><th>Себестоимость</th></tr>
+          {''.join(models_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Последние дни</h2>
+        <table>
+          <tr><th>День</th><th>Выручка</th><th>Активные</th></tr>
+          {''.join(daily_rows)}
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page(request: Request, token: str = "", days: int = 30) -> HTMLResponse:
     auth_token = resolve_admin_token(request, token)
     if not auth_token:
         return HTMLResponse(render_admin_login_html())
 
-    response = HTMLResponse(render_admin_analytics_html(token="", days=days))
+    response = HTMLResponse(render_admin_analytics_html_v2(token="", days=days))
     set_admin_cookie(response, auth_token)
     return response
 

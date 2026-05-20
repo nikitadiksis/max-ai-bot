@@ -84,6 +84,8 @@ These are important project-specific UX rules:
 - If a flow requests promo/ref code input, leaving that flow must clear pending input state
 - Payment flows should avoid duplicate “back” actions; every page should have access to `Меню`
 - Do not enable bonuses that cannot be verified honestly
+- Referral flow should support both `/ref CODE` and start-link activation when `BOT_PUBLIC_URL` is configured
+- Referral analytics should surface top referrers and suspicious invite clusters before adding any automated anti-fraud actions
 
 ## Payments
 
