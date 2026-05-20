@@ -2551,24 +2551,10 @@ def preset_available_aliases_for_plan(plan: str, preset: str) -> list[str]:
     return aliases
 
 
-def preset_available_labels_for_plan(plan: str, preset: str) -> list[str]:
-    labels: list[str] = []
-    seen: set[str] = set()
-    for alias in preset_available_aliases_for_plan(plan, preset):
-        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
-        if label in seen:
-            continue
-        seen.add(label)
-        labels.append(label)
-    return labels
-
-
 def preset_choice_enabled_for_plan(plan: str, preset: str) -> bool:
     if plan == "free":
         return False
-    current_aliases = preset_available_aliases_for_plan(plan, preset)
-    free_aliases = preset_available_aliases_for_plan("free", preset)
-    return len(current_aliases) > len(free_aliases)
+    return len(preset_available_aliases_for_plan(plan, preset)) > 1
 
 
 def current_preset_for_chat(chat_id: int) -> str:
@@ -2582,7 +2568,7 @@ def can_pick_models_for_current_preset(chat_id: int) -> bool:
     if not preset:
         return False
     plan = str(user_profile(chat_id).get("plan", "free"))
-    return preset_choice_enabled_for_plan(plan, preset) and len(preset_available_aliases_for_plan(plan, preset)) > 1
+    return preset_choice_enabled_for_plan(plan, preset)
 
 
 def preset_model_hint(alias: str) -> str:
@@ -2599,13 +2585,9 @@ def build_preset_block(plan: str) -> str:
     lines = ["🎛 Режимы ответов для вашего тарифа:"]
     for key in ("fast", "balanced", "quality", "expert"):
         cfg = MODEL_PRESETS[key]
-        if preset_choice_enabled_for_plan(plan, key):
-            labels = preset_available_labels_for_plan(plan, key)
-            lines.append(f"• {cfg['label']} — {cfg['description']} ({', '.join(labels)})")
-        else:
-            alias = resolve_preset_alias_for_plan(plan, key)
-            label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
-            lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
+        alias = resolve_preset_alias_for_plan(plan, key)
+        label = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL).label
+        lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
     lines.append("• 🎨 Картинка — отдельный режим для генерации и редактирования")
     return "\n".join(lines)
 
@@ -2774,9 +2756,12 @@ def parse_usage_tokens(data: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
-    models_button = {"type": "callback", "text": "Модели", "payload": "action:models"}
+    plan_buttons = [
+        {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
+        {"type": "callback", "text": "Мой план", "payload": "action:plan"},
+    ]
     if chat_id is not None and can_pick_models_for_current_preset(chat_id):
-        models_button = {"type": "callback", "text": "⚙ Модели режима", "payload": "action:preset_models"}
+        plan_buttons.append({"type": "callback", "text": "⚙ Модели режима", "payload": "action:preset_models"})
     return [
         {
             "type": "inline_keyboard",
@@ -2791,9 +2776,7 @@ def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
                         {"type": "callback", "text": "🚀 Эксперт", "payload": "set_preset:expert"},
                     ],
                     [
-                        {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
-                        {"type": "callback", "text": "Мой план", "payload": "action:plan"},
-                        models_button,
+                        *plan_buttons,
                     ],
                     [
                         {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
