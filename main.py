@@ -3687,6 +3687,14 @@ def channel_gate_text() -> str:
     )
 
 
+def channel_gate_setup_text(reason: str) -> str:
+    return (
+        "Канал почти подключен, но бот пока не может проверить подписку.\n\n"
+        "Мы уже видим проблему и настраиваем доступ. Попробуй нажать «Проверить подписку» чуть позже.\n\n"
+        f"Техническая причина: {reason}"
+    )
+
+
 def channel_gate_allows_payload(payload: str) -> bool:
     return payload in {"channel_gate:check", "action:channel", "action:support"}
 
@@ -5795,10 +5803,12 @@ async def show_channel_gate(
     callback_id: str | None = None,
     source_mid: str | None = None,
     notification: str = "Нужна подписка",
+    reason: str = "",
 ) -> None:
+    text = channel_gate_setup_text(reason) if reason.startswith(("config_", "api_")) else channel_gate_text()
     await show_managed_content(
         chat_id,
-        channel_gate_text(),
+        text,
         attachments=build_channel_gate_keyboard(),
         callback_id=callback_id,
         source_mid=source_mid,
@@ -5812,10 +5822,10 @@ async def ensure_channel_access(
     callback_id: str | None = None,
     source_mid: str | None = None,
 ) -> bool:
-    ok, _reason = await check_channel_subscription(chat_id, force=False)
+    ok, reason = await check_channel_subscription(chat_id, force=False)
     if ok:
         return True
-    await show_channel_gate(chat_id, callback_id=callback_id, source_mid=source_mid)
+    await show_channel_gate(chat_id, callback_id=callback_id, source_mid=source_mid, reason=reason)
     return False
 
 
@@ -5975,9 +5985,9 @@ async def send_growth_menu(chat_id: int) -> None:
 
 async def send_channel(chat_id: int) -> None:
     if CHANNEL_GATE_ENABLED:
-        subscribed, _ = await check_channel_subscription(chat_id, force=False)
+        subscribed, reason = await check_channel_subscription(chat_id, force=False)
         if not subscribed:
-            await show_channel_gate(chat_id, notification="Канал")
+            await show_channel_gate(chat_id, notification="Канал", reason=reason)
             return
     await send_managed_message(
         chat_id,
@@ -7089,6 +7099,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 callback_id=callback_id,
                 source_mid=source_mid,
                 notification="Подписка не найдена",
+                reason=reason,
             )
         return True
 
@@ -7338,13 +7349,14 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "action:channel":
         if CHANNEL_GATE_ENABLED:
-            subscribed, _ = await check_channel_subscription(chat_id, force=False)
+            subscribed, reason = await check_channel_subscription(chat_id, force=False)
             if not subscribed:
                 await show_channel_gate(
                     chat_id,
                     callback_id=callback_id,
                     source_mid=source_mid,
                     notification="Канал",
+                    reason=reason,
                 )
                 return True
         await show_managed_content(
