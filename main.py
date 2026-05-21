@@ -666,6 +666,21 @@ def max_share_url(text: str) -> str:
     return f"https://max.ru/:share?text={quote(str(text or ''), safe='')}"
 
 
+def referral_share_message_v2(code: str) -> str:
+    normalized = normalize_referral_code(code)
+    return (
+        "Попробуй моего AI-бота в MAX.\n"
+        f"Канал с обновлениями: {channel_url_value()}\n\n"
+        "Как активировать бонус:\n"
+        "1. Перейди в бота\n"
+        "2. Открой Меню → Бонусы\n"
+        "3. Нажми «Ввести реф-код»\n"
+        "4. Вставь код друга:\n"
+        f"`{normalized}`\n\n"
+        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
+    )
+
+
 def parse_date_ymd(value: str) -> date | None:
     raw = str(value or "").strip()
     if not raw:
@@ -3050,7 +3065,7 @@ def build_growth_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
     if chat_id:
         row = user_profile(chat_id)
         code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
-        share_button = {"type": "link", "text": "🔗 Поделиться", "url": max_share_url(referral_share_message(code))}
+        share_button = {"type": "link", "text": "🔗 Поделиться", "url": max_share_url(referral_share_message_v2(code))}
     else:
         share_button = {"type": "callback", "text": "🔗 Поделиться", "payload": "growth:ref_share"}
     return [
@@ -5132,6 +5147,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
             "Обновления и кейсы: в нашем канале."
         )
+        text = text.replace("Ты приглашен по реф-коду: да\n", "").replace("Ты приглашен по реф-коду: нет\n", "")
         return text, build_growth_keyboard(chat_id)
     if page == UI_PAGE_SUPPORT:
         return support_help_text(), build_keyboard(chat_id)
@@ -5333,6 +5349,7 @@ async def send_growth_menu(chat_id: int) -> None:
         f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
         "Обновления и кейсы: в нашем канале."
     )
+    text = text.replace("Ты приглашен по реф-коду: да\n", "").replace("Ты приглашен по реф-коду: нет\n", "")
     await send_managed_message(chat_id, text, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
 
 
