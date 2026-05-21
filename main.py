@@ -143,7 +143,6 @@ SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши на�
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
-BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").strip().rstrip("/")
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
 PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "0"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
@@ -337,57 +336,27 @@ ADMIN_HELP_TEXT = (
     "/id — твой chat_id и user_id"
 )
 
-TARIFFS_TEXT = (
-    "Тарифы:\n"
-    "• free: дневной бонус кредитов\n"
-    "• lite/start/pro: доступ по кредитам\n\n"
-    "Модели по тарифам:\n"
-    "• **Free**: DeepSeek V4 Flash, GPT-4.1 Nano\n"
-    "• **Lite / Start**: + GPT-4o Mini и Gemini 2.5 Flash\n"
-    "• **Pro**: + GPT-5.4"
-)
-
-BUY_TEXT = (
-    "Покупка (пока в ручном режиме):\n"
-    "/buy lite — заявка на Lite\n"
-    "/buy start — заявка на Start\n"
-    "/buy pro — заявка на Pro\n"
-    "/payments — мои заявки\n\n"
-    "После заявки админ подтверждает оплату и активирует подписку."
-)
-
-
 @dataclass(slots=True)
 class PlanInfo:
     name: str
-    daily_messages_limit: int
-    daily_images_limit: int
     daily_gpt54_limit: int
 
 
 PLAN_CONFIGS = {
     "free": PlanInfo(
         name="free",
-        daily_messages_limit=0,
-        daily_images_limit=0,
         daily_gpt54_limit=0,
     ),
     "lite": PlanInfo(
         name="lite",
-        daily_messages_limit=0,
-        daily_images_limit=0,
         daily_gpt54_limit=0,
     ),
     "start": PlanInfo(
         name="start",
-        daily_messages_limit=0,
-        daily_images_limit=0,
         daily_gpt54_limit=START_DAILY_GPT54_LIMIT,
     ),
     "pro": PlanInfo(
         name="pro",
-        daily_messages_limit=0,
-        daily_images_limit=0,
         daily_gpt54_limit=PRO_DAILY_GPT54_LIMIT,
     ),
 }
@@ -605,34 +574,6 @@ def is_referral_code(value: str) -> bool:
     return code.startswith("RF") and len(code) >= 8
 
 
-def bot_public_url_value() -> str:
-    return BOT_PUBLIC_URL
-
-
-def referral_deep_link(code: str) -> str:
-    normalized = normalize_referral_code(code)
-    base = bot_public_url_value()
-    if not base or not is_referral_code(normalized):
-        return ""
-    return f"{base}?start={normalized}"
-
-
-def referral_share_message(code: str) -> str:
-    normalized = normalize_referral_code(code)
-    link = referral_deep_link(normalized)
-    if link:
-        return (
-            "Попробуй моего AI-бота в MAX.\n"
-            f"Стартовая ссылка: {link}\n"
-            f"После запуска тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
-        )
-    return (
-        "Попробуй моего AI-бота в MAX.\n"
-        f"Когда зайдёшь, отправь в боте: /ref {normalized}\n"
-        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
-    )
-
-
 def parse_start_payload(update: dict[str, Any]) -> str:
     candidates: list[Any] = [
         update.get("payload"),
@@ -697,16 +638,6 @@ def acquisition_meta_from_start_payload(update: dict[str, Any]) -> tuple[str, st
     source = re.sub(r"[^a-z0-9_-]", "", source)[:32]
     campaign = re.sub(r"[^a-z0-9_-]", "", campaign)[:48]
     return source, campaign
-
-
-def referral_share_message(code: str) -> str:
-    normalized = normalize_referral_code(code)
-    return (
-        "Попробуй моего AI-бота в MAX.\n"
-        f"Канал с обновлениями: {channel_url_value()}\n"
-        f"После запуска бота введи: /ref {normalized}\n"
-        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
-    )
 
 
 def max_share_url(text: str) -> str:
@@ -2174,6 +2105,40 @@ class UserStore:
                 """,
                 (since, since),
             ).fetchall()
+            promo_code_rows = conn.execute(
+                """
+                WITH promo_base AS (
+                    SELECT chat_id, promo_code, credits, created_at
+                    FROM promo_activations
+                    WHERE created_at >= ?
+                ),
+                promo_payments AS (
+                    SELECT
+                        pb.promo_code,
+                        pb.chat_id,
+                        SUM(CASE WHEN e.event_type = 'payment' AND e.rub_amount > 0 THEN e.rub_amount ELSE 0 END) AS revenue_rub
+                    FROM promo_base pb
+                    LEFT JOIN usage_events e
+                      ON e.chat_id = pb.chat_id
+                     AND e.created_at >= pb.created_at
+                    GROUP BY pb.promo_code, pb.chat_id
+                )
+                SELECT
+                    pb.promo_code,
+                    COUNT(DISTINCT pb.chat_id) AS activations,
+                    SUM(pb.credits) AS credits,
+                    SUM(CASE WHEN COALESCE(pp.revenue_rub, 0) > 0 THEN 1 ELSE 0 END) AS paid_users,
+                    SUM(COALESCE(pp.revenue_rub, 0)) AS revenue_rub
+                FROM promo_base pb
+                LEFT JOIN promo_payments pp
+                  ON pp.promo_code = pb.promo_code
+                 AND pp.chat_id = pb.chat_id
+                GROUP BY pb.promo_code
+                ORDER BY revenue_rub DESC, paid_users DESC, activations DESC
+                LIMIT 20
+                """,
+                (since,),
+            ).fetchall()
             cohort_rows = conn.execute(
                 """
                 SELECT chat_id, COALESCE(NULLIF(acquired_at, ''), created_at) AS cohort_at
@@ -2365,6 +2330,7 @@ class UserStore:
                 "top_referrers": top_referrers,
                 "suspicious_referrals": suspicious_referrals,
                 "sources": [dict(row) for row in source_rows],
+                "promo_codes": [dict(row) for row in promo_code_rows],
                 "top_screens": top_screens,
                 "top_presets": top_presets,
             }
@@ -3769,8 +3735,6 @@ def image_availability_text(chat_id: int) -> str:
         )
         return "На тарифе Free: доступна 1 картинка каждые 7 дней."
 
-    return "На платных тарифах картинки доступны по кредитам, без дневного лимита."
-
 
 def build_image_menu_text(chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
@@ -3842,84 +3806,6 @@ def build_image_prompt(user_text: str, chat_id: int) -> str:
     if not instructions:
         return user_text
     return f"{user_text}\n\nStyle constraints: {', '.join(instructions)}."
-
-
-def build_tariffs_keyboard() -> list[dict[str, Any]]:
-    return build_tariffs_keyboard_pricing()
-
-
-def build_tariffs_keyboard_v2() -> list[dict[str, Any]]:
-    buy_row_1: list[dict[str, Any]] = [
-        {"type": "callback", "text": "Купить Lite", "payload": "buy:lite"},
-        {"type": "callback", "text": "Купить Start", "payload": "buy:start"},
-    ]
-    buy_row_2: list[dict[str, Any]] = [
-        {"type": "callback", "text": "Купить Pro", "payload": "buy:pro"},
-    ]
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {
-                "buttons": [
-                    buy_row_1,
-                    buy_row_2,
-                    [
-                        {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
-                        {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
-                    ],
-                    [
-                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
-                    ],
-                ]
-            },
-        }
-    ]
-
-
-def build_payment_request_keyboard(request_id: int, payment_url: str = "") -> list[dict[str, Any]]:
-    buttons: list[list[dict[str, Any]]] = []
-    buttons.append([{"type": "callback", "text": "Проверить статус", "payload": f"payment_status:{request_id}"}])
-    buttons.append([{"type": "callback", "text": "Я оплатил", "payload": f"paid:{request_id}"}])
-    buttons.append(
-        [
-            {"type": "callback", "text": "Меню", "payload": "action:menu"},
-            {"type": "callback", "text": "Помощь", "payload": "action:support"},
-        ]
-    )
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {"buttons": buttons},
-        }
-    ]
-
-
-def build_payments_keyboard(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    buttons: list[list[dict[str, Any]]] = []
-    for item in rows[:5]:
-        request_id = int(item.get("id", 0) or 0)
-        if request_id <= 0:
-            continue
-        status = str(item.get("status", "")).lower()
-        if status in {"pending", "claimed"}:
-            buttons.append(
-                [
-                    {
-                        "type": "callback",
-                        "text": f"Проверить #{request_id}",
-                        "payload": f"payment_status:{request_id}",
-                    }
-                ]
-            )
-
-    buttons.append(
-        [
-            {"type": "callback", "text": "Меню", "payload": "action:menu"},
-            {"type": "callback", "text": "Помощь", "payload": "action:support"},
-        ]
-    )
-    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
 def build_quick_topup_keyboard(code: str) -> list[dict[str, Any]]:
@@ -4668,12 +4554,6 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
                 )
             return True, ""
 
-        daily_limit = int(cfg.daily_images_limit or 0)
-        if daily_limit > 0:
-            used = int(row.get("daily_images_used", 0) or 0)
-            if used >= daily_limit:
-                left = max(0, daily_limit - used)
-                return False, f"Лимит картинок на сегодня исчерпан: {used}/{daily_limit} (осталось {left})."
         return True, ""
 
     return True, ""
@@ -5470,19 +5350,40 @@ def build_topups_text() -> str:
     )
 
 
-def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
-    rows = state.user_store.list_user_payments(chat_id, limit=8)
-    if not rows:
-        return "Заявок пока нет. Используй кнопку «Тарифы».", build_keyboard()
-    lines = ["Мои оплаты:"]
-    for item in rows:
-        status = str(item["status"]).lower()
-        status_human = payment_status_label(status)
+def active_promo_lines() -> list[str]:
+    promo_items = sorted(promo_catalog().items())
+    lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
+    channel = channel_promo_meta()
+    if channel["enabled"] and channel["active"]:
         lines.append(
-            f"#{item['id']} • {item['plan']} • {item['amount_rub']} ₽ • {status_human}"
+            f"• {channel['code']}: +{channel['credits']} кредитов "
+            f"(акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
         )
-    lines.append("\nНажми «Проверить #...», чтобы обновить статус.")
-    return "\n".join(lines), build_payments_keyboard(rows)
+    return lines
+
+
+def build_growth_text(chat_id: int, row: dict[str, Any] | None = None) -> str:
+    data = row or user_profile(chat_id)
+    referral_code = str(data.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+    invited = int(data.get("referrals_invited", 0) or 0)
+    promo_lines = active_promo_lines()
+    promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
+    welcome_line = (
+        f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+        if PROMO_WELCOME_CREDITS > 0
+        else ""
+    )
+    return (
+        "🎁 Бонусы и приглашения\n\n"
+        f"Твой реф-код: {referral_code}\n"
+        f"Приглашено друзей: {invited}\n"
+        f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
+        "Кнопка «Поделиться» откроет готовый текст приглашения.\n\n"
+        "Промокоды из канала и акций:\n"
+        f"{promo_block}\n\n"
+        f"{welcome_line}"
+        "Если в канале опубликован код, нажми «Промокод» и введи его здесь."
+    )
 
 
 def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, Any]]]:
@@ -5516,43 +5417,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
     if page == UI_PAGE_PAYMENTS:
         return build_payments_text(chat_id)
     if page == UI_PAGE_GROWTH:
-        referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
-        invited = int(row.get("referrals_invited", 0) or 0)
-        referred_by = int(row.get("referred_by_chat_id", 0) or 0)
-        promo_items = sorted(promo_catalog().items())
-        promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
-        channel = channel_promo_meta()
-        channel_block = "Бонус за подписку на канал пока отключен: в боте еще нет честной автопроверки подписки."
-        if channel["enabled"]:
-            if channel["active"]:
-                promo_lines.append(
-                    f"• {channel['code']}: +{channel['credits']} кредитов (акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
-                )
-                channel_block = (
-                    f"Бонус за канал: +{channel['credits']} кредитов.\n"
-                    f"Срок акции: еще {channel['days_left']} дн.\n"
-                    f"Срок бонуса: {channel['bonus_ttl_days']} дн.\n"
-                    "Автопроверка подписки пока не подключена, поэтому выдача бонуса отключена."
-                )
-            else:
-                promo_lines.append(f"• {channel['code']}: акция завершена")
-                channel_block = "Акция с бонусом за канал уже завершена."
-        promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
-        text = (
-            "🎁 Бонусы и приглашения\n\n"
-            f"Твой реф-код: {referral_code}\n"
-            f"Приглашено друзей: {invited}\n"
-            f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
-            f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-            "Нажми «Поделиться», чтобы открыть шторку MAX с готовым приглашением.\n\n"
-            f"{channel_block}\n\n"
-            "Доступные промокоды:\n"
-            f"{promo_block}\n\n"
-            f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
-            "Обновления и кейсы: в нашем канале."
-        )
-        text = text.replace("Ты приглашен по реф-коду: да\n", "").replace("Ты приглашен по реф-коду: нет\n", "")
-        return text, build_growth_keyboard(chat_id)
+        return build_growth_text(chat_id, row), build_growth_keyboard(chat_id)
     if page == UI_PAGE_SUPPORT:
         return support_help_text(), build_keyboard(chat_id)
     if page == UI_PAGE_IMAGE_MENU:
@@ -5731,35 +5596,12 @@ async def close_onboarding_message(chat_id: int, source_mid: str | None, text: s
 
 
 async def send_growth_menu(chat_id: int) -> None:
-    row = user_profile(chat_id)
-    referral_code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
-    invited = int(row.get("referrals_invited", 0) or 0)
-    referred_by = int(row.get("referred_by_chat_id", 0) or 0)
-    promo_items = sorted(promo_catalog().items())
-    promo_lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
-    channel = channel_promo_meta()
-    if channel["enabled"]:
-        if channel["active"]:
-            promo_lines.append(
-                f"• {channel['code']}: +{channel['credits']} кредитов (акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
-            )
-        else:
-            promo_lines.append(f"• {channel['code']}: акция завершена")
-    promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
-    text = (
-        "🎁 Бонусы и приглашения\n\n"
-        f"Твой реф-код: {referral_code}\n"
-        f"Приглашено друзей: {invited}\n"
-        f"Ты приглашен по реф-коду: {'да' if referred_by > 0 else 'нет'}\n"
-        f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
-        "Нажми «Поделиться», чтобы открыть шторку MAX с готовым приглашением.\n\n"
-        "Доступные промокоды:\n"
-        f"{promo_block}\n\n"
-        f"{f'Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\\n' if PROMO_WELCOME_CREDITS > 0 else ''}"
-        "Обновления и кейсы: в нашем канале."
+    await send_managed_message(
+        chat_id,
+        build_growth_text(chat_id),
+        attachments=build_growth_keyboard(chat_id),
+        page=UI_PAGE_GROWTH,
     )
-    text = text.replace("Ты приглашен по реф-коду: да\n", "").replace("Ты приглашен по реф-коду: нет\n", "")
-    await send_managed_message(chat_id, text, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
 
 
 async def send_channel(chat_id: int) -> None:
@@ -7176,12 +7018,12 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "growth:channel_bonus":
         await show_managed_content(
             chat_id,
-            "Бонус за подписку на канал пока отключен: в боте еще нет честной автопроверки подписки.",
+            "Промокоды из канала активируются через кнопку «Промокод». Если в канале опубликован код, введи его здесь.",
             attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
             source_mid=source_mid,
             page=UI_PAGE_GROWTH,
-            notification="Бонус пока недоступен",
+            notification="Промокоды",
         )
         return True
 
@@ -7836,15 +7678,13 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not arg:
             code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
             invited = int(row.get("referrals_invited", 0) or 0)
-            referral_link = referral_deep_link(code)
             await max_send_message(
                 chat_id,
                 (
                     f"👥 Твой реф-код: {code}\n"
-                    f"{f'Ссылка другу: {referral_link}\\n' if referral_link else ''}"
                     f"Приглашено друзей: {invited}\n"
                     f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
-                    f"{'Другу можно отправить стартовую ссылку выше.' if referral_link else f'Другу нужно отправить: /ref {code}'}"
+                    "Нажми «Поделиться» или попроси друга открыть Меню → Бонусы → Ввести реф-код."
                 ),
                 attachments=build_growth_keyboard(chat_id),
             )
@@ -7873,6 +7713,14 @@ async def handle_command(chat_id: int, text: str) -> bool:
         if not ok:
             await max_send_message(chat_id, info, attachments=build_growth_keyboard(chat_id))
             return True
+        state.user_store.set_acquisition_meta(chat_id, source="promo", campaign=code)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="promo_activation",
+            plan=str(row.get("plan", "")),
+            credits_spent=int(info),
+            details=f"code={code};source=command",
+        )
         ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
         await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard(chat_id))
         return True
@@ -8072,6 +7920,15 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
     if not ok:
         await show_managed_content(chat_id, info, attachments=build_growth_keyboard(chat_id), page=UI_PAGE_GROWTH)
         return True
+    state.user_store.set_acquisition_meta(chat_id, source="promo", campaign=code)
+    row = user_profile(chat_id)
+    state.user_store.record_usage_event(
+        chat_id=chat_id,
+        event_type="promo_activation",
+        plan=str(row.get("plan", "")),
+        credits_spent=int(info),
+        details=f"code={code};source=input",
+    )
     ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
     await show_managed_content(
         chat_id,
@@ -8598,473 +8455,6 @@ def render_admin_login_html(error: str = "") -> str:
 </html>"""
 
 
-def render_admin_analytics_html(token: str, days: int = 30) -> str:
-    report = state.user_store.kpi_report(days=days)
-    esc = html.escape
-
-    def money(value: int | float) -> str:
-        return f"{int(round(value)):,}".replace(",", " ")
-
-    def credits_per_rub(credits: int, price_rub: int) -> str:
-        if price_rub <= 0:
-            return "0.00"
-        return f"{credits / float(price_rub):.2f}"
-
-    active_users = int(report.get("active_users", 0) or 0)
-    payers = int(report.get("payers", 0) or 0)
-    revenue_rub = int(report.get("revenue_rub", 0) or 0)
-    refunds_raw = int(report.get("refunds_rub", 0) or 0)
-    refunds_abs = abs(refunds_raw)
-    payments_count = int(report.get("payments_count", 0) or 0)
-    refunds_count = int(report.get("refunds_count", 0) or 0)
-    net_rub = revenue_rub + refunds_raw if refunds_raw < 0 else revenue_rub - refunds_abs
-    pay_share = (payers * 100.0 / active_users) if active_users else 0.0
-    arpu = (net_rub / active_users) if active_users else 0.0
-    arppu = (net_rub / payers) if payers else 0.0
-    avg_check = (revenue_rub / payments_count) if payments_count else 0.0
-    refund_rate_pct = (refunds_count * 100.0 / payments_count) if payments_count else 0.0
-    text_requests = int(report.get("text_requests", 0) or 0)
-    image_requests = int(report.get("image_requests", 0) or 0)
-    referral_activations = int(report.get("referral_activations", 0) or 0)
-    referred_payers = int(report.get("referred_payers", 0) or 0)
-    referral_bonus_credits = int(report.get("referral_bonus_credits", 0) or 0)
-    text_credits = int(report.get("text_credits", 0) or 0)
-    image_credits = int(report.get("image_credits", 0) or 0)
-    total_credits = int(report.get("total_credits_spent", 0) or 0)
-    text_tokens = int(report.get("text_tokens", 0) or 0)
-    avg_tokens = (text_tokens / text_requests) if text_requests else 0.0
-    referral_conversion_pct = (referred_payers * 100.0 / referral_activations) if referral_activations else 0.0
-    estimated_text_cost_rub = float(report.get("estimated_text_cost_rub", 0.0) or 0.0)
-    estimated_text_contribution_rub = net_rub - estimated_text_cost_rub
-    estimated_text_margin_pct = (estimated_text_contribution_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
-    text_cost_share_pct = (estimated_text_cost_rub * 100.0 / net_rub) if net_rub > 0 else 0.0
-
-    economics_plan_rows = []
-    unit_margin_rows = []
-    for plan in ("lite", "start", "pro"):
-        amount, period_days = plan_price_and_days(plan)
-        credits = credits_for_plan(plan)
-        ratio = credits_per_rub(credits, amount)
-        daily_credits = credits / max(1, period_days)
-        models_text = {
-            "lite": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash",
-            "start": f"DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4 в «Эксперт» до {PLAN_CONFIGS['start'].daily_gpt54_limit}/день",
-            "pro": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4",
-        }[plan]
-        economics_plan_rows.append(
-            "<tr>"
-            f"<td>{esc(plan)}</td>"
-            f"<td>{money(amount)} ₽</td>"
-            f"<td>{period_days}</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{daily_credits:.0f}</td>"
-            f"<td>{ratio}</td>"
-            f"<td>{esc(models_text)}</td>"
-            "</tr>"
-        )
-        econ = expected_unit_economics(amount, credits)
-        unit_margin_rows.append(
-            "<tr>"
-            f"<td>{esc(plan)}</td>"
-            f"<td>{money(amount)} ₽</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
-            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
-            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
-            f"<td>{money(econ['tax_rub'])} ₽</td>"
-            f"<td>{money(econ['margin_rub'])} ₽</td>"
-            f"<td>{econ['margin_pct']:.1f}%</td>"
-            "</tr>"
-        )
-
-    economics_pack_rows = []
-    for code in ("small", "medium", "large"):
-        pack = TOPUP_PACKS[code]
-        credits = int(pack["credits"])
-        price_rub = int(pack["price_rub"])
-        economics_pack_rows.append(
-            "<tr>"
-            f"<td>{esc(str(pack['label']))}</td>"
-            f"<td>{money(price_rub)} ₽</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{credits_per_rub(credits, price_rub)}</td>"
-            "</tr>"
-        )
-        econ = expected_unit_economics(price_rub, credits)
-        unit_margin_rows.append(
-            "<tr>"
-            f"<td>{esc(str(pack['label']))}</td>"
-            f"<td>{money(price_rub)} ₽</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
-            f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
-            f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
-            f"<td>{money(econ['tax_rub'])} ₽</td>"
-            f"<td>{money(econ['margin_rub'])} ₽</td>"
-            f"<td>{econ['margin_pct']:.1f}%</td>"
-            "</tr>"
-        )
-
-    margin_rows = []
-    for row in report.get("margins", []):
-        revenue = int(row.get("revenue_rub", 0) or 0)
-        text_cost = float(row.get("estimated_text_cost_rub", 0.0) or 0.0)
-        contribution = float(row.get("contribution_rub", 0.0) or 0.0)
-        if revenue <= 0 and text_cost <= 0:
-            continue
-        margin_rows.append(
-            "<tr>"
-            f"<td>{esc(str(row.get('plan', '-') or '-'))}</td>"
-            f"<td>{money(revenue)} ₽</td>"
-            f"<td>{money(text_cost)} ₽</td>"
-            f"<td>{money(contribution)} ₽</td>"
-            f"<td>{float(row.get('margin_pct', 0.0) or 0.0):.1f}%</td>"
-            f"<td>{int(row.get('text_requests', 0) or 0)}</td>"
-            f"<td>{int(row.get('image_requests', 0) or 0)}</td>"
-            "</tr>"
-        )
-    if not margin_rows:
-        margin_rows.append("<tr><td colspan='7'>Пока недостаточно данных для оценки маржи по тарифам.</td></tr>")
-
-    period_links = " ".join(
-        f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
-        for option in (7, 30, 90, 180)
-    )
-
-    models_rows = []
-    for row in report.get("models", []):
-        label = str(row.get("label", "") or "-")
-        kind = str(row.get("kind", "") or "—")
-        requests_count = int(row.get("requests", 0) or 0)
-        tokens = int(row.get("tokens", 0) or 0)
-        credits = int(row.get("credits", 0) or 0)
-        avg_model_tokens = (tokens / requests_count) if requests_count else 0.0
-        estimated_cost_rub = float(row.get("estimated_cost_usd", 0.0) or 0.0) * ANALYTICS_USD_TO_RUB
-        estimated_cost_cell = f"{money(estimated_cost_rub)} ₽" if kind == "Текст" else "—"
-        models_rows.append(
-            "<tr>"
-            f"<td>{esc(label)}</td>"
-            f"<td>{esc(kind)}</td>"
-            f"<td>{requests_count}</td>"
-            f"<td>{money(tokens)}</td>"
-            f"<td>{money(avg_model_tokens)}</td>"
-            f"<td>{credits}</td>"
-            f"<td>{estimated_cost_cell}</td>"
-            "</tr>"
-        )
-    if not models_rows:
-        models_rows.append("<tr><td colspan='7'>Пока нет данных по моделям.</td></tr>")
-
-    plan_rows = []
-    for row in report.get("plans", []):
-        plan_rows.append(
-            "<tr>"
-            f"<td>{esc(str(row.get('plan', '-') or '-'))}</td>"
-            f"<td>{int(row.get('payments', 0) or 0)}</td>"
-            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
-            "</tr>"
-        )
-    if not plan_rows:
-        plan_rows.append("<tr><td colspan='3'>Платежей за выбранный период пока нет.</td></tr>")
-
-    daily_rows = []
-    for row in report.get("daily", []):
-        daily_rows.append(
-            "<tr>"
-            f"<td>{esc(str(row.get('day', '-') or '-'))}</td>"
-            f"<td>{money(int(row.get('revenue', 0) or 0))} ₽</td>"
-            f"<td>{int(row.get('active_users', 0) or 0)}</td>"
-            "</tr>"
-        )
-    if not daily_rows:
-        daily_rows.append("<tr><td colspan='3'>За период пока нет дневных данных.</td></tr>")
-
-    return f"""<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Аналитика бота</title>
-  <link rel="stylesheet" href="/assets/style.css"/>
-  <style>
-    .dash-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-top:16px; }}
-    .metric {{ border:1px solid var(--line); border-radius:16px; padding:16px; background:#fcfdff; }}
-    .metric-label {{ color:var(--muted); font-size:13px; margin-bottom:8px; }}
-    .metric-value {{ font-size:28px; font-weight:800; color:var(--text); }}
-    .metric-note {{ color:var(--muted); font-size:13px; margin-top:6px; }}
-    .panel-nav {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
-    .table-card {{ margin-top:14px; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <div class="top">
-        <span class="badge">Закрытая аналитика</span>
-        <span class="badge">Период: {int(report.get('days', days) or days)} дней</span>
-      </div>
-      <h1>Деньги и метрики</h1>
-      <p>Здесь можно быстро смотреть выручку, плательщиков, нагрузку на модели и общую экономику проекта.</p>
-      <div class="panel-nav">
-        <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
-        <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
-        <a class="btn" href="{esc(admin_url('/status', token))}">Статус</a>
-        <a class="btn" href="{esc(admin_url('/health/deep', token))}">Deep health JSON</a>
-        <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
-      </div>
-      <div class="actions">{period_links}</div>
-      <div class="dash-grid">
-        <div class="metric"><div class="metric-label">Чистая выручка</div><div class="metric-value">{money(net_rub)} ₽</div><div class="metric-note">Выручка {money(revenue_rub)} ₽, возвраты {money(refunds_abs)} ₽</div></div>
-        <div class="metric"><div class="metric-label">Плательщики</div><div class="metric-value">{payers}</div><div class="metric-note">{pay_share:.1f}% от активных</div></div>
-        <div class="metric"><div class="metric-label">Активные пользователи</div><div class="metric-value">{active_users}</div><div class="metric-note">За выбранный период</div></div>
-        <div class="metric"><div class="metric-label">ARPU / ARPPU</div><div class="metric-value">{money(arpu)} / {money(arppu)} ₽</div><div class="metric-note">На активного и на платящего</div></div>
-        <div class="metric"><div class="metric-label">Средний чек</div><div class="metric-value">{money(avg_check)} ₽</div><div class="metric-note">{payments_count} оплат, refund rate {refund_rate_pct:.1f}%</div></div>
-        <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
-        <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Израсходовано {image_credits} кредитов</div></div>
-        <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
-        <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">Оценка по токенам и прайсам моделей, {text_cost_share_pct:.1f}% от чистой выручки</div></div>
-        <div class="metric"><div class="metric-label">Маржа после текста</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, без учёта image-cost</div></div>
-        <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Воронка</h2>
-        <table>
-          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
-          {''.join(funnel_rows)}
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Монетизация</h2>
-        <table>
-          <tr><th>Показатель</th><th>Значение</th></tr>
-          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
-          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
-          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
-          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
-          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
-          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
-        </table>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Воронка</h2>
-        <table>
-          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
-          <tr><td>Новые пользователи</td><td>{new_users}</td><td>за {int(report.get('days', days) or days)} дней</td></tr>
-          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
-          <tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>
-          <tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>
-          <tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Монетизация</h2>
-        <table>
-          <tr><th>Показатель</th><th>Значение</th></tr>
-          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
-          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
-          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
-          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
-          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
-          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
-        </table>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Retention и конверсия</h2>
-        <table>
-          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
-          <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
-          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
-          <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
-          <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Навигация и режимы</h2>
-        <div class="grid">
-          <div>
-            <table>
-              <tr><th>Экран</th><th>Просмотров</th></tr>
-              {''.join(screen_rows)}
-            </table>
-          </div>
-          <div>
-            <table>
-              <tr><th>Режим</th><th>Выборов</th></tr>
-              {''.join(preset_rows)}
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Воронка</h2>
-        <table>
-          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
-          <tr><td>Новые пользователи</td><td>{new_users}</td><td>за {int(report.get('days', days) or days)} дней</td></tr>
-          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
-          <tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>
-          <tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>
-          <tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Монетизация</h2>
-        <table>
-          <tr><th>Показатель</th><th>Значение</th></tr>
-          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
-          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
-          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
-          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
-          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
-          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
-        </table>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Retention и конверсия</h2>
-        <table>
-          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
-          <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
-          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
-          <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
-          <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Навигация и режимы</h2>
-        <div class="grid">
-          <div>
-            <table>
-              <tr><th>Экран</th><th>Просмотров</th></tr>
-              {''.join(screen_rows)}
-            </table>
-          </div>
-          <div>
-            <table>
-              <tr><th>Режим</th><th>Выборов</th></tr>
-              {''.join(preset_rows)}
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="card table-card">
-      <h2>Retention и конверсия</h2>
-      <table>
-        <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
-        <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
-        <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
-        <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
-        <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
-      </table>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Навигация</h2>
-        <table>
-          <tr><th>Экран</th><th>Просмотров</th></tr>
-          {''.join(screen_rows)}
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Режимы ответов</h2>
-        <table>
-          <tr><th>Режим</th><th>Выборов</th></tr>
-          {''.join(preset_rows)}
-        </table>
-      </div>
-    </div>
-    <div class="card table-card">
-      <h2>Выручка по тарифам</h2>
-      <table>
-        <tr><th>Тариф</th><th>Оплат</th><th>Выручка</th></tr>
-        {''.join(plan_rows)}
-      </table>
-    </div>
-    <div class="card table-card">
-      <h2>Экономика проекта</h2>
-      <p>Закрытая шпаргалка по текущей сетке. Здесь удобно держать опорные цифры: цены, кредиты, модели и курс для оценки себестоимости.</p>
-      <div class="grid">
-        <div class="card table-card">
-          <h3>Подписки</h3>
-          <table>
-            <tr><th>Тариф</th><th>Цена</th><th>Дней</th><th>Кредитов</th><th>В день</th><th>Кр/₽</th><th>Модели</th></tr>
-            {''.join(economics_plan_rows)}
-          </table>
-        </div>
-        <div class="card table-card">
-          <h3>Пакеты кредитов</h3>
-          <table>
-            <tr><th>Пакет</th><th>Цена</th><th>Кредитов</th><th>Кр/₽</th></tr>
-            {''.join(economics_pack_rows)}
-          </table>
-          <p>Подписки должны быть выгоднее пакетов по курсу кредитов. Сейчас ориентир соблюдается относительно Small/Medium/Large.</p>
-        </div>
-      </div>
-      <div class="grid">
-        <div class="card table-card">
-          <h3>Free и лимиты</h3>
-          <p>Free: {FREE_DAILY_CREDITS} кредитов в день и 1 картинка каждые 7 дней.</p>
-          <p>Картинка: {image_credit_cost()} кредитов. Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.</p>
-          <p>Макс. переменная доплата за текст: {MAX_VARIABLE_CREDITS_PER_TEXT} кредита.</p>
-        </div>
-        <div class="card table-card">
-          <h3>Расчётные допущения</h3>
-          <p>Курс для аналитики: {money(ANALYTICS_USD_TO_RUB)} ₽ за $1.</p>
-          <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
-          <p>Для бумажной экономики используем: эквайринг {ANALYTICS_PAYMENT_FEE_PCT:.2f}%, Т-Чеки {ANALYTICS_RECEIPT_FEE_PCT:.2f}%, налог {ANALYTICS_TAX_PCT:.2f}%, ожидаемая себестоимость 1 кредита {ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB:.3f} ₽.</p>
-          <p>Если захочешь скорректировать допущения, обнови <code>ANALYTICS_USD_TO_RUB</code>, <code>ANALYTICS_PAYMENT_FEE_PCT</code>, <code>ANALYTICS_RECEIPT_FEE_PCT</code>, <code>ANALYTICS_TAX_PCT</code> и <code>ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB</code> в server <code>.env</code>.</p>
-        </div>
-      </div>
-      <div class="card table-card">
-        <h3>Ожидаемая юнит-экономика</h3>
-        <p>Это уже "бумажная прибыль": цена минус ожидаемая себестоимость кредитов, эквайринг, Т-Чеки и налог. Нужна, чтобы понимать, остаётся ли прибыль вообще до масштабирования.</p>
-        <table>
-          <tr><th>Продукт</th><th>Цена</th><th>Кредитов</th><th>Себестоимость</th><th>Эквайринг</th><th>Т-Чеки</th><th>Налог</th><th>Маржа</th><th>Маржа %</th></tr>
-          {''.join(unit_margin_rows)}
-        </table>
-      </div>
-      <div class="card table-card">
-        <h3>Оценка маржи по тарифам</h3>
-        <p>Это управленческая оценка: выручка минус текстовая себестоимость по токенам. Затраты на картинки и эквайринг сюда пока не включены.</p>
-        <table>
-          <tr><th>Тариф</th><th>Выручка</th><th>Себестоимость текста</th><th>Маржа</th><th>Маржа %</th><th>Текстов</th><th>Картинок</th></tr>
-          {''.join(margin_rows)}
-        </table>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card table-card">
-        <h2>Расход по моделям</h2>
-        <p>Текстовая себестоимость считается по prompt/completion токенам и текущим ценам из реестра моделей. Для картинок токен-стоимость здесь не считаем, поэтому в таблице стоит «—».</p>
-        <table>
-          <tr><th>Модель</th><th>Тип</th><th>Запросов</th><th>Токенов</th><th>Ср./запрос</th><th>Кредитов</th><th>Себестоимость</th></tr>
-          {''.join(models_rows)}
-        </table>
-      </div>
-      <div class="card table-card">
-        <h2>Последние дни</h2>
-        <table>
-          <tr><th>День</th><th>Выручка</th><th>Активные</th></tr>
-          {''.join(daily_rows)}
-        </table>
-      </div>
-    </div>
-  </div>
-</body>
-</html>"""
-
-
 def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     report = state.user_store.kpi_report(days=days)
     esc = html.escape
@@ -9185,6 +8575,24 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         )
     if not source_rows:
         source_rows.append("<tr><td colspan='5'>По источникам пока нет данных.</td></tr>")
+
+    promo_code_rows: list[str] = []
+    for row in report.get("promo_codes", []):
+        activations = int(row.get("activations", 0) or 0)
+        paid_users = int(row.get("paid_users", 0) or 0)
+        conversion = (paid_users * 100.0 / activations) if activations else 0.0
+        promo_code_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('promo_code', '-') or '-'))}</td>"
+            f"<td>{activations}</td>"
+            f"<td>{paid_users}</td>"
+            f"<td>{conversion:.1f}%</td>"
+            f"<td>{money(int(row.get('credits', 0) or 0))}</td>"
+            f"<td>{money(int(row.get('revenue_rub', 0) or 0))} ₽</td>"
+            "</tr>"
+        )
+    if not promo_code_rows:
+        promo_code_rows.append("<tr><td colspan='6'>По промокодам пока нет активаций.</td></tr>")
 
     economics_plan_rows: list[str] = []
     unit_margin_rows: list[str] = []
@@ -9470,10 +8878,18 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
       </div>
       <div class="card table-card">
         <h2>Источники и кампании</h2>
-        <p class="muted">Сюда попадают пользователи, которые пришли по стартовым payload-меткам. Это база для каналов, рекламных ссылок и будущих deep-link кампаний.</p>
+        <p class="muted">Автоматически сюда попадает только то, что бот реально видит при первом запуске. Для рекламы в канал главный измеритель ниже — промокоды кампаний.</p>
         <table>
           <tr><th>Источник</th><th>Кампания</th><th>Пользователей</th><th>Платных</th><th>Выручка</th></tr>
           {''.join(source_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Промокоды кампаний</h2>
+        <p class="muted">Для рекламы в канал проще давать в посте один код кампании. Лид в боте считается после активации кода, дальше видно оплаты и выручку.</p>
+        <table>
+          <tr><th>Код</th><th>Активаций</th><th>Платных</th><th>Конверсия</th><th>Кредитов выдано</th><th>Выручка</th></tr>
+          {''.join(promo_code_rows)}
         </table>
       </div>
     </div>
@@ -9722,117 +9138,6 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
     }
 
 
-def render_admin_panel_html(
-    token: str,
-    chat_id: int | None = None,
-    request_id: int | None = None,
-    message: str = "",
-) -> str:
-    users = state.user_store.list_recent_users(limit=25)
-    payments = state.user_store.list_recent_payments(limit=25)
-    selected_user = state.user_store.get_user(chat_id) if chat_id else None
-    selected_payment = state.user_store.get_payment(request_id) if request_id else None
-    esc = html.escape
-    info_block = ""
-    if message:
-        info_block += f"<p style='padding:10px;border:1px solid #dbe3f0;border-radius:8px;background:#f8fbff'>{esc(message)}</p>"
-    if selected_user:
-        info_block += (
-            "<h3>Пользователь</h3>"
-            f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
-        )
-    if selected_payment:
-        info_block += (
-            "<h3>Платеж</h3>"
-            f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
-        )
-
-    user_rows = []
-    for row in users:
-        cid = int(row.get("chat_id", 0) or 0)
-        user_rows.append(
-            "<tr>"
-            f"<td>{cid}</td><td>{esc(str(row.get('plan', '')))}</td>"
-            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
-            f"<td>{int(row.get('daily_messages_used', 0) or 0)}/{int(row.get('daily_images_used', 0) or 0)}</td>"
-            f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
-            f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
-            f"<td><a href='/admin/panel?token={esc(token)}&chat_id={cid}'>Открыть</a></td>"
-            "</tr>"
-        )
-
-    payment_rows = []
-    for row in payments:
-        rid = int(row.get("id", 0) or 0)
-        payment_rows.append(
-            "<tr>"
-            f"<td>{rid}</td><td>{int(row.get('chat_id', 0) or 0)}</td>"
-            f"<td>{esc(str(row.get('plan', '')))}</td>"
-            f"<td>{int(row.get('amount_rub', 0) or 0)}</td>"
-            f"<td>{esc(payment_status_label(str(row.get('status', ''))))}</td>"
-            f"<td><a href='/admin/panel?token={esc(token)}&request_id={rid}'>Открыть</a></td>"
-            "</tr>"
-        )
-
-    action_block = ""
-    if selected_user:
-        cid = int(selected_user["chat_id"])
-        action_block = (
-            "<h3>Ручная корректировка</h3>"
-            "<p>"
-            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=free'>План free</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=lite'>План lite</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=start'>План start</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=set_plan&chat_id={cid}&plan=pro'>План pro</a>"
-            "</p>"
-            "<p>"
-            f"<a href='/admin/panel/action?token={esc(token)}&type=add_credits&chat_id={cid}&amount=500'>+500 кредитов</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=add_credits&chat_id={cid}&amount=-500'>-500 кредитов</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=reset_daily&chat_id={cid}'>Сброс дневных лимитов</a>"
-            "</p>"
-            "<p>"
-            f"<a href='/admin/panel/action?token={esc(token)}&type=block&chat_id={cid}&value=on'>Block ON</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=block&chat_id={cid}&value=off'>Block OFF</a>"
-            "</p>"
-        )
-    if selected_payment:
-        rid = int(selected_payment["id"])
-        action_block += (
-            "<h3>Платеж</h3>"
-            "<p>"
-            f"<a href='/admin/panel/action?token={esc(token)}&type=payment&request_id={rid}&value=paid'>Подтвердить оплату</a> | "
-            f"<a href='/admin/panel/action?token={esc(token)}&type=payment&request_id={rid}&value=cancel'>Отменить</a>"
-            "</p>"
-        )
-
-    return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Admin Panel</title>
-<style>
-body{{font-family:Segoe UI,Arial,sans-serif;background:#f6f8fb;color:#13213a;margin:0;padding:20px}}
-.card{{background:#fff;border:1px solid #dbe3f0;border-radius:14px;padding:16px;margin-bottom:14px}}
-table{{width:100%;border-collapse:collapse}} th,td{{border-bottom:1px solid #ecf1fa;padding:8px;text-align:left;font-size:13px}}
-a{{color:#1458d4;text-decoration:none}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#fbfdff;border:1px solid #e1e8f5;border-radius:8px;padding:10px}}
-</style></head>
-<body>
-<div class="card"><h2>Admin Panel</h2>
-<p><a href="/admin/panel/action?token={esc(token)}&type=backup">Создать бэкап БД</a> |
-<a href="/admin/panel/action?token={esc(token)}&type=nudge">Реактивировать free-пользователей</a></p>
-{info_block}
-{action_block}
-</div>
-<div class="card"><h3>Последние пользователи</h3>
-<table><tr><th>chat_id</th><th>plan</th><th>credits</th><th>usage d</th><th>blocked</th><th>last_active_at</th><th></th></tr>
-{''.join(user_rows)}
-</table></div>
-<div class="card"><h3>Последние платежи</h3>
-<table><tr><th>id</th><th>chat_id</th><th>plan</th><th>amount</th><th>status</th><th></th></tr>
-{''.join(payment_rows)}
-</table></div>
-</body></html>"""
-
-
 def render_admin_panel_html_v2(
     token: str,
     chat_id: int | None = None,
@@ -9906,6 +9211,7 @@ def render_admin_panel_html_v2(
             "model_select": "Модель",
             "referral_activation": "Реф-активация",
             "referral_reward": "Реф-бонус",
+            "promo_activation": "Промокод",
         }
         for item in selected_user_events:
             event_type = str(item.get("event_type", "") or "")

@@ -84,8 +84,9 @@ These are important project-specific UX rules:
 - If a flow requests promo/ref code input, leaving that flow must clear pending input state
 - Payment flows should avoid duplicate “back” actions; every page should have access to `Меню`
 - Do not enable bonuses that cannot be verified honestly
-- Referral flow should keep the primary UX simple: MAX share sheet + manual `/ref CODE` fallback
+- Referral flow should keep the primary UX simple: MAX share sheet + `Бонусы` -> `Ввести реф-код`
 - Referral analytics should surface top referrers and suspicious invite clusters before adding any automated anti-fraud actions
+- Ads that lead to the channel should be measured with campaign promo codes, not many different bot links
 
 ## Payments
 
