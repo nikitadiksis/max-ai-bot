@@ -2843,10 +2843,16 @@ def channel_url_value() -> str:
 
 
 def channel_chat_id_value() -> str:
-    if CHANNEL_CHAT_ID:
-        return CHANNEL_CHAT_ID
-    path = urlsplit(channel_url_value()).path.strip("/")
-    return path.rsplit("/", 1)[-1].strip() if path else ""
+    raw = CHANNEL_CHAT_ID or channel_url_value()
+    value = str(raw or "").strip()
+    if value.startswith(("http://", "https://")):
+        value = urlsplit(value).path.strip("/").rsplit("/", 1)[-1].strip()
+    if re.fullmatch(r"-?\d+", value):
+        return value
+    match = re.fullmatch(r"id(-?\d+)(?:[_-].*)?", value)
+    if match:
+        return match.group(1)
+    return value
 
 
 def channel_subscription_cache_valid(row: dict[str, Any]) -> bool:
