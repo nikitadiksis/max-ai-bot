@@ -3680,6 +3680,8 @@ def build_channel_gate_keyboard() -> list[dict[str, Any]]:
 
 def channel_gate_text() -> str:
     return (
+        "👋 Добро пожаловать!\n\n"
+        "Это AI-бот в MAX: помогает с текстами, вопросами, идеями, кодом и картинками.\n\n"
         "Чтобы пользоваться ботом, подпишись на канал проекта.\n\n"
         "1. Нажми «Подписаться на канал».\n"
         "2. Вернись сюда и нажми «Проверить подписку».\n\n"
@@ -3786,23 +3788,7 @@ def build_receipt_contact_keyboard() -> list[dict[str, Any]]:
 
 
 def build_onboarding_keyboard(step: int) -> list[dict[str, Any]]:
-    if step == 1:
-        buttons = [
-            [{"type": "callback", "text": "Дальше", "payload": "onboard:2"}],
-            [{"type": "callback", "text": "Пропустить", "payload": "onboard:skip"}],
-        ]
-    elif step == 2:
-        buttons = [
-            [{"type": "callback", "text": "💬 Задать вопрос", "payload": "onboard:scenario:text"}],
-            [{"type": "callback", "text": "🎨 Генерировать картинку", "payload": "onboard:scenario:image"}],
-            [{"type": "callback", "text": "💎 Выбрать тариф", "payload": "onboard:scenario:tariff"}],
-            [{"type": "callback", "text": "Дальше", "payload": "onboard:3"}],
-        ]
-    else:
-        buttons = [
-            [{"type": "callback", "text": "Готово, начать", "payload": "onboard:done"}],
-            [{"type": "link", "text": "📣 Канал с обновлениями", "url": channel_url_value()}],
-        ]
+    buttons = [[{"type": "callback", "text": "Начать!", "payload": "onboard:done"}]]
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -5884,32 +5870,26 @@ async def send_managed_message(
     return sent_mid
 
 
-async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
+def build_onboarding_text(chat_id: int) -> str:
     row = user_profile(chat_id)
-    if step <= 1:
-        text = (
-            "👋 Добро пожаловать!\n\n"
-            "Это AI-бот в MAX:\n"
-            "• ответы через GPT, Gemini и DeepSeek\n"
-            "• генерация картинок\n"
-            "• кредиты и прозрачные лимиты\n\n"
-            "Давай за 3 коротких шага покажу как пользоваться."
-        )
-    elif step == 2:
-        text = (
-            "⚡ Шаг 2/3: выбери быстрый сценарий\n\n"
-            "• вопрос/текст\n"
-            "• картинка\n"
-            "• выбор тарифа\n\n"
-            "Можно нажать кнопку ниже или просто написать сообщение."
-        )
-    else:
-        text = (
-            "✅ Шаг 3/3: всё готово\n\n"
-            f"Сейчас модель: {current_model_label(chat_id)}\n"
-            f"{usage_text(row)}\n\n"
-            "Нажми «Готово, начать», и открою основное меню."
-        )
+    return (
+        "Как пользоваться ботом?\n"
+        "────────────────────\n\n"
+        "Можно ничего не выбирать и просто написать вопрос в чат. Бот ответит выбранной моделью и сохранит контекст диалога.\n\n"
+        "Кнопки помогают быстрее выбрать режим:\n"
+        "• ⚡ Быстро — короткие ответы и простые задачи\n"
+        "• ⚖ Баланс — повседневные вопросы и диалог\n"
+        "• 🧠 Качество — подробнее и аккуратнее\n"
+        "• 🚀 Эксперт — сложные задачи, если доступно на тарифе\n\n"
+        "Для картинок нажми «🎨 Картинка»: можно сгенерировать новую картинку или редактировать фото.\n\n"
+        "Кредиты списываются за ответы, картинки и модели. Баланс, тариф и дату следующей free-картинки можно смотреть в «Мой план».\n\n"
+        f"Сейчас у тебя тариф: {str(row.get('plan', 'free')).title()}.\n"
+        "Нажми «Начать!» — открою Главное меню."
+    )
+
+
+async def send_onboarding(chat_id: int, step: int = 1, notify: bool = False) -> None:
+    text = build_onboarding_text(chat_id)
     sent_mid = await max_send_message(chat_id, text, attachments=build_onboarding_keyboard(step), notify=notify)
     if sent_mid:
         state.onboarding_message_mid[chat_id] = sent_mid
@@ -5922,31 +5902,7 @@ async def show_onboarding_step(
     source_mid: str | None = None,
     notification: str = "Открываю",
 ) -> None:
-    row = user_profile(chat_id)
-    if step <= 1:
-        text = (
-            "👋 Добро пожаловать!\n\n"
-            "Это AI-бот в MAX:\n"
-            "• ответы через GPT, Gemini и DeepSeek\n"
-            "• генерация картинок\n"
-            "• кредиты и прозрачные лимиты\n\n"
-            "Давай за 3 коротких шага покажу как пользоваться."
-        )
-    elif step == 2:
-        text = (
-            "⚡ Шаг 2/3: выбери быстрый сценарий\n\n"
-            "• вопрос/текст\n"
-            "• картинка\n"
-            "• выбор тарифа\n\n"
-            "Можно нажать кнопку ниже или просто написать сообщение."
-        )
-    else:
-        text = (
-            "✅ Шаг 3/3: всё готово\n\n"
-            f"Сейчас модель: {current_model_label(chat_id)}\n"
-            f"{usage_text(row)}\n\n"
-            "Нажми «Готово, начать», и открою основное меню."
-        )
+    text = build_onboarding_text(chat_id)
     target_mid = source_mid or state.onboarding_message_mid.get(chat_id)
     if target_mid:
         ok = await max_edit_message(chat_id, target_mid, text, attachments=build_onboarding_keyboard(step))
@@ -5989,28 +5945,6 @@ async def finish_onboarding_to_page(
         push_history=False,
         notification=notification,
     )
-
-
-async def finish_onboarding_with_text(
-    chat_id: int,
-    text: str,
-    callback_id: str | None = None,
-    source_mid: str | None = None,
-    notification: str = "Готово",
-) -> None:
-    state.user_store.set_onboarding_done(chat_id, True)
-    handoff_onboarding_to_ui(chat_id, source_mid)
-    target_mid = source_mid or state.ui_message_mid.get(chat_id)
-    await show_managed_content(
-        chat_id,
-        text,
-        attachments=build_keyboard(chat_id),
-        callback_id=callback_id,
-        source_mid=target_mid,
-        page=UI_PAGE_MENU,
-        notification=notification,
-    )
-
 
 async def send_growth_menu(chat_id: int) -> None:
     await send_managed_message(
@@ -7500,38 +7434,13 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         )
         return True
 
-    if payload == "onboard:skip":
-        await finish_onboarding_to_page(chat_id, UI_PAGE_MENU, callback_id=callback_id, source_mid=source_mid)
-        return True
-
-    if payload == "onboard:2":
-        await show_onboarding_step(chat_id, step=2, callback_id=callback_id, source_mid=source_mid, notification="Шаг 2")
-        return True
-
-    if payload == "onboard:3":
-        await show_onboarding_step(chat_id, step=3, callback_id=callback_id, source_mid=source_mid, notification="Шаг 3")
-        return True
-
-    if payload == "onboard:done":
-        await finish_onboarding_to_page(chat_id, UI_PAGE_MENU, callback_id=callback_id, source_mid=source_mid)
-        return True
-
-    if payload == "onboard:scenario:text":
-        await finish_onboarding_with_text(
-            chat_id,
-            "Супер, просто напиши вопрос в чат — отвечу сразу.",
-            callback_id=callback_id,
-            source_mid=source_mid,
-            notification="Текст",
-        )
-        return True
-
-    if payload == "onboard:scenario:image":
-        await finish_onboarding_to_page(chat_id, UI_PAGE_IMAGE_MENU, callback_id=callback_id, source_mid=source_mid)
-        return True
-
-    if payload == "onboard:scenario:tariff":
-        await finish_onboarding_to_page(chat_id, UI_PAGE_TARIFFS, callback_id=callback_id, source_mid=source_mid)
+    if payload.startswith("onboard:"):
+        target_page = UI_PAGE_MENU
+        if payload == "onboard:scenario:image":
+            target_page = UI_PAGE_IMAGE_MENU
+        elif payload == "onboard:scenario:tariff":
+            target_page = UI_PAGE_TARIFFS
+        await finish_onboarding_to_page(chat_id, target_page, callback_id=callback_id, source_mid=source_mid)
         return True
 
     if payload == "action:image_menu":
