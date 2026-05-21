@@ -3369,6 +3369,8 @@ def build_image_prompt_keyboard() -> list[dict[str, Any]]:
 def image_availability_text(chat_id: int) -> str:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
+    if plan_name != "free":
+        return ""
     if plan_name == "free":
         if not free_image_is_available(row):
             next_at = free_image_next_available_at(row)
@@ -3386,14 +3388,16 @@ def build_image_menu_text(chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
     mode = prefs.get("mode", "")
     panel = prefs.get("panel", "root")
+    availability = image_availability_text(chat_id)
+    availability_block = f"{availability}\n" if availability else ""
     if not mode:
         return (
             "🎨 Картинки\n\n"
-            f"{image_availability_text(chat_id)}\n"
+            f"{availability_block}"
             f"Генерация: {CREDIT_COST_IMAGE} кредитов.\n"
             f"Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n\n"
             "Сначала выбери, что хочешь сделать:\n"
-            "• создать новую картинку\n"
+            "• сгенерировать новую картинку\n"
             "• изменить фото"
         )
     if mode == "generate":
@@ -3407,7 +3411,7 @@ def build_image_menu_text(chat_id: int) -> str:
             "✨ Сценарии генерации\n\n"
             "Выбери готовый сценарий или не выбирай его.\n"
             "После этого откроется шаг со стилем и форматом.\n\n"
-            f"{image_availability_text(chat_id)}\n"
+            f"{availability_block}"
             f"Стоимость: {CREDIT_COST_IMAGE} кредитов."
         )
     if panel == "style":
@@ -8265,6 +8269,27 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">События</div><div class="metric-value">{int(report.get('events_total', 0) or 0)}</div><div class="metric-note">Все usage events за период</div></div>
       </div>
     </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Воронка</h2>
+        <table>
+          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
+          {''.join(funnel_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Монетизация</h2>
+        <table>
+          <tr><th>Показатель</th><th>Значение</th></tr>
+          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
+          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
+          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
+          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
+          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
+          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
+        </table>
+      </div>
+    </div>
     <div class="card table-card">
       <h2>Выручка по тарифам</h2>
       <table>
@@ -8391,6 +8416,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     referred_payers = int(report.get("referred_payers", 0) or 0)
     referral_bonus_credits = int(report.get("referral_bonus_credits", 0) or 0)
     referral_conversion_pct = (referred_payers * 100.0 / referral_activations) if referral_activations else 0.0
+    referred_share_of_payers_pct = (referred_payers * 100.0 / payers) if payers else 0.0
 
     period_links = " ".join(
         f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
@@ -8565,6 +8591,13 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         )
     if not daily_rows:
         daily_rows.append("<tr><td colspan='3'>За период пока нет дневных данных.</td></tr>")
+
+    funnel_rows = [
+        f"<tr><td>Активные пользователи</td><td>{active_users}</td><td>100%</td></tr>",
+        f"<tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>",
+        f"<tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>",
+        f"<tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>",
+    ]
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -9014,13 +9047,38 @@ def render_admin_panel_html_v2(
     selected_payment = state.user_store.get_payment(request_id) if request_id else None
     esc = html.escape
 
+    def yes_no(flag: Any) -> str:
+        return "да" if int(flag or 0) == 1 else "нет"
+
     info_block = ""
     if message:
         info_block += f"<p class='notice'>{esc(repair_mojibake(message))}</p>"
     if selected_user:
-        info_block += "<h3>Пользователь</h3>" + f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
+        selected_plan = str(selected_user.get("plan", "free") or "free").title()
+        selected_user_summary = (
+            "<div class='mini-grid'>"
+            f"<div class='mini-metric'>Тариф<strong>{esc(selected_plan)}</strong></div>"
+            f"<div class='mini-metric'>Кредиты<strong>{int(selected_user.get('credits_balance', 0) or 0)}</strong></div>"
+            f"<div class='mini-metric'>Автопродление<strong>{yes_no(selected_user.get('recurring_enabled', 0))}</strong></div>"
+            f"<div class='mini-metric'>Блок<strong>{yes_no(selected_user.get('is_blocked', 0))}</strong></div>"
+            f"<div class='mini-metric'>Реф-код<strong>{esc(str(selected_user.get('referral_code', '') or '-'))}</strong></div>"
+            f"<div class='mini-metric'>Пригласил<strong>{int(selected_user.get('referrals_invited', 0) or 0)}</strong></div>"
+            "</div>"
+            f"<p class='muted'>chat_id: {int(selected_user.get('chat_id', 0) or 0)} • user_id: {int(selected_user.get('max_user_id', 0) or 0)} • активность: {esc(str(selected_user.get('last_active_at', '') or '-'))}</p>"
+        )
+        info_block += "<h3>Пользователь</h3>" + selected_user_summary + f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
     if selected_payment:
-        info_block += "<h3>Платёж</h3>" + f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
+        payment_status_text = payment_status_label(str(selected_payment.get("status", "") or ""))
+        payment_summary = (
+            "<div class='mini-grid'>"
+            f"<div class='mini-metric'>Статус<strong>{esc(payment_status_text)}</strong></div>"
+            f"<div class='mini-metric'>Сумма<strong>{int(selected_payment.get('amount_rub', 0) or 0)} ₽</strong></div>"
+            f"<div class='mini-metric'>Продукт<strong>{esc(str(selected_payment.get('plan', '') or '-'))}</strong></div>"
+            f"<div class='mini-metric'>Провайдер<strong>{esc(str(selected_payment.get('provider_payment_id', '') or '-'))}</strong></div>"
+            "</div>"
+            f"<p class='muted'>Заявка #{int(selected_payment.get('id', 0) or 0)} • chat_id: {int(selected_payment.get('chat_id', 0) or 0)} • создан: {esc(str(selected_payment.get('created_at', '') or '-'))}</p>"
+        )
+        info_block += "<h3>Платёж</h3>" + payment_summary + f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
 
     user_rows = []
     for row in users:
@@ -9072,6 +9130,13 @@ def render_admin_panel_html_v2(
     users_count = len(users)
     payments_count = len(payments)
     suspicious_count = len(suspicious_users)
+    paid_users_count = sum(1 for row in users if str(row.get("plan", "free") or "free") != "free")
+    recurring_count = sum(1 for row in users if int(row.get("recurring_enabled", 0) or 0) == 1)
+    blocked_count = sum(1 for row in users if int(row.get("is_blocked", 0) or 0) == 1)
+    pending_count = sum(1 for row in payments if str(row.get("status", "") or "").lower() == "pending")
+    claimed_count = sum(1 for row in payments if str(row.get("status", "") or "").lower() == "claimed")
+    paid_count = sum(1 for row in payments if str(row.get("status", "") or "").lower() == "paid")
+    refunded_count = sum(1 for row in payments if str(row.get("status", "") or "").lower() == "refunded")
     search_form = (
         "<form class='actions' method='get' action='/admin/panel'>"
         f"<input type='hidden' name='token' value='{esc(token)}'/>"
@@ -9165,6 +9230,11 @@ def render_admin_panel_html_v2(
         <div class="mini-metric">Пользователи в выдаче<strong>{users_count}</strong></div>
         <div class="mini-metric">Платежи в выдаче<strong>{payments_count}</strong></div>
         <div class="mini-metric">Подозрительные кейсы<strong>{suspicious_count}</strong></div>
+        <div class="mini-metric">Платные в выдаче<strong>{paid_users_count}</strong></div>
+        <div class="mini-metric">Автопродление<strong>{recurring_count}</strong></div>
+        <div class="mini-metric">Заблокированы<strong>{blocked_count}</strong></div>
+        <div class="mini-metric">Pending / Claimed<strong>{pending_count} / {claimed_count}</strong></div>
+        <div class="mini-metric">Paid / Refunded<strong>{paid_count} / {refunded_count}</strong></div>
       </div>
       {info_block}
       {action_block}
