@@ -662,6 +662,36 @@ def referral_code_from_start_payload(update: dict[str, Any]) -> str:
     return normalize_referral_code(raw) if is_referral_code(raw) else ""
 
 
+def acquisition_meta_from_start_payload(update: dict[str, Any]) -> tuple[str, str]:
+    payload = parse_start_payload(update)
+    source = ""
+    campaign = ""
+    if payload:
+        raw = payload.strip()
+        if "=" in raw or "&" in raw:
+            params = dict(parse_qsl(raw, keep_blank_values=True))
+            source = str(params.get("src") or params.get("source") or params.get("utm_source") or "").strip().lower()
+            campaign = str(params.get("campaign") or params.get("utm_campaign") or "").strip().lower()
+        else:
+            for chunk in raw.split(";"):
+                part = chunk.strip()
+                if not part or ":" not in part:
+                    continue
+                key, value = part.split(":", 1)
+                key = key.strip().lower()
+                value = value.strip().lower()
+                if key in {"src", "source", "utm_source"} and not source:
+                    source = value
+                elif key in {"campaign", "utm_campaign"} and not campaign:
+                    campaign = value
+    code = referral_code_from_start_payload(update)
+    if code and not source:
+        source = "referral"
+    source = re.sub(r"[^a-z0-9_-]", "", source)[:32]
+    campaign = re.sub(r"[^a-z0-9_-]", "", campaign)[:48]
+    return source, campaign
+
+
 def referral_share_message(code: str) -> str:
     normalized = normalize_referral_code(code)
     return (
@@ -786,6 +816,9 @@ class UserStore:
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id INTEGER PRIMARY KEY,
                     max_user_id INTEGER NOT NULL DEFAULT 0,
+                    acquisition_source TEXT NOT NULL DEFAULT '',
+                    acquisition_campaign TEXT NOT NULL DEFAULT '',
+                    acquired_at TEXT NOT NULL DEFAULT '',
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
                     onboarding_done INTEGER NOT NULL DEFAULT 0,
@@ -890,6 +923,9 @@ class UserStore:
             )
             self._ensure_column(conn, "users", "subscription_expires_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "max_user_id", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "users", "acquisition_source", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "acquisition_campaign", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "acquired_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
@@ -989,13 +1025,14 @@ class UserStore:
             """
             INSERT INTO users (
                 chat_id, max_user_id, plan, is_blocked, onboarding_done, referral_code, referred_by_chat_id, referrals_invited,
+                acquisition_source, acquisition_campaign, acquired_at,
                 selected_model_alias, selected_preset, usage_date,
                 daily_messages_used, daily_images_used, daily_gpt54_used,
                 free_image_week_key, free_image_week_used, free_image_last_used_at,
                 credits_balance, credits_spent_total,
                 last_active_at,
                 created_at, updated_at
-            ) VALUES (?, ?, 'free', 0, 0, ?, 0, 0, ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
+            ) VALUES (?, ?, 'free', 0, 0, ?, 0, 0, '', '', '', ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -1056,6 +1093,9 @@ class UserStore:
         merged["referral_code"] = str(merged.get("referral_code", "") or "").strip() or str(current_dict.get("referral_code", "") or "").strip() or referral_code_for_chat(int(existing["chat_id"]))
         merged["referred_by_chat_id"] = int(merged.get("referred_by_chat_id", 0) or 0) or int(current_dict.get("referred_by_chat_id", 0) or 0)
         merged["referrals_invited"] = max(int(merged.get("referrals_invited", 0) or 0), int(current_dict.get("referrals_invited", 0) or 0))
+        merged["acquisition_source"] = str(merged.get("acquisition_source", "") or "").strip() or str(current_dict.get("acquisition_source", "") or "").strip()
+        merged["acquisition_campaign"] = str(merged.get("acquisition_campaign", "") or "").strip() or str(current_dict.get("acquisition_campaign", "") or "").strip()
+        merged["acquired_at"] = later_iso(merged.get("acquired_at", ""), current_dict.get("acquired_at", ""))
         merged["receipt_email"] = str(merged.get("receipt_email", "") or "").strip() or str(current_dict.get("receipt_email", "") or "").strip()
         merged["receipt_phone"] = str(merged.get("receipt_phone", "") or "").strip() or str(current_dict.get("receipt_phone", "") or "").strip()
         merged["last_active_at"] = later_iso(merged.get("last_active_at", ""), current_dict.get("last_active_at", ""))
@@ -1148,7 +1188,8 @@ class UserStore:
             conn.execute(
                 """
                 UPDATE users
-                SET max_user_id = ?, plan = ?, is_blocked = ?, onboarding_done = ?, referral_code = ?,
+                SET max_user_id = ?, acquisition_source = ?, acquisition_campaign = ?, acquired_at = ?,
+                    plan = ?, is_blocked = ?, onboarding_done = ?, referral_code = ?,
                     referred_by_chat_id = ?, referrals_invited = ?, receipt_email = ?, receipt_phone = ?,
                     selected_model_alias = ?, selected_preset = ?, subscription_expires_at = ?,
                     recurring_enabled = ?, recurring_cancel_from = ?, recurring_canceled_at = ?,
@@ -1159,6 +1200,9 @@ class UserStore:
                 """,
                 (
                     int(merged.get("max_user_id", 0) or 0),
+                    str(merged.get("acquisition_source", "") or ""),
+                    str(merged.get("acquisition_campaign", "") or ""),
+                    str(merged.get("acquired_at", "") or ""),
                     str(merged.get("plan", "free") or "free"),
                     int(merged.get("is_blocked", 0) or 0),
                     int(merged.get("onboarding_done", 0) or 0),
@@ -1901,6 +1945,46 @@ class UserStore:
             )
             conn.commit()
 
+    def set_acquisition_meta(self, chat_id: int, source: str = "", campaign: str = "") -> None:
+        source_value = re.sub(r"[^a-z0-9_-]", "", str(source or "").strip().lower())[:32]
+        campaign_value = re.sub(r"[^a-z0-9_-]", "", str(campaign or "").strip().lower())[:48]
+        if not source_value and not campaign_value:
+            return
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT acquisition_source, acquisition_campaign, acquired_at FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                return
+            current_source = str(row["acquisition_source"] or "").strip().lower()
+            current_campaign = str(row["acquisition_campaign"] or "").strip().lower()
+            acquired_at = str(row["acquired_at"] or "").strip()
+            next_source = current_source
+            next_campaign = current_campaign
+            next_acquired_at = acquired_at
+            if source_value and (not current_source or current_source == "direct"):
+                next_source = source_value
+                next_acquired_at = acquired_at or now
+            if campaign_value and not current_campaign:
+                next_campaign = campaign_value
+                next_acquired_at = acquired_at or now
+            if not next_source and source_value:
+                next_source = source_value
+                next_acquired_at = acquired_at or now
+            if next_source == current_source and next_campaign == current_campaign and next_acquired_at == acquired_at:
+                return
+            conn.execute(
+                """
+                UPDATE users
+                SET acquisition_source = ?, acquisition_campaign = ?, acquired_at = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (next_source, next_campaign, next_acquired_at, now, chat_id),
+            )
+            conn.commit()
+
     def record_usage_event(
         self,
         chat_id: int,
@@ -2044,6 +2128,29 @@ class UserStore:
             ).fetchall()
             top_referrers = self.top_referrers_report(limit=10)
             suspicious_referrals = self.suspicious_referral_report(limit=10)
+            source_rows = conn.execute(
+                """
+                WITH payer_revenue AS (
+                    SELECT chat_id, SUM(rub_amount) AS revenue_rub
+                    FROM usage_events
+                    WHERE created_at >= ? AND event_type = 'payment' AND rub_amount > 0
+                    GROUP BY chat_id
+                )
+                SELECT
+                    COALESCE(NULLIF(lower(u.acquisition_source), ''), 'direct') AS source,
+                    COALESCE(NULLIF(lower(u.acquisition_campaign), ''), '-') AS campaign,
+                    COUNT(*) AS users_count,
+                    SUM(CASE WHEN u.plan != 'free' THEN 1 ELSE 0 END) AS paid_users,
+                    SUM(COALESCE(pr.revenue_rub, 0)) AS revenue_rub
+                FROM users u
+                LEFT JOIN payer_revenue pr ON pr.chat_id = u.chat_id
+                WHERE COALESCE(NULLIF(u.acquired_at, ''), u.created_at) >= ?
+                GROUP BY source, campaign
+                ORDER BY revenue_rub DESC, paid_users DESC, users_count DESC
+                LIMIT 12
+                """,
+                (since, since),
+            ).fetchall()
 
             model_stats: dict[str, dict[str, Any]] = {}
             plan_cost_stats: dict[str, dict[str, Any]] = {}
@@ -2154,6 +2261,7 @@ class UserStore:
                 "daily": [dict(row) for row in daily_rows],
                 "top_referrers": top_referrers,
                 "suspicious_referrals": suspicious_referrals,
+                "sources": [dict(row) for row in source_rows],
             }
 
     def service_monitor_report(
@@ -3209,7 +3317,7 @@ def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
     ]
 
 
-def build_reply_shortcuts_keyboard(chat_id: int) -> list[dict[str, Any]]:
+def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) -> list[dict[str, Any]]:
     row = user_profile(chat_id)
     buttons: list[list[dict[str, Any]]] = [
         [
@@ -3220,6 +3328,9 @@ def build_reply_shortcuts_keyboard(chat_id: int) -> list[dict[str, Any]]:
     if str(row.get("plan", "free")) == "free":
         buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
     buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
+    if include_share:
+        code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
+        buttons.append([{"type": "link", "text": "🔗 Поделиться", "url": max_share_url(referral_share_message_v2(code))}])
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -4653,7 +4764,7 @@ async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, di
     await max_send_message(
         chat_id,
         f"Готово. Вот картинка по запросу:\n{shown_prompt}",
-        attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id)],
+        attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id, include_share=True)],
     )
 
 
@@ -7472,6 +7583,8 @@ async def handle_command(chat_id: int, text: str) -> bool:
     if command in {"/start", "/menu"}:
         row = user_profile(chat_id)
         if command == "/start" and arg:
+            start_source, start_campaign = acquisition_meta_from_start_payload({"payload": arg})
+            state.user_store.set_acquisition_meta(chat_id, source=start_source or ("referral" if is_referral_code(arg) else "direct"), campaign=start_campaign)
             start_ref = referral_code_from_start_payload({"payload": arg}) or (normalize_referral_code(arg) if is_referral_code(arg) else "")
             if start_ref:
                 ok, info = state.user_store.apply_referral_code(chat_id, start_ref, REFERRAL_BONUS_CREDITS)
@@ -7834,6 +7947,8 @@ async def process_update(update: dict[str, Any]) -> None:
         return
 
     if update_type in {"bot_started", "user_added", "bot_added"}:
+        source, campaign = acquisition_meta_from_start_payload(update)
+        state.user_store.set_acquisition_meta(chat_id, source=source or "direct", campaign=campaign)
         referral_applied = await maybe_apply_start_referral(chat_id, update)
         if referral_applied:
             row = user_profile(chat_id)
@@ -8785,6 +8900,20 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     if not suspicious_referral_rows:
         suspicious_referral_rows.append("<tr><td colspan='7'>Подозрительных реферальных кластеров пока нет.</td></tr>")
 
+    source_rows: list[str] = []
+    for row in report.get("sources", []):
+        source_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('source', 'direct') or 'direct'))}</td>"
+            f"<td>{esc(str(row.get('campaign', '-') or '-'))}</td>"
+            f"<td>{int(row.get('users_count', 0) or 0)}</td>"
+            f"<td>{int(row.get('paid_users', 0) or 0)}</td>"
+            f"<td>{money(int(row.get('revenue_rub', 0) or 0))} ₽</td>"
+            "</tr>"
+        )
+    if not source_rows:
+        source_rows.append("<tr><td colspan='5'>По источникам пока нет данных.</td></tr>")
+
     economics_plan_rows: list[str] = []
     unit_margin_rows: list[str] = []
     for plan in ("lite", "start", "pro"):
@@ -8987,6 +9116,14 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         <table>
           <tr><th>chat_id</th><th>user_id</th><th>Код</th><th>Пригласил</th><th>Активно за 14 дней</th><th>Платных</th><th></th></tr>
           {''.join(suspicious_referral_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Источники и кампании</h2>
+        <p class="muted">Сюда попадают пользователи, которые пришли по стартовым payload-меткам. Это база для каналов, рекламных ссылок и будущих deep-link кампаний.</p>
+        <table>
+          <tr><th>Источник</th><th>Кампания</th><th>Пользователей</th><th>Платных</th><th>Выручка</th></tr>
+          {''.join(source_rows)}
         </table>
       </div>
     </div>
