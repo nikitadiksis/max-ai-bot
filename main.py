@@ -4640,8 +4640,8 @@ def plan_price_and_days(plan: str) -> tuple[int, int]:
 def build_tariffs_text() -> str:
     start_cfg = PLAN_CONFIGS["start"]
     pro_cfg = PLAN_CONFIGS["pro"]
-    start_gpt54_line = f" + GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день" if start_cfg.daily_gpt54_limit > 0 else ""
-    pro_gpt54_line = f" (GPT-5.4: до {pro_cfg.daily_gpt54_limit}/день)" if pro_cfg.daily_gpt54_limit > 0 else ""
+    start_gpt54_line = f"+ GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день" if start_cfg.daily_gpt54_limit > 0 else "как Lite"
+    pro_gpt54_line = f"+ GPT-5.4 без дневного лимита" if pro_cfg.daily_gpt54_limit <= 0 else f"+ GPT-5.4 до {pro_cfg.daily_gpt54_limit}/день"
     free_nano_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_GPT))
     free_ds_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_DEEPSEEK))
     return (
@@ -4652,9 +4652,9 @@ def build_tariffs_text() -> str:
         f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов\n\n"
         "Модели по тарифам:\n"
         "• **Free**: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
-        "• **Lite**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
-        f"• **Start**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image{start_gpt54_line}\n"
-        f"• **Pro**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image, GPT-5.4{pro_gpt54_line}\n\n"
+        "• **Lite**: + GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
+        f"• **Start**: {start_gpt54_line}\n"
+        f"• **Pro**: {pro_gpt54_line}\n\n"
         "🪙 Обычно списывается:\n"
         f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
         f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
