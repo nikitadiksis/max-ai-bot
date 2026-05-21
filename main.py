@@ -4316,9 +4316,14 @@ def build_tariffs_text() -> str:
     return (
         "💠 Тарифы:\n"
         f"• 🆓 **Free (бесплатный)**: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов) + 1 картинка / 7 дней\n"
-        f"• 🍬 **Lite**: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash\n"
-        f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash{start_gpt54_line}\n"
-        f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов, DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4{pro_gpt54_line}\n\n"
+        f"• 🍬 **Lite**: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов\n"
+        f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов\n"
+        f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов\n\n"
+        "Модели по тарифам:\n"
+        "• Free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
+        "• Lite: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
+        f"• Start: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image{start_gpt54_line}\n"
+        f"• Pro: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image, GPT-5.4{pro_gpt54_line}\n\n"
         "🪙 Обычно списывается:\n"
         f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
         f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
@@ -4330,12 +4335,7 @@ def build_tariffs_text() -> str:
         "Точное списание за текст зависит от длины и сложности ответа.\n"
         "Для платных тарифов действует автопродление.\n"
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
-        "Отменить автопродление можно в разделе «Мой план».\n\n"
-        "Модели по тарифам:\n"
-        "• Free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
-        f"• Lite: + GPT-4o Mini и Gemini 2.5 Flash\n"
-        f"• Start: + GPT-4o Mini, Gemini 2.5 Flash и GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день\n"
-        "• Pro: + GPT-5.4"
+        "Отменить автопродление можно в разделе «Мой план»."
     )
 
 
