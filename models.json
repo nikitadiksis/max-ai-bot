@@ -63,7 +63,7 @@
       "version": "2025-10-07",
       "input_price_usd_per_m": "0.30",
       "output_price_usd_per_m": "2.50",
-      "min_plan": "start",
+      "min_plan": "lite",
       "description": "Генерация и редактирование картинок."
     }
   }
