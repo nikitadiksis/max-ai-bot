@@ -3025,7 +3025,7 @@ async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple
             "channel_gate_config",
             f"Проверка подписки включена, но не найден chat_id канала. chat_id={chat_id}",
         )
-        return True, "config_missing"
+        return False, "config_missing"
 
     session = await get_session()
     url = f"{MAX_API}/chats/{quote(channel_id, safe='')}/members"
@@ -3047,13 +3047,13 @@ async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple
                 )
                 if resp.status == 400 and "dialogs" in str(data).lower():
                     state.channel_chat_id_cache = ""
-                return True, f"api_error_{resp.status}"
+                return False, f"api_error_{resp.status}"
     except Exception as exc:
         await notify_admin_alert(
             "channel_gate_api",
             f"MAX members check exception: channel_id={channel_id}, user_id={max_user_id}, error={exc}",
         )
-        return True, "api_exception"
+        return False, "api_exception"
 
     subscribed = channel_membership_response_is_positive(data, max_user_id)
     state.user_store.mark_channel_subscription(chat_id, subscribed)
@@ -3694,7 +3694,7 @@ def channel_gate_allows_payload(payload: str) -> bool:
 def channel_gate_allows_text(text: str) -> bool:
     value = text.strip()
     if not value.startswith("/"):
-        return False
+        return value.lower() in {"старт", "start", "начать"}
     command = value.split(maxsplit=1)[0].lower()
     return command in {"/start", "/id", "/support", "/channel"}
 
@@ -7974,6 +7974,12 @@ async def handle_command(chat_id: int, text: str) -> bool:
     if lowered in {"gpt", "gpt4o", "gemini", "deepseek", "gpt54"}:
         command = "/model"
         arg = lowered
+    elif lowered in {"старт", "start", "начать"}:
+        command = "/start"
+        arg = ""
+    elif lowered in {"меню", "menu"}:
+        command = "/menu"
+        arg = ""
     elif command in {"/gpt", "/gpt4o", "/gemini", "/deepseek", "/gpt54"}:
         command = "/model"
         arg = command[1:]
@@ -8428,7 +8434,8 @@ async def process_update(update: dict[str, Any]) -> None:
         return
 
     log.info("Incoming update=%s chat_id=%s text=%r", update_type, chat_id, text[:120])
-    if int(row.get("onboarding_done", 0) or 0) == 0 and text.strip().lower() not in {"/start"}:
+    first_word = text.strip().lower().split(maxsplit=1)[0] if text.strip() else ""
+    if int(row.get("onboarding_done", 0) or 0) == 0 and first_word not in {"/start", "старт", "start", "начать"}:
         state.user_store.set_onboarding_done(chat_id, True)
     try:
         if await handle_pending_referral_input(chat_id, text):
