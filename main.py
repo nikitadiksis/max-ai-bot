@@ -8567,6 +8567,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
         <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
         <a class="btn" href="{esc(admin_url('/status', token))}">Статус</a>
+        <a class="btn" href="{esc(admin_url('/health/deep', token))}">Deep health JSON</a>
         <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
       </div>
       <div class="actions">{period_links}</div>
