@@ -292,7 +292,7 @@ WELCOME_TEXT = (
 )
 
 MENU_TEXT = (
-    "Кнопки ниже — основной способ пользоваться ботом.\n"
+    "Кнопки ниже помогают быстро открыть нужный режим, тарифы и картинки.\n"
     "Новости и обновления — в кнопке «📣 Канал».\n"
     "Можно просто написать вопрос в чат — бот ответит."
 )
@@ -500,6 +500,13 @@ def parse_usage_details_blob(details: str) -> tuple[int, int]:
     prompt_tokens = int(prompt_match.group(1)) if prompt_match else 0
     completion_tokens = int(completion_match.group(1)) if completion_match else 0
     return max(0, prompt_tokens), max(0, completion_tokens)
+
+
+def parse_detail_field(details: str, key: str) -> str:
+    if not details or not key:
+        return ""
+    match = re.search(rf"(?:^|;){re.escape(key)}=([^;]+)", str(details))
+    return match.group(1).strip() if match else ""
 
 
 def model_info_for_alias(alias: str) -> tuple[str, str, ModelInfo | None]:
@@ -1834,6 +1841,20 @@ class UserStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_user_usage_events(self, chat_id: int, limit: int = 12) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_type, plan, model_alias, credits_spent, rub_amount, tokens_total, details, created_at
+                FROM usage_events
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def get_payment(self, request_id: int) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
@@ -2044,7 +2065,9 @@ class UserStore:
 
     def kpi_report(self, days: int = 30) -> dict[str, Any]:
         period_days = max(1, min(int(days), 365))
-        since = (datetime.utcnow() - timedelta(days=period_days)).isoformat()
+        now_dt = datetime.utcnow()
+        since_dt = now_dt - timedelta(days=period_days)
+        since = since_dt.isoformat()
         with self._connect() as conn:
             summary = conn.execute(
                 """
@@ -2151,6 +2174,24 @@ class UserStore:
                 """,
                 (since, since),
             ).fetchall()
+            cohort_rows = conn.execute(
+                """
+                SELECT chat_id, COALESCE(NULLIF(acquired_at, ''), created_at) AS cohort_at
+                FROM users
+                WHERE COALESCE(NULLIF(acquired_at, ''), created_at) >= ?
+                """,
+                (since,),
+            ).fetchall()
+            behavior_rows = conn.execute(
+                """
+                SELECT chat_id, event_type, model_alias, details, created_at
+                FROM usage_events
+                WHERE created_at >= ?
+                  AND event_type IN ('payment', 'text_request', 'image_request', 'screen_view', 'preset_select', 'model_select')
+                ORDER BY id DESC
+                """,
+                (since,),
+            ).fetchall()
 
             model_stats: dict[str, dict[str, Any]] = {}
             plan_cost_stats: dict[str, dict[str, Any]] = {}
@@ -2234,6 +2275,62 @@ class UserStore:
                     }
                 )
 
+            new_users = 0
+            new_paid_users = 0
+            d1_eligible = 0
+            d1_retained = 0
+            d7_eligible = 0
+            d7_retained = 0
+            activity_dates_by_chat: dict[int, set[str]] = {}
+            payment_datetimes_by_chat: dict[int, list[datetime]] = {}
+            screen_counts: dict[str, int] = {}
+            preset_counts: dict[str, int] = {}
+
+            for row in behavior_rows:
+                cid = int(row["chat_id"] or 0)
+                event_type = str(row["event_type"] or "").strip().lower()
+                created_at = parse_iso_datetime(str(row["created_at"] or ""))
+                details = str(row["details"] or "")
+                if created_at and event_type in {"text_request", "image_request", "screen_view"}:
+                    activity_dates_by_chat.setdefault(cid, set()).add(created_at.date().isoformat())
+                if created_at and event_type == "payment":
+                    payment_datetimes_by_chat.setdefault(cid, []).append(created_at)
+                if event_type == "screen_view":
+                    screen = parse_detail_field(details, "screen") or "unknown"
+                    screen_counts[screen] = screen_counts.get(screen, 0) + 1
+                if event_type == "preset_select":
+                    preset = parse_detail_field(details, "preset") or "unknown"
+                    preset_counts[preset] = preset_counts.get(preset, 0) + 1
+
+            for row in cohort_rows:
+                cid = int(row["chat_id"] or 0)
+                cohort_at = parse_iso_datetime(str(row["cohort_at"] or ""))
+                if not cohort_at:
+                    continue
+                new_users += 1
+                payment_dates = payment_datetimes_by_chat.get(cid, [])
+                if any(payment_dt >= cohort_at for payment_dt in payment_dates):
+                    new_paid_users += 1
+                cohort_date = cohort_at.date()
+                activity_dates = activity_dates_by_chat.get(cid, set())
+                if cohort_at <= now_dt - timedelta(days=1):
+                    d1_eligible += 1
+                    if (cohort_date + timedelta(days=1)).isoformat() in activity_dates:
+                        d1_retained += 1
+                if cohort_at <= now_dt - timedelta(days=7):
+                    d7_eligible += 1
+                    if (cohort_date + timedelta(days=7)).isoformat() in activity_dates:
+                        d7_retained += 1
+
+            top_screens = [
+                {"screen": screen, "views": count}
+                for screen, count in sorted(screen_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+            ]
+            top_presets = [
+                {"preset": preset, "uses": count}
+                for preset, count in sorted(preset_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+            ]
+
             return {
                 "days": period_days,
                 "since": since,
@@ -2251,6 +2348,12 @@ class UserStore:
                 "image_credits": int((summary["image_credits"] or 0) if summary else 0),
                 "total_credits_spent": int((summary["total_credits_spent"] or 0) if summary else 0),
                 "text_tokens": int((summary["text_tokens"] or 0) if summary else 0),
+                "new_users": new_users,
+                "new_paid_users": new_paid_users,
+                "d1_eligible": d1_eligible,
+                "d1_retained": d1_retained,
+                "d7_eligible": d7_eligible,
+                "d7_retained": d7_retained,
                 "payers": int((payers_row["payers"] or 0) if payers_row else 0),
                 "referred_payers": int((referred_payers_row["referred_payers"] or 0) if referred_payers_row else 0),
                 "estimated_text_cost_usd": estimated_text_cost_usd,
@@ -2262,6 +2365,8 @@ class UserStore:
                 "top_referrers": top_referrers,
                 "suspicious_referrals": suspicious_referrals,
                 "sources": [dict(row) for row in source_rows],
+                "top_screens": top_screens,
+                "top_presets": top_presets,
             }
 
     def service_monitor_report(
@@ -3111,6 +3216,18 @@ def build_preset_block(plan: str) -> str:
         lines.append(f"• {cfg['label']} — {cfg['description']} ({label})")
     lines.append("• 🎨 Картинка — отдельный режим для генерации и редактирования")
     return "\n".join(lines)
+
+
+def record_ui_page_view(chat_id: int, page: str | None) -> None:
+    if page not in UI_PAGE_KEYS:
+        return
+    row = user_profile(chat_id)
+    state.user_store.record_usage_event(
+        chat_id=chat_id,
+        event_type="screen_view",
+        plan=str(row.get("plan", "")),
+        details=f"screen={page}",
+    )
 
 
 def normalize_text_content(content: Any) -> str:
@@ -5162,16 +5279,9 @@ async def send_help(chat_id: int) -> None:
 async def send_menu(chat_id: int) -> None:
     row = user_profile(chat_id)
     preset_block = build_preset_block(str(row.get("plan", "free")))
-    capabilities = (
-        "Что умею:\n"
-        "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
-        f"• 🎨 {image_capability_line().replace('• ', '')}\n"
-        "• 🧠 сохранение контекста диалога"
-    )
     text = (
         "Главное меню\n\n"
         "Выбери режим кнопками или просто напиши вопрос.\n\n"
-        f"{capabilities}\n\n"
         f"{preset_block}\n\n"
         f"{current_model_focus_block(chat_id)}\n"
         f"{usage_text(row)}\n\n"
@@ -5311,10 +5421,10 @@ def build_model_picker_text(chat_id: int) -> str:
     row = user_profile(chat_id)
     plan = str(row.get("plan", "free"))
     current_alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan))
-    lines = ["⚙ Модели", "", "Выбери модель для своего тарифа:"]
+    lines = ["⚙ Модели", "", "Здесь можно вручную выбрать текстовую модель."]
     if current_alias:
         current_label = TEXT_MODELS.get(current_alias, DEFAULT_TEXT_MODEL).label
-        lines.extend(["", f"Сейчас выбрана: {current_label}"])
+        lines.extend(["", f"**Сейчас выбрана:** {current_label}"])
     for alias in allowed_text_aliases_for_plan(plan):
         info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
         prefix = "•"
@@ -5322,7 +5432,7 @@ def build_model_picker_text(chat_id: int) -> str:
             prefix = "✅"
         lines.append(f"{prefix} {info.label} — {preset_model_hint(alias)}")
     lines.append("")
-    lines.append("После выбора бот вернёт тебя в Главное меню.")
+    lines.append("После выбора верну тебя в Главное меню.")
     return "\n".join(part for part in lines if part is not None)
 
 
@@ -5469,6 +5579,7 @@ async def show_ui_page(
         ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments, text_format=text_format)
         if ok:
             state.ui_message_mid[chat_id] = target_mid
+            record_ui_page_view(chat_id, page)
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
@@ -5476,6 +5587,7 @@ async def show_ui_page(
     sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False, text_format=text_format)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
+        record_ui_page_view(chat_id, page)
     if callback_id:
         await answer_callback(callback_id, notification)
 
@@ -5501,6 +5613,7 @@ async def show_managed_content(
         ok = await max_edit_message(chat_id, target_mid, text, attachments=attachments, text_format=text_format)
         if ok:
             state.ui_message_mid[chat_id] = target_mid
+            record_ui_page_view(chat_id, page)
             if callback_id:
                 await answer_callback(callback_id, notification)
             return
@@ -5508,6 +5621,7 @@ async def show_managed_content(
     sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=False, text_format=text_format)
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
+        record_ui_page_view(chat_id, page)
     if callback_id:
         await answer_callback(callback_id, notification)
 
@@ -5525,6 +5639,7 @@ async def send_managed_message(
     sent_mid = await max_send_message(chat_id, text, attachments=attachments, notify=notify, text_format=managed_page_text_format(page))
     if sent_mid:
         state.ui_message_mid[chat_id] = sent_mid
+        record_ui_page_view(chat_id, page)
     return sent_mid
 
 
@@ -6826,6 +6941,13 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             alias = aliases[0]
             label = await set_user_model(chat_id, alias)
             state.user_store.set_selected_preset(chat_id, preset)
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="preset_select",
+                plan=plan,
+                model_alias=alias,
+                details=f"preset={preset}",
+            )
             await show_ui_page(
                 chat_id,
                 UI_PAGE_MENU,
@@ -6886,6 +7008,13 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         try:
             label = await set_user_model(chat_id, alias)
             state.user_store.set_selected_preset(chat_id, "")
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="model_select",
+                plan=str(user_profile(chat_id).get("plan", "free")),
+                model_alias=alias,
+                details="source=manual_picker",
+            )
             target_page = state.ui_current_page.get(chat_id, UI_PAGE_MENU)
             if target_page not in UI_PAGE_KEYS:
                 target_page = UI_PAGE_MENU
@@ -7768,6 +7897,13 @@ async def handle_command(chat_id: int, text: str) -> bool:
         alias = resolve_preset_alias_for_chat(chat_id, preset)
         label = await set_user_model(chat_id, alias)
         state.user_store.set_selected_preset(chat_id, preset)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="preset_select",
+            plan=str(user_profile(chat_id).get("plan", "free")),
+            model_alias=alias,
+            details=f"preset={preset};source=command",
+        )
         await max_send_message(
             chat_id,
             f"Режим: {preset_cfg['label']}\nМодель: {label}",
@@ -7781,6 +7917,13 @@ async def handle_command(chat_id: int, text: str) -> bool:
             return True
         label = await set_user_model(chat_id, arg)
         state.user_store.set_selected_preset(chat_id, "")
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="model_select",
+            plan=str(user_profile(chat_id).get("plan", "free")),
+            model_alias=str(arg).strip().lower(),
+            details="source=command",
+        )
         await max_send_message(chat_id, f"Выбрана модель: {label}", attachments=build_keyboard())
         return True
 
@@ -8420,36 +8563,6 @@ def render_admin_login_html(error: str = "") -> str:
     error_block = ""
     if error:
         error_block = f"<p class='error-box'>{esc(error)}</p>"
-    top_referrer_rows = []
-    for row in report.get("top_referrers", []):
-        top_referrer_rows.append(
-            "<tr>"
-            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
-            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
-            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
-            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
-            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
-            f"<td>{esc(str(row.get('last_referral_at', '') or '-'))}</td>"
-            "</tr>"
-        )
-    if not top_referrer_rows:
-        top_referrer_rows.append("<tr><td colspan='6'>Пока нет данных по рефералам.</td></tr>")
-
-    suspicious_referral_rows = []
-    for row in report.get("suspicious_referrals", []):
-        suspicious_referral_rows.append(
-            "<tr>"
-            f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
-            f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
-            f"<td>{esc(str(row.get('referral_code', '') or '-'))}</td>"
-            f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
-            f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
-            f"<td>{int(row.get('active_recent_referrals', 0) or 0)}</td>"
-            "</tr>"
-        )
-    if not suspicious_referral_rows:
-        suspicious_referral_rows.append("<tr><td colspan='6'>Подозрительных реф-кластеров пока нет.</td></tr>")
-
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -8737,6 +8850,140 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
         </table>
       </div>
     </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Воронка</h2>
+        <table>
+          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
+          <tr><td>Новые пользователи</td><td>{new_users}</td><td>за {int(report.get('days', days) or days)} дней</td></tr>
+          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+          <tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>
+          <tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>
+          <tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Монетизация</h2>
+        <table>
+          <tr><th>Показатель</th><th>Значение</th></tr>
+          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
+          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
+          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
+          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
+          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
+          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Retention и конверсия</h2>
+        <table>
+          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
+          <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
+          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+          <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
+          <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Навигация и режимы</h2>
+        <div class="grid">
+          <div>
+            <table>
+              <tr><th>Экран</th><th>Просмотров</th></tr>
+              {''.join(screen_rows)}
+            </table>
+          </div>
+          <div>
+            <table>
+              <tr><th>Режим</th><th>Выборов</th></tr>
+              {''.join(preset_rows)}
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Воронка</h2>
+        <table>
+          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
+          <tr><td>Новые пользователи</td><td>{new_users}</td><td>за {int(report.get('days', days) or days)} дней</td></tr>
+          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+          <tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>
+          <tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>
+          <tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Монетизация</h2>
+        <table>
+          <tr><th>Показатель</th><th>Значение</th></tr>
+          <tr><td>ARPU</td><td>{money(arpu)} ₽</td></tr>
+          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td></tr>
+          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td></tr>
+          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td></tr>
+          <tr><td>Текстовая себестоимость / выручка</td><td>{text_cost_share_pct:.1f}%</td></tr>
+          <tr><td>Оценочная маржа после текста</td><td>{estimated_text_margin_pct:.1f}%</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Retention и конверсия</h2>
+        <table>
+          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
+          <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
+          <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+          <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
+          <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Навигация и режимы</h2>
+        <div class="grid">
+          <div>
+            <table>
+              <tr><th>Экран</th><th>Просмотров</th></tr>
+              {''.join(screen_rows)}
+            </table>
+          </div>
+          <div>
+            <table>
+              <tr><th>Режим</th><th>Выборов</th></tr>
+              {''.join(preset_rows)}
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card table-card">
+      <h2>Retention и конверсия</h2>
+      <table>
+        <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
+        <tr><td>Новые пользователи</td><td>{new_users}</td><td>За выбранный период</td></tr>
+        <tr><td>Free → paid</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+        <tr><td>D1 retention</td><td>{d1_retained}/{d1_eligible}</td><td>{d1_retention_pct:.1f}% от зрелых когорт</td></tr>
+        <tr><td>D7 retention</td><td>{d7_retained}/{d7_eligible}</td><td>{d7_retention_pct:.1f}% от зрелых когорт</td></tr>
+      </table>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Навигация</h2>
+        <table>
+          <tr><th>Экран</th><th>Просмотров</th></tr>
+          {''.join(screen_rows)}
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Режимы ответов</h2>
+        <table>
+          <tr><th>Режим</th><th>Выборов</th></tr>
+          {''.join(preset_rows)}
+        </table>
+      </div>
+    </div>
     <div class="card table-card">
       <h2>Выручка по тарифам</h2>
       <table>
@@ -8864,6 +9111,15 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     referral_bonus_credits = int(report.get("referral_bonus_credits", 0) or 0)
     referral_conversion_pct = (referred_payers * 100.0 / referral_activations) if referral_activations else 0.0
     referred_share_of_payers_pct = (referred_payers * 100.0 / payers) if payers else 0.0
+    new_users = int(report.get("new_users", 0) or 0)
+    new_paid_users = int(report.get("new_paid_users", 0) or 0)
+    free_to_paid_pct = (new_paid_users * 100.0 / new_users) if new_users else 0.0
+    d1_eligible = int(report.get("d1_eligible", 0) or 0)
+    d1_retained = int(report.get("d1_retained", 0) or 0)
+    d1_retention_pct = (d1_retained * 100.0 / d1_eligible) if d1_eligible else 0.0
+    d7_eligible = int(report.get("d7_eligible", 0) or 0)
+    d7_retained = int(report.get("d7_retained", 0) or 0)
+    d7_retention_pct = (d7_retained * 100.0 / d7_eligible) if d7_eligible else 0.0
 
     period_links = " ".join(
         f"<a class='btn {'btn-primary' if days == option else ''}' href='{esc(admin_url('/analytics', token, days=option))}'>{option} дней</a>"
@@ -9053,12 +9309,35 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     if not daily_rows:
         daily_rows.append("<tr><td colspan='3'>За период пока нет дневных данных.</td></tr>")
 
-    funnel_rows = [
-        f"<tr><td>Активные пользователи</td><td>{active_users}</td><td>100%</td></tr>",
-        f"<tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>",
-        f"<tr><td>Реферальные активации</td><td>{referral_activations}</td><td>{(referral_activations * 100.0 / active_users) if active_users else 0.0:.1f}% от активных</td></tr>",
-        f"<tr><td>Реферальные плательщики</td><td>{referred_payers}</td><td>{referred_share_of_payers_pct:.1f}% от всех плательщиков</td></tr>",
-    ]
+    screen_rows: list[str] = []
+    for row in report.get("top_screens", []):
+        screen_rows.append(
+            "<tr>"
+            f"<td>{esc(str(row.get('screen', '-') or '-'))}</td>"
+            f"<td>{int(row.get('views', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not screen_rows:
+        screen_rows.append("<tr><td colspan='2'>Пока нет данных по экранам.</td></tr>")
+
+    preset_rows: list[str] = []
+    preset_names = {
+        "fast": "⚡ Быстро",
+        "balanced": "⚖ Баланс",
+        "quality": "🧠 Качество",
+        "expert": "🚀 Эксперт",
+        "unknown": "Неизвестно",
+    }
+    for row in report.get("top_presets", []):
+        preset_key = str(row.get("preset", "unknown") or "unknown")
+        preset_rows.append(
+            "<tr>"
+            f"<td>{esc(preset_names.get(preset_key, preset_key))}</td>"
+            f"<td>{int(row.get('uses', 0) or 0)}</td>"
+            "</tr>"
+        )
+    if not preset_rows:
+        preset_rows.append("<tr><td colspan='2'>Пока нет данных по режимам.</td></tr>")
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -9109,6 +9388,61 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">Оценочная маржа</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, пока без image-cost</div></div>
         <div class="metric"><div class="metric-label">Реф. активации</div><div class="metric-value">{referral_activations}</div><div class="metric-note">Реф. плательщики: {referred_payers}, конверсия {referral_conversion_pct:.1f}%</div></div>
         <div class="metric"><div class="metric-label">Бонусы рефералки</div><div class="metric-value">{referral_bonus_credits}</div><div class="metric-note">Выдано кредитов по реферальной механике</div></div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Воронка</h2>
+        <table>
+          <tr><th>Этап</th><th>Пользователей</th><th>Доля</th></tr>
+          <tr><td>Активные пользователи</td><td>{active_users}</td><td>100%</td></tr>
+          <tr><td>Плательщики</td><td>{payers}</td><td>{pay_share:.1f}% от активных</td></tr>
+          <tr><td>Новые пользователи</td><td>{new_users}</td><td>—</td></tr>
+          <tr><td>Новые платные</td><td>{new_paid_users}</td><td>{free_to_paid_pct:.1f}% от новых</td></tr>
+        </table>
+      </div>
+      <div class="card table-card">
+        <h2>Retention и конверсия</h2>
+        <table>
+          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
+          <tr><td>D1 retention</td><td>{d1_retention_pct:.1f}%</td><td>{d1_retained} из {d1_eligible} пользователей</td></tr>
+          <tr><td>D7 retention</td><td>{d7_retention_pct:.1f}%</td><td>{d7_retained} из {d7_eligible} пользователей</td></tr>
+          <tr><td>Новые → платные</td><td>{free_to_paid_pct:.1f}%</td><td>{new_paid_users} из {new_users} новых пользователей</td></tr>
+          <tr><td>Реферальная конверсия</td><td>{referral_conversion_pct:.1f}%</td><td>{referred_payers} платящих из {referral_activations} реф-активаций</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card table-card">
+        <h2>Навигация и режимы</h2>
+        <div class="grid">
+          <div class="card table-card">
+            <h3>Популярные экраны</h3>
+            <table>
+              <tr><th>Экран</th><th>Просмотров</th></tr>
+              {''.join(screen_rows)}
+            </table>
+          </div>
+          <div class="card table-card">
+            <h3>Популярные режимы</h3>
+            <table>
+              <tr><th>Режим</th><th>Выборов</th></tr>
+              {''.join(preset_rows)}
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card table-card">
+        <h2>Монетизация</h2>
+        <table>
+          <tr><th>Метрика</th><th>Значение</th><th>Комментарий</th></tr>
+          <tr><td>ARPU</td><td>{money(arpu)} ₽</td><td>На одного активного пользователя</td></tr>
+          <tr><td>ARPPU</td><td>{money(arppu)} ₽</td><td>На одного платящего пользователя</td></tr>
+          <tr><td>Средний чек</td><td>{money(avg_check)} ₽</td><td>{payments_count} оплат за период</td></tr>
+          <tr><td>Refund rate</td><td>{refund_rate_pct:.1f}%</td><td>{refunds_count} возвратов</td></tr>
+          <tr><td>Доля текстовой себестоимости</td><td>{text_cost_share_pct:.1f}%</td><td>{money(estimated_text_cost_rub)} ₽ от чистой выручки</td></tr>
+          <tr><td>Маржа после текста</td><td>{money(estimated_text_contribution_rub)} ₽</td><td>{estimated_text_margin_pct:.1f}% от чистой выручки</td></tr>
+        </table>
       </div>
     </div>
     <div class="card table-card">
@@ -9514,6 +9848,8 @@ def render_admin_panel_html_v2(
     suspicious_users = state.user_store.suspicious_users_report(limit=20)
     selected_user = state.user_store.get_user(chat_id) if chat_id else None
     selected_payment = state.user_store.get_payment(request_id) if request_id else None
+    selected_user_payments = state.user_store.list_user_payments(chat_id, limit=8) if chat_id else []
+    selected_user_events = state.user_store.list_user_usage_events(chat_id, limit=12) if chat_id else []
     esc = html.escape
 
     def yes_no(flag: Any) -> str:
@@ -9524,18 +9860,82 @@ def render_admin_panel_html_v2(
         info_block += f"<p class='notice'>{esc(repair_mojibake(message))}</p>"
     if selected_user:
         selected_plan = str(selected_user.get("plan", "free") or "free").title()
+        selected_alias = str(selected_user.get("selected_model_alias", "") or "").strip()
+        selected_model_label = TEXT_MODELS.get(selected_alias, DEFAULT_TEXT_MODEL).label if selected_alias else "-"
+        acquisition_source = str(selected_user.get("acquisition_source", "") or "").strip() or "direct"
+        acquisition_campaign = str(selected_user.get("acquisition_campaign", "") or "").strip() or "-"
+        expires_at = format_msk_datetime(parse_iso_datetime(str(selected_user.get("subscription_expires_at", "") or ""))) if str(selected_user.get("plan", "free")) != "free" else "—"
+        referred_by = int(selected_user.get("referred_by_chat_id", 0) or 0)
         selected_user_summary = (
             "<div class='mini-grid'>"
             f"<div class='mini-metric'>Тариф<strong>{esc(selected_plan)}</strong></div>"
             f"<div class='mini-metric'>Кредиты<strong>{int(selected_user.get('credits_balance', 0) or 0)}</strong></div>"
+            f"<div class='mini-metric'>Модель<strong>{esc(selected_model_label)}</strong></div>"
             f"<div class='mini-metric'>Автопродление<strong>{yes_no(selected_user.get('recurring_enabled', 0))}</strong></div>"
             f"<div class='mini-metric'>Блок<strong>{yes_no(selected_user.get('is_blocked', 0))}</strong></div>"
             f"<div class='mini-metric'>Реф-код<strong>{esc(str(selected_user.get('referral_code', '') or '-'))}</strong></div>"
             f"<div class='mini-metric'>Пригласил<strong>{int(selected_user.get('referrals_invited', 0) or 0)}</strong></div>"
+            f"<div class='mini-metric'>Доступ до<strong>{esc(expires_at)}</strong></div>"
+            f"<div class='mini-metric'>Источник<strong>{esc(acquisition_source)}</strong></div>"
+            f"<div class='mini-metric'>Кампания<strong>{esc(acquisition_campaign)}</strong></div>"
+            f"<div class='mini-metric'>Пригласил его<strong>{referred_by if referred_by > 0 else '—'}</strong></div>"
             "</div>"
             f"<p class='muted'>chat_id: {int(selected_user.get('chat_id', 0) or 0)} • user_id: {int(selected_user.get('max_user_id', 0) or 0)} • активность: {esc(str(selected_user.get('last_active_at', '') or '-'))}</p>"
         )
-        info_block += "<h3>Пользователь</h3>" + selected_user_summary + f"<pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre>"
+        payment_history_rows = []
+        for item in selected_user_payments:
+            payment_history_rows.append(
+                "<tr>"
+                f"<td>#{int(item.get('id', 0) or 0)}</td>"
+                f"<td>{esc(payment_item_human_name(str(item.get('plan', '') or '')))}</td>"
+                f"<td>{int(item.get('amount_rub', 0) or 0)} ₽</td>"
+                f"<td>{esc(payment_status_label(str(item.get('status', '') or '')))}</td>"
+                f"<td>{esc(format_msk_datetime(parse_iso_datetime(str(item.get('created_at', '') or ''))))}</td>"
+                "</tr>"
+            )
+        if not payment_history_rows:
+            payment_history_rows.append("<tr><td colspan='5'>Платежей по пользователю пока нет.</td></tr>")
+        event_history_rows = []
+        event_names = {
+            "text_request": "Текстовый запрос",
+            "image_request": "Картинка",
+            "payment": "Оплата",
+            "refund": "Возврат",
+            "screen_view": "Экран",
+            "preset_select": "Режим",
+            "model_select": "Модель",
+            "referral_activation": "Реф-активация",
+            "referral_reward": "Реф-бонус",
+        }
+        for item in selected_user_events:
+            event_type = str(item.get("event_type", "") or "")
+            details = str(item.get("details", "") or "")
+            label = event_names.get(event_type, event_type or "Событие")
+            event_history_rows.append(
+                "<tr>"
+                f"<td>{esc(label)}</td>"
+                f"<td>{esc(str(item.get('model_alias', '') or '—'))}</td>"
+                f"<td>{int(item.get('credits_spent', 0) or 0)}</td>"
+                f"<td>{int(item.get('rub_amount', 0) or 0)} ₽</td>"
+                f"<td>{esc(details[:90] + ('…' if len(details) > 90 else ''))}</td>"
+                f"<td>{esc(format_msk_datetime(parse_iso_datetime(str(item.get('created_at', '') or ''))))}</td>"
+                "</tr>"
+            )
+        if not event_history_rows:
+            event_history_rows.append("<tr><td colspan='6'>Истории действий пока нет.</td></tr>")
+        info_block += (
+            "<h3>Пользователь</h3>"
+            + selected_user_summary
+            + "<h3>Последние оплаты пользователя</h3>"
+            + "<table><tr><th>ID</th><th>Продукт</th><th>Сумма</th><th>Статус</th><th>Когда</th></tr>"
+            + "".join(payment_history_rows)
+            + "</table>"
+            + "<h3>Последние действия пользователя</h3>"
+            + "<table><tr><th>Событие</th><th>Модель</th><th>Кредиты</th><th>Сумма</th><th>Детали</th><th>Когда</th></tr>"
+            + "".join(event_history_rows)
+            + "</table>"
+            + f"<details><summary>Сырой JSON пользователя</summary><pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre></details>"
+        )
     if selected_payment:
         payment_status_text = payment_status_label(str(selected_payment.get("status", "") or ""))
         payment_summary = (
@@ -9547,7 +9947,7 @@ def render_admin_panel_html_v2(
             "</div>"
             f"<p class='muted'>Заявка #{int(selected_payment.get('id', 0) or 0)} • chat_id: {int(selected_payment.get('chat_id', 0) or 0)} • создан: {esc(str(selected_payment.get('created_at', '') or '-'))}</p>"
         )
-        info_block += "<h3>Платёж</h3>" + payment_summary + f"<pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre>"
+        info_block += "<h3>Платёж</h3>" + payment_summary + f"<details><summary>Сырой JSON платежа</summary><pre>{esc(json.dumps(selected_payment, ensure_ascii=False, indent=2))}</pre></details>"
 
     user_rows = []
     for row in users:
