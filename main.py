@@ -4391,6 +4391,44 @@ def parse_incoming_text(update: dict[str, Any]) -> tuple[int | None, str]:
     return chat_id, text.strip()
 
 
+def _walk_for_string_value(node: Any, keys: set[str]) -> str:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in keys and isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in node.values():
+            found = _walk_for_string_value(value, keys)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _walk_for_string_value(item, keys)
+            if found:
+                return found
+    return ""
+
+
+def is_channel_update(update: dict[str, Any]) -> bool:
+    chat_type = _walk_for_string_value(update, {"type", "chat_type", "chatType"}).lower()
+    if chat_type == "channel":
+        return True
+    message = update.get("message")
+    if isinstance(message, dict):
+        recipient = message.get("recipient")
+        if isinstance(recipient, dict):
+            if str(recipient.get("type") or "").lower() == "channel":
+                return True
+            if int(recipient.get("chat_id") or 0) < 0 and not recipient.get("dialog_with_user"):
+                return True
+    chat = update.get("chat")
+    if isinstance(chat, dict):
+        if str(chat.get("type") or chat.get("chat_type") or chat.get("chatType") or "").lower() == "channel":
+            return True
+        if int(chat.get("chat_id") or 0) < 0 and not chat.get("dialog_with_user"):
+            return True
+    return False
+
+
 def _extract_nested_int(node: Any, *path: str) -> int | None:
     current = node
     for key in path:
@@ -8373,6 +8411,9 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
 
 async def process_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict) or not is_supported_update(update):
+        return
+    if is_channel_update(update):
+        log.info("Channel update skipped")
         return
     if not remember_update(update):
         log.info("Duplicate update skipped")
