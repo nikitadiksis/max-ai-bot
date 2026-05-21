@@ -143,6 +143,9 @@ SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши на�
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
+CHANNEL_GATE_ENABLED = os.getenv("CHANNEL_GATE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
+CHANNEL_MEMBERSHIP_CACHE_HOURS = int(os.getenv("CHANNEL_MEMBERSHIP_CACHE_HOURS", "12"))
 REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
 PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "0"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
@@ -757,6 +760,8 @@ class UserStore:
                     acquisition_source TEXT NOT NULL DEFAULT '',
                     acquisition_campaign TEXT NOT NULL DEFAULT '',
                     acquired_at TEXT NOT NULL DEFAULT '',
+                    channel_subscribed_at TEXT NOT NULL DEFAULT '',
+                    channel_subscription_checked_at TEXT NOT NULL DEFAULT '',
                     plan TEXT NOT NULL DEFAULT 'free',
                     is_blocked INTEGER NOT NULL DEFAULT 0,
                     onboarding_done INTEGER NOT NULL DEFAULT 0,
@@ -864,6 +869,8 @@ class UserStore:
             self._ensure_column(conn, "users", "acquisition_source", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "acquisition_campaign", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "acquired_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "channel_subscribed_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "channel_subscription_checked_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "recurring_cancel_from", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "recurring_canceled_at", "TEXT NOT NULL DEFAULT ''")
@@ -1034,6 +1041,8 @@ class UserStore:
         merged["acquisition_source"] = str(merged.get("acquisition_source", "") or "").strip() or str(current_dict.get("acquisition_source", "") or "").strip()
         merged["acquisition_campaign"] = str(merged.get("acquisition_campaign", "") or "").strip() or str(current_dict.get("acquisition_campaign", "") or "").strip()
         merged["acquired_at"] = later_iso(merged.get("acquired_at", ""), current_dict.get("acquired_at", ""))
+        merged["channel_subscribed_at"] = later_iso(merged.get("channel_subscribed_at", ""), current_dict.get("channel_subscribed_at", ""))
+        merged["channel_subscription_checked_at"] = later_iso(merged.get("channel_subscription_checked_at", ""), current_dict.get("channel_subscription_checked_at", ""))
         merged["receipt_email"] = str(merged.get("receipt_email", "") or "").strip() or str(current_dict.get("receipt_email", "") or "").strip()
         merged["receipt_phone"] = str(merged.get("receipt_phone", "") or "").strip() or str(current_dict.get("receipt_phone", "") or "").strip()
         merged["last_active_at"] = later_iso(merged.get("last_active_at", ""), current_dict.get("last_active_at", ""))
@@ -1127,6 +1136,7 @@ class UserStore:
                 """
                 UPDATE users
                 SET max_user_id = ?, acquisition_source = ?, acquisition_campaign = ?, acquired_at = ?,
+                    channel_subscribed_at = ?, channel_subscription_checked_at = ?,
                     plan = ?, is_blocked = ?, onboarding_done = ?, referral_code = ?,
                     referred_by_chat_id = ?, referrals_invited = ?, receipt_email = ?, receipt_phone = ?,
                     selected_model_alias = ?, selected_preset = ?, subscription_expires_at = ?,
@@ -1141,6 +1151,8 @@ class UserStore:
                     str(merged.get("acquisition_source", "") or ""),
                     str(merged.get("acquisition_campaign", "") or ""),
                     str(merged.get("acquired_at", "") or ""),
+                    str(merged.get("channel_subscribed_at", "") or ""),
+                    str(merged.get("channel_subscription_checked_at", "") or ""),
                     str(merged.get("plan", "free") or "free"),
                     int(merged.get("is_blocked", 0) or 0),
                     int(merged.get("onboarding_done", 0) or 0),
@@ -1257,6 +1269,20 @@ class UserStore:
             conn.execute(
                 "UPDATE users SET onboarding_done = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if done else 0, datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def mark_channel_subscription(self, chat_id: int, subscribed: bool) -> None:
+        now = datetime.utcnow().replace(microsecond=0).isoformat()
+        subscribed_at = now if subscribed else ""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET channel_subscribed_at = ?, channel_subscription_checked_at = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (subscribed_at, now, now, chat_id),
             )
             conn.commit()
 
@@ -2816,6 +2842,115 @@ def channel_url_value() -> str:
     return CHANNEL_URL or "https://max.ru/id231128398751_biz"
 
 
+def channel_chat_id_value() -> str:
+    if CHANNEL_CHAT_ID:
+        return CHANNEL_CHAT_ID
+    path = urlsplit(channel_url_value()).path.strip("/")
+    return path.rsplit("/", 1)[-1].strip() if path else ""
+
+
+def channel_subscription_cache_valid(row: dict[str, Any]) -> bool:
+    subscribed_at = parse_iso_datetime(str(row.get("channel_subscribed_at", "") or ""))
+    checked_at = parse_iso_datetime(str(row.get("channel_subscription_checked_at", "") or ""))
+    if subscribed_at is None or checked_at is None:
+        return False
+    cache_hours = max(1, CHANNEL_MEMBERSHIP_CACHE_HOURS)
+    return datetime.utcnow() - checked_at <= timedelta(hours=cache_hours)
+
+
+def response_contains_user_id(node: Any, user_id: int) -> bool:
+    if isinstance(node, dict):
+        for key in ("user_id", "userId", "id"):
+            value = node.get(key)
+            if isinstance(value, int) and value == user_id:
+                return True
+            if isinstance(value, str) and value.isdigit() and int(value) == user_id:
+                return True
+        return any(response_contains_user_id(value, user_id) for value in node.values())
+    if isinstance(node, list):
+        return any(response_contains_user_id(item, user_id) for item in node)
+    return False
+
+
+def response_has_member_items(node: Any) -> bool:
+    if isinstance(node, list):
+        return len(node) > 0
+    if not isinstance(node, dict):
+        return False
+    for key in ("members", "items", "participants", "users"):
+        value = node.get(key)
+        if isinstance(value, list):
+            return len(value) > 0
+        if isinstance(value, dict):
+            if response_has_member_items(value):
+                return True
+    return False
+
+
+def channel_membership_response_is_positive(data: Any, max_user_id: int) -> bool:
+    return response_contains_user_id(data, max_user_id) or response_has_member_items(data)
+
+
+async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple[bool, str]:
+    if not CHANNEL_GATE_ENABLED:
+        return True, "disabled"
+    if is_admin(chat_id):
+        return True, "admin"
+
+    row = user_profile(chat_id)
+    if not force and channel_subscription_cache_valid(row):
+        return True, "cached"
+
+    max_user_id = int(row.get("max_user_id", 0) or 0)
+    if max_user_id <= 0:
+        await notify_admin_alert("channel_gate_user_id", f"Не удалось определить max_user_id для chat_id={chat_id}")
+        return False, "no_user_id"
+
+    channel_id = channel_chat_id_value()
+    if not MAX_TOKEN or not channel_id:
+        await notify_admin_alert(
+            "channel_gate_config",
+            f"Проверка подписки включена, но не хватает MAX_TOKEN или CHANNEL_CHAT_ID. chat_id={chat_id}",
+        )
+        return True, "config_missing"
+
+    session = await get_session()
+    url = f"{MAX_API}/chats/{quote(channel_id, safe='')}/members"
+    try:
+        async with session.get(
+            url,
+            headers=max_headers(),
+            params={"user_ids": str(max_user_id)},
+        ) as resp:
+            data: Any
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = await resp.text()
+            if resp.status >= 400:
+                await notify_admin_alert(
+                    "channel_gate_api",
+                    f"MAX members check failed: status={resp.status}, channel_id={channel_id}, user_id={max_user_id}, body={str(data)[:300]}",
+                )
+                return True, f"api_error_{resp.status}"
+    except Exception as exc:
+        await notify_admin_alert(
+            "channel_gate_api",
+            f"MAX members check exception: channel_id={channel_id}, user_id={max_user_id}, error={exc}",
+        )
+        return True, "api_exception"
+
+    subscribed = channel_membership_response_is_positive(data, max_user_id)
+    state.user_store.mark_channel_subscription(chat_id, subscribed)
+    state.user_store.record_usage_event(
+        chat_id=chat_id,
+        event_type="channel_subscription_check",
+        plan=str(row.get("plan", "")),
+        details=f"subscribed={1 if subscribed else 0};force={1 if force else 0};channel_id={channel_id}",
+    )
+    return subscribed, "subscribed" if subscribed else "not_subscribed"
+
+
 def support_admin_templates_text() -> str:
     return (
         "Шаблоны для спорных кейсов\n\n"
@@ -2943,6 +3078,12 @@ def smoke_check_report() -> list[dict[str, str]]:
     add_check("Models config", CONFIG_PATH.exists(), str(CONFIG_PATH))
     add_check("Site index", site_file("index.html").exists(), str(site_file("index.html")))
     add_check("T-Bank", bool(TBANK_TERMINAL_KEY and TBANK_PASSWORD), "Терминал и пароль настроены" if TBANK_TERMINAL_KEY and TBANK_PASSWORD else "Проверь TBANK_TERMINAL_KEY / TBANK_PASSWORD")
+    channel_id = channel_chat_id_value()
+    add_check(
+        "Channel gate",
+        (not CHANNEL_GATE_ENABLED) or bool(MAX_TOKEN and channel_id),
+        "Включен, channel_id=" + channel_id if CHANNEL_GATE_ENABLED and channel_id else ("Выключен" if not CHANNEL_GATE_ENABLED else "Нет CHANNEL_CHAT_ID / CHANNEL_URL"),
+    )
     return checks
 
 
@@ -2973,6 +3114,11 @@ def service_status_report() -> dict[str, Any]:
         "latest_backup_path": str(backup_file) if backup_file else "",
         "latest_backup_at": backup_mtime.isoformat() if backup_mtime else "",
         "recent_runtime_errors": recent_errors,
+        "channel_gate": {
+            "enabled": CHANNEL_GATE_ENABLED,
+            "channel_id": channel_chat_id_value(),
+            "cache_hours": CHANNEL_MEMBERSHIP_CACHE_HOURS,
+        },
         "monitor": monitor,
         "smoke_checks": smoke_check_report(),
     }
@@ -3398,6 +3544,42 @@ def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
             },
         }
     ]
+
+
+def build_channel_gate_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [{"type": "link", "text": "📣 Подписаться на канал", "url": channel_url_value()}],
+                    [{"type": "callback", "text": "✅ Проверить подписку", "payload": "channel_gate:check"}],
+                    [{"type": "callback", "text": "Помощь", "payload": "action:support"}],
+                ]
+            },
+        }
+    ]
+
+
+def channel_gate_text() -> str:
+    return (
+        "Чтобы пользоваться ботом, подпишись на канал проекта.\n\n"
+        "1. Нажми «Подписаться на канал».\n"
+        "2. Вернись сюда и нажми «Проверить подписку».\n\n"
+        "Если ты уже подписан, просто нажми проверку."
+    )
+
+
+def channel_gate_allows_payload(payload: str) -> bool:
+    return payload in {"channel_gate:check", "action:channel", "action:support"}
+
+
+def channel_gate_allows_text(text: str) -> bool:
+    value = text.strip()
+    if not value.startswith("/"):
+        return False
+    command = value.split(maxsplit=1)[0].lower()
+    return command in {"/start", "/id", "/support", "/channel"}
 
 
 def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) -> list[dict[str, Any]]:
@@ -5491,6 +5673,35 @@ async def show_managed_content(
         await answer_callback(callback_id, notification)
 
 
+async def show_channel_gate(
+    chat_id: int,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+    notification: str = "Нужна подписка",
+) -> None:
+    await show_managed_content(
+        chat_id,
+        channel_gate_text(),
+        attachments=build_channel_gate_keyboard(),
+        callback_id=callback_id,
+        source_mid=source_mid,
+        notification=notification,
+        force_new=False,
+    )
+
+
+async def ensure_channel_access(
+    chat_id: int,
+    callback_id: str | None = None,
+    source_mid: str | None = None,
+) -> bool:
+    ok, _reason = await check_channel_subscription(chat_id, force=False)
+    if ok:
+        return True
+    await show_channel_gate(chat_id, callback_id=callback_id, source_mid=source_mid)
+    return False
+
+
 async def send_managed_message(
     chat_id: int,
     text: str,
@@ -5605,6 +5816,11 @@ async def send_growth_menu(chat_id: int) -> None:
 
 
 async def send_channel(chat_id: int) -> None:
+    if CHANNEL_GATE_ENABLED:
+        subscribed, _ = await check_channel_subscription(chat_id, force=False)
+        if not subscribed:
+            await show_channel_gate(chat_id, notification="Канал")
+            return
     await send_managed_message(
         chat_id,
         f"📣 Канал проекта:\n{channel_url_value()}",
@@ -6688,6 +6904,40 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return False
     ensure_update_user_binding(chat_id, update)
 
+    if payload == "channel_gate:check":
+        ok, reason = await check_channel_subscription(chat_id, force=True)
+        if ok:
+            row = user_profile(chat_id)
+            if int(row.get("onboarding_done", 0) or 0) == 0:
+                await show_onboarding_step(
+                    chat_id,
+                    step=1,
+                    callback_id=callback_id,
+                    source_mid=source_mid,
+                    notification="Подписка подтверждена",
+                )
+            else:
+                await show_ui_page(
+                    chat_id,
+                    UI_PAGE_MENU,
+                    callback_id=callback_id,
+                    source_mid=source_mid,
+                    push_history=False,
+                    notification="Подписка подтверждена" if reason in {"subscribed", "cached"} else "Открываю меню",
+                )
+        else:
+            await show_channel_gate(
+                chat_id,
+                callback_id=callback_id,
+                source_mid=source_mid,
+                notification="Подписка не найдена",
+            )
+        return True
+
+    if CHANNEL_GATE_ENABLED and not channel_gate_allows_payload(payload):
+        if not await ensure_channel_access(chat_id, callback_id=callback_id, source_mid=source_mid):
+            return True
+
     if payload.startswith("reply_action:"):
         reply_action = payload.split(":", 1)[1].strip()
         reply_page_map = {
@@ -6924,6 +7174,16 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload == "action:channel":
+        if CHANNEL_GATE_ENABLED:
+            subscribed, _ = await check_channel_subscription(chat_id, force=False)
+            if not subscribed:
+                await show_channel_gate(
+                    chat_id,
+                    callback_id=callback_id,
+                    source_mid=source_mid,
+                    notification="Канал",
+                )
+                return True
         await show_managed_content(
             chat_id,
             f"📣 Канал проекта:\n{channel_url_value()}",
@@ -7580,6 +7840,9 @@ async def handle_command(chat_id: int, text: str) -> bool:
                     log_referral_activation(chat_id, owner_chat_id, start_ref, "start_command")
                     await notify_referral_success(chat_id, owner_chat_id, "start")
                     row = user_profile(chat_id)
+        if command == "/start" and CHANNEL_GATE_ENABLED:
+            if not await ensure_channel_access(chat_id):
+                return True
         if command == "/start" and int(row.get("onboarding_done", 0) or 0) == 0:
             await send_onboarding(chat_id, step=1)
             return True
@@ -7968,6 +8231,10 @@ async def process_update(update: dict[str, Any]) -> None:
         referral_applied = await maybe_apply_start_referral(chat_id, update)
         if referral_applied:
             row = user_profile(chat_id)
+
+    if CHANNEL_GATE_ENABLED and not channel_gate_allows_text(text or ""):
+        if not await ensure_channel_access(chat_id):
+            return
 
     if incoming_image_url:
         try:

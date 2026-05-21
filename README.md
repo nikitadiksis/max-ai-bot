@@ -102,6 +102,9 @@ TBANK_FAIL_URL=
 SUPPORT_URL=
 SUPPORT_TEXT=Поддержка: напиши нам, поможем быстро.
 CHANNEL_URL=https://max.ru/id231128398751_biz
+CHANNEL_GATE_ENABLED=1
+CHANNEL_CHAT_ID=
+CHANNEL_MEMBERSHIP_CACHE_HOURS=12
 REFERRAL_BONUS_CREDITS=120
 PROMO_WELCOME_CREDITS=0
 # Campaign promo codes for channel posts/ads: CODE:credits,CODE2:credits
@@ -158,13 +161,14 @@ REFERENCE_IMAGE_TTL_MINUTES=180
 
 ## Ad Leads Through The Channel
 
-When ads send people to the channel first, the bot cannot see the channel join itself.
-Use campaign promo codes instead:
+When ads send people to the channel first, keep using campaign promo codes for attribution.
+The bot also checks channel membership before normal usage when `CHANNEL_GATE_ENABLED=1`:
 
 - publish one code in the channel post, for example `MAYPOST:120`
 - add it to server `.env` as `PROMO_CODES=MAYPOST:120`
 - users open the bot, go to `Бонусы`, press `Промокод`, and enter the code
 - `/analytics` shows activations, paid users, conversion, issued credits, and revenue by promo code
+- `CHANNEL_CHAT_ID` can be left empty if `CHANNEL_URL` contains the MAX channel id/slug; set it manually if MAX requires another id
 
 Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
 - `/admin help`
