@@ -342,9 +342,9 @@ TARIFFS_TEXT = (
     "• free: дневной бонус кредитов\n"
     "• lite/start/pro: доступ по кредитам\n\n"
     "Модели по тарифам:\n"
-    "• free: DeepSeek V4 Flash, GPT-4.1 Nano\n"
-    "• lite/start: + GPT-4o Mini и Gemini 2.5 Flash\n"
-    "• pro: + GPT-5.4"
+    "• **Free**: DeepSeek V4 Flash, GPT-4.1 Nano\n"
+    "• **Lite / Start**: + GPT-4o Mini и Gemini 2.5 Flash\n"
+    "• **Pro**: + GPT-5.4"
 )
 
 BUY_TEXT = (
@@ -4319,10 +4319,10 @@ def build_tariffs_text() -> str:
         f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов\n"
         f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов\n\n"
         "Модели по тарифам:\n"
-        "• Free: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
-        "• Lite: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
-        f"• Start: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image{start_gpt54_line}\n"
-        f"• Pro: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image, GPT-5.4{pro_gpt54_line}\n\n"
+        "• **Free**: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
+        "• **Lite**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
+        f"• **Start**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image{start_gpt54_line}\n"
+        f"• **Pro**: DeepSeek V4 Flash, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image, GPT-5.4{pro_gpt54_line}\n\n"
         "🪙 Обычно списывается:\n"
         f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
         f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
