@@ -6761,6 +6761,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "image_share_manual":
         if callback_id:
             await answer_callback(callback_id, "Перешли это сообщение с картинкой другу.")
+        await max_send_message(
+            chat_id,
+            "Чтобы поделиться картинкой, просто перешли это сообщение с изображением другу.",
+            notify=False,
+        )
         return True
 
     if payload.startswith("onboard:") and int(user_profile(chat_id).get("onboarding_done", 0) or 0) == 1:
