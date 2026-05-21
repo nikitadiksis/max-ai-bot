@@ -3329,8 +3329,7 @@ def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) ->
         buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
     buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
     if include_share:
-        code = str(row.get("referral_code", "")).strip() or referral_code_for_chat(chat_id)
-        buttons.append([{"type": "link", "text": "🔗 Поделиться", "url": max_share_url(referral_share_message_v2(code))}])
+        buttons.append([{"type": "callback", "text": "📤 Поделиться картинкой", "payload": "image_share_manual"}])
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -4768,6 +4767,17 @@ async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, di
     )
 
 
+def friendly_image_generation_error(exc: Exception, *, is_edit: bool = False) -> str:
+    text = str(exc).strip()
+    if "Image was not returned by the selected model." in text or "Edited image was not returned by the selected model." in text:
+        if is_edit:
+            return "Не удалось получить готовую картинку по фото. Попробуй ещё раз чуть позже или измени описание."
+        return "Не удалось получить картинку от модели. Попробуй ещё раз чуть позже или немного измени запрос."
+    if is_edit:
+        return f"Не удалось обработать фото: {text}" if text else "Не удалось обработать фото. Попробуй ещё раз позже."
+    return f"Не удалось сгенерировать картинку: {text}" if text else "Не удалось сгенерировать картинку. Попробуй ещё раз позже."
+
+
 async def fetch_image_bytes(url: str, use_max_auth: bool = False) -> ImageResult:
     session = await get_session()
     headers = max_headers() if use_max_auth else None
@@ -5012,6 +5022,10 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
         )
         with suppress(Exception):
             await maybe_send_low_credits_nudge(chat_id)
+    except RuntimeError as exc:
+        state.user_store.refund_credits(chat_id, img_cost)
+        log.warning("Image generation failed for chat_id=%s: %s", chat_id, exc)
+        await max_send_message(chat_id, friendly_image_generation_error(exc), attachments=build_image_menu_keyboard(chat_id))
     except Exception:
         state.user_store.refund_credits(chat_id, img_cost)
         raise
@@ -5079,6 +5093,10 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
         )
         with suppress(Exception):
             await maybe_send_low_credits_nudge(chat_id)
+    except RuntimeError as exc:
+        state.user_store.refund_credits(chat_id, edit_cost)
+        log.warning("Image edit failed for chat_id=%s: %s", chat_id, exc)
+        await max_send_message(chat_id, friendly_image_generation_error(exc, is_edit=True), attachments=build_image_menu_keyboard(chat_id))
     except Exception:
         state.user_store.refund_credits(chat_id, edit_cost)
         raise
@@ -6739,6 +6757,11 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 force_new=True,
             )
             return True
+
+    if payload == "image_share_manual":
+        if callback_id:
+            await answer_callback(callback_id, "Перешли это сообщение с картинкой другу.")
+        return True
 
     if payload.startswith("onboard:") and int(user_profile(chat_id).get("onboarding_done", 0) or 0) == 1:
         if callback_id:
