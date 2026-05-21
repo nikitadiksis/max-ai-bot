@@ -161,6 +161,16 @@ AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").strip().lower() not 
 AUTO_BACKUP_INTERVAL_HOURS = int(os.getenv("AUTO_BACKUP_INTERVAL_HOURS", "24"))
 ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("ERROR_ALERT_COOLDOWN_SEC", "120"))
 ERROR_ALERTS_ENABLED = os.getenv("ERROR_ALERTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+SERVICE_MONITOR_ENABLED = os.getenv("SERVICE_MONITOR_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+SERVICE_MONITOR_INTERVAL_MINUTES = int(os.getenv("SERVICE_MONITOR_INTERVAL_MINUTES", "15"))
+ALERT_HIGH_ERRORS_WINDOW_MINUTES = int(os.getenv("ALERT_HIGH_ERRORS_WINDOW_MINUTES", "30"))
+ALERT_HIGH_ERRORS_THRESHOLD = int(os.getenv("ALERT_HIGH_ERRORS_THRESHOLD", "8"))
+ALERT_LOW_PAYMENTS_LOOKBACK_HOURS = int(os.getenv("ALERT_LOW_PAYMENTS_LOOKBACK_HOURS", "24"))
+ALERT_LOW_PAYMENTS_MIN_ACTIVE_USERS = int(os.getenv("ALERT_LOW_PAYMENTS_MIN_ACTIVE_USERS", "15"))
+ALERT_LOW_PAYMENTS_MAX_PAYMENTS = int(os.getenv("ALERT_LOW_PAYMENTS_MAX_PAYMENTS", "0"))
+ALERT_SPEND_SPIKE_LOOKBACK_HOURS = int(os.getenv("ALERT_SPEND_SPIKE_LOOKBACK_HOURS", "1"))
+ALERT_SPEND_SPIKE_MIN_RUB = float(os.getenv("ALERT_SPEND_SPIKE_MIN_RUB", "150"))
+ALERT_SPEND_SPIKE_MULTIPLIER = float(os.getenv("ALERT_SPEND_SPIKE_MULTIPLIER", "3.0"))
 REENGAGE_DORMANT_DAYS = int(os.getenv("REENGAGE_DORMANT_DAYS", "5"))
 REENGAGE_BATCH_LIMIT = int(os.getenv("REENGAGE_BATCH_LIMIT", "30"))
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
@@ -2146,9 +2156,82 @@ class UserStore:
                 "suspicious_referrals": suspicious_referrals,
             }
 
+    def service_monitor_report(
+        self,
+        payments_hours: int = 24,
+        spend_hours: int = 1,
+        baseline_hours: int = 24,
+    ) -> dict[str, Any]:
+        payments_window = max(1, int(payments_hours or 24))
+        spend_window = max(1, int(spend_hours or 1))
+        baseline_window = max(spend_window + 1, int(baseline_hours or 24))
+        now = datetime.utcnow()
+        payments_since = (now - timedelta(hours=payments_window)).isoformat()
+        spend_since = (now - timedelta(hours=spend_window)).isoformat()
+        baseline_since = (now - timedelta(hours=baseline_window)).isoformat()
+        baseline_until = spend_since
+
+        with self._connect() as conn:
+            payments_row = conn.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT CASE WHEN event_type IN ('text_request', 'image_request') THEN chat_id END) AS active_users,
+                    SUM(CASE WHEN event_type = 'payment' AND rub_amount > 0 THEN 1 ELSE 0 END) AS payments_count,
+                    SUM(CASE WHEN event_type = 'payment' THEN rub_amount ELSE 0 END) AS revenue_rub,
+                    SUM(CASE WHEN event_type = 'refund' THEN rub_amount ELSE 0 END) AS refunds_rub
+                FROM usage_events
+                WHERE created_at >= ?
+                """,
+                (payments_since,),
+            ).fetchone()
+
+            recent_rows = conn.execute(
+                """
+                SELECT model_alias, tokens_total, details
+                FROM usage_events
+                WHERE created_at >= ? AND event_type = 'text_request'
+                """,
+                (spend_since,),
+            ).fetchall()
+            baseline_rows = conn.execute(
+                """
+                SELECT model_alias, tokens_total, details
+                FROM usage_events
+                WHERE created_at >= ? AND created_at < ? AND event_type = 'text_request'
+                """,
+                (baseline_since, baseline_until),
+            ).fetchall()
+
+        def rows_cost_rub(rows: list[sqlite3.Row]) -> float:
+            total_usd = 0.0
+            for row in rows:
+                alias = str(row["model_alias"] or "").strip()
+                _, _, model_info = model_info_for_alias(alias)
+                prompt_tokens, completion_tokens = parse_usage_details_blob(str(row["details"] or ""))
+                total_tokens = int(row["tokens_total"] or 0)
+                total_usd += estimate_text_cost_usd(model_info, prompt_tokens, completion_tokens, total_tokens)
+            return total_usd * ANALYTICS_USD_TO_RUB
+
+        recent_cost_rub = rows_cost_rub(recent_rows)
+        baseline_total_cost_rub = rows_cost_rub(baseline_rows)
+        baseline_hourly_cost_rub = baseline_total_cost_rub / float(max(1, baseline_window - spend_window))
+        baseline_cost_for_window_rub = baseline_hourly_cost_rub * spend_window
+        return {
+            "payments_window_hours": payments_window,
+            "spend_window_hours": spend_window,
+            "active_users": int((payments_row["active_users"] or 0) if payments_row else 0),
+            "payments_count": int((payments_row["payments_count"] or 0) if payments_row else 0),
+            "revenue_rub": int((payments_row["revenue_rub"] or 0) if payments_row else 0),
+            "refunds_rub": int((payments_row["refunds_rub"] or 0) if payments_row else 0),
+            "recent_text_cost_rub": recent_cost_rub,
+            "baseline_text_cost_rub": baseline_cost_for_window_rub,
+            "baseline_hourly_text_cost_rub": baseline_hourly_cost_rub,
+        }
+
 
 class BotState:
     def __init__(self) -> None:
+        self.started_at = datetime.utcnow()
         self.user_histories: dict[int, deque[dict[str, str]]] = {}
         self.pending_receipt_plan: dict[int, str] = {}
         self.pending_image_prompt: set[int] = set()
@@ -2164,6 +2247,7 @@ class BotState:
         self.last_image_at: dict[int, datetime] = {}
         self.last_low_credits_nudge_at: dict[int, datetime] = {}
         self.error_alert_last_at: dict[str, datetime] = {}
+        self.runtime_error_events: deque[datetime] = deque()
         self.ui_message_mid: dict[int, str] = {}
         self.onboarding_message_mid: dict[int, str] = {}
         self.ui_current_page: dict[int, str] = {}
@@ -2172,6 +2256,7 @@ class BotState:
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.backup_task: asyncio.Task[None] | None = None
+        self.monitor_task: asyncio.Task[None] | None = None
         self.user_store = UserStore(DB_PATH)
 
     def history(self, chat_id: int) -> deque[dict[str, str]]:
@@ -2297,6 +2382,14 @@ async def notify_admin_alert(key: str, text: str) -> None:
     for admin_id in admin_target_chat_ids():
         with suppress(Exception):
             await max_send_message(admin_id, f"⚠️ ALERT [{key}]\n{text}", notify=False)
+
+
+def record_runtime_error() -> None:
+    now = datetime.utcnow()
+    state.runtime_error_events.append(now)
+    cutoff = now - timedelta(hours=24)
+    while state.runtime_error_events and state.runtime_error_events[0] < cutoff:
+        state.runtime_error_events.popleft()
 
 
 def require_env() -> None:
@@ -2634,6 +2727,76 @@ def create_db_backup() -> Path:
             with suppress(Exception):
                 old.unlink()
     return target
+
+
+def latest_backup_file() -> Path | None:
+    files = sorted(backups_dir().glob("bot-*.sqlite3"))
+    return files[-1] if files else None
+
+
+def format_timedelta_short(delta: timedelta) -> str:
+    total_seconds = max(0, int(delta.total_seconds()))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def smoke_check_report() -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = []
+
+    def add_check(name: str, ok: bool, details: str) -> None:
+        checks.append({"name": name, "ok": "ok" if ok else "fail", "details": details})
+
+    add_check("MAX token", bool(MAX_TOKEN), "Настроен" if MAX_TOKEN else "Пустой MAX_TOKEN")
+    add_check("OpenRouter key", bool(OPENROUTER_KEY), "Настроен" if OPENROUTER_KEY else "Пустой OPENROUTER_KEY")
+    add_check("DB file", DB_PATH.exists(), f"{DB_PATH} ({DB_PATH.stat().st_size if DB_PATH.exists() else 0} bytes)")
+    add_check("HTTP session", state.session is not None and not state.session.closed, "aiohttp session ready" if state.session and not state.session.closed else "session closed")
+    add_check("Polling task", RUN_MODE != "polling" or (state.polling_task is not None and not state.polling_task.done()), "active" if RUN_MODE != "polling" or (state.polling_task and not state.polling_task.done()) else "not running")
+    add_check("Backup task", (not AUTO_BACKUP_ENABLED) or (state.backup_task is not None and not state.backup_task.done()), "active" if AUTO_BACKUP_ENABLED and state.backup_task and not state.backup_task.done() else ("disabled" if not AUTO_BACKUP_ENABLED else "not running"))
+    add_check("Monitor task", (not SERVICE_MONITOR_ENABLED) or (state.monitor_task is not None and not state.monitor_task.done()), "active" if SERVICE_MONITOR_ENABLED and state.monitor_task and not state.monitor_task.done() else ("disabled" if not SERVICE_MONITOR_ENABLED else "not running"))
+    add_check("Models config", CONFIG_PATH.exists(), str(CONFIG_PATH))
+    add_check("Site index", site_file("index.html").exists(), str(site_file("index.html")))
+    add_check("T-Bank", bool(TBANK_TERMINAL_KEY and TBANK_PASSWORD), "Терминал и пароль настроены" if TBANK_TERMINAL_KEY and TBANK_PASSWORD else "Проверь TBANK_TERMINAL_KEY / TBANK_PASSWORD")
+    return checks
+
+
+def service_status_report() -> dict[str, Any]:
+    now = datetime.utcnow()
+    db_exists = DB_PATH.exists()
+    db_size = DB_PATH.stat().st_size if db_exists else 0
+    backup_file = latest_backup_file()
+    backup_mtime = datetime.utcfromtimestamp(backup_file.stat().st_mtime) if backup_file and backup_file.exists() else None
+    error_cutoff = now - timedelta(minutes=max(1, ALERT_HIGH_ERRORS_WINDOW_MINUTES))
+    recent_errors = sum(1 for ts in state.runtime_error_events if ts >= error_cutoff)
+    monitor = state.user_store.service_monitor_report(
+        payments_hours=ALERT_LOW_PAYMENTS_LOOKBACK_HOURS,
+        spend_hours=ALERT_SPEND_SPIKE_LOOKBACK_HOURS,
+        baseline_hours=max(24, ALERT_SPEND_SPIKE_LOOKBACK_HOURS * 24),
+    )
+    return {
+        "generated_at": now.isoformat(),
+        "run_mode": RUN_MODE,
+        "uptime": format_timedelta_short(now - state.started_at),
+        "db_exists": db_exists,
+        "db_path": str(DB_PATH),
+        "db_size_bytes": db_size,
+        "session_ready": bool(state.session and not state.session.closed),
+        "polling_task": bool(state.polling_task and not state.polling_task.done()),
+        "backup_task": bool(state.backup_task and not state.backup_task.done()),
+        "monitor_task": bool(state.monitor_task and not state.monitor_task.done()),
+        "latest_backup_path": str(backup_file) if backup_file else "",
+        "latest_backup_at": backup_mtime.isoformat() if backup_mtime else "",
+        "recent_runtime_errors": recent_errors,
+        "monitor": monitor,
+        "smoke_checks": smoke_check_report(),
+    }
 
 
 def payment_status_label(status: str) -> str:
@@ -7821,6 +7984,7 @@ async def process_update(update: dict[str, Any]) -> None:
     except Exception as exc:
         log.exception("Failed to process update")
         capture_exception_safe(exc)
+        record_runtime_error()
         await notify_admin_alert("process_update", f"chat_id={chat_id}\nerror={exc}")
         with suppress(Exception):
             await max_send_message(chat_id, f"Ошибка: {exc}")
@@ -7866,6 +8030,7 @@ async def polling_loop() -> None:
         except Exception as exc:
             log.exception("Polling loop error")
             capture_exception_safe(exc)
+            record_runtime_error()
             await notify_admin_alert("polling_loop", f"Polling loop error: {exc}")
             await asyncio.sleep(3)
 
@@ -7883,7 +8048,122 @@ async def backup_loop() -> None:
         except Exception as exc:
             log.exception("Automatic backup failed")
             capture_exception_safe(exc)
+            record_runtime_error()
             await notify_admin_alert("db_backup", f"Automatic DB backup failed: {exc}")
+
+
+async def monitor_loop() -> None:
+    interval_seconds = max(300, SERVICE_MONITOR_INTERVAL_MINUTES * 60)
+    log.info("Service monitor loop started, interval=%ss", interval_seconds)
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            report = service_status_report()
+            monitor = report["monitor"]
+            recent_errors = int(report["recent_runtime_errors"] or 0)
+            if recent_errors >= max(1, ALERT_HIGH_ERRORS_THRESHOLD):
+                await notify_admin_alert(
+                    "high_errors",
+                    f"За последние {ALERT_HIGH_ERRORS_WINDOW_MINUTES} минут ошибок: {recent_errors}",
+                )
+            active_users = int(monitor.get("active_users", 0) or 0)
+            payments_count = int(monitor.get("payments_count", 0) or 0)
+            if active_users >= max(1, ALERT_LOW_PAYMENTS_MIN_ACTIVE_USERS) and payments_count <= max(0, ALERT_LOW_PAYMENTS_MAX_PAYMENTS):
+                await notify_admin_alert(
+                    "low_payments",
+                    (
+                        f"За последние {ALERT_LOW_PAYMENTS_LOOKBACK_HOURS} ч активных пользователей: {active_users}, "
+                        f"оплат: {payments_count}. Проверь платежный UX и конверсию."
+                    ),
+                )
+            recent_cost = float(monitor.get("recent_text_cost_rub", 0.0) or 0.0)
+            baseline_cost = float(monitor.get("baseline_text_cost_rub", 0.0) or 0.0)
+            if (
+                recent_cost >= max(0.0, ALERT_SPEND_SPIKE_MIN_RUB)
+                and baseline_cost > 0
+                and recent_cost >= baseline_cost * max(1.1, ALERT_SPEND_SPIKE_MULTIPLIER)
+            ):
+                await notify_admin_alert(
+                    "spend_spike",
+                    (
+                        f"Текстовая себестоимость за последние {ALERT_SPEND_SPIKE_LOOKBACK_HOURS} ч выросла до "
+                        f"{recent_cost:.0f} ₽ против ожидаемых {baseline_cost:.0f} ₽."
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Service monitor loop failed")
+            capture_exception_safe(exc)
+            record_runtime_error()
+            await notify_admin_alert("service_monitor", f"Service monitor loop failed: {exc}")
+
+
+def render_status_html(token: str) -> str:
+    report = service_status_report()
+    esc = html.escape
+    smoke_rows = []
+    for row in report["smoke_checks"]:
+        ok = row["ok"] == "ok"
+        smoke_rows.append(
+            "<tr>"
+            f"<td>{'✅' if ok else '❌'} {esc(str(row['name']))}</td>"
+            f"<td>{esc(str(row['details']))}</td>"
+            "</tr>"
+        )
+    monitor = report["monitor"]
+    backup_at = report["latest_backup_at"] or "-"
+    backup_path = report["latest_backup_path"] or "-"
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Состояние сервиса</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+  <style>
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; font-size:14px; vertical-align:top; }}
+    .mini-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:10px; margin:14px 0; }}
+    .mini-metric {{ border:1px solid var(--line); border-radius:12px; padding:12px; background:#fcfdff; }}
+    .mini-metric strong {{ display:block; font-size:22px; margin-top:4px; }}
+    .muted {{ color:var(--muted); }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top"><span class="badge">Состояние сервиса</span><span class="badge">Срез: {esc(str(report['generated_at']))}</span></div>
+      <h1>Статус бота</h1>
+      <div class="actions">
+        <a class="btn" href="{esc(admin_url('/analytics', token))}">Аналитика</a>
+        <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn btn-primary" href="{esc(admin_url('/status', token))}">Обновить</a>
+        <a class="btn" href="{esc(admin_url('/health/deep', token))}">JSON</a>
+      </div>
+      <div class="mini-grid">
+        <div class="mini-metric">Run mode<strong>{esc(str(report['run_mode']))}</strong></div>
+        <div class="mini-metric">Uptime<strong>{esc(str(report['uptime']))}</strong></div>
+        <div class="mini-metric">DB size<strong>{int(report['db_size_bytes']) // 1024} KB</strong></div>
+        <div class="mini-metric">Ошибки за окно<strong>{int(report['recent_runtime_errors'])}</strong></div>
+        <div class="mini-metric">Активные за {ALERT_LOW_PAYMENTS_LOOKBACK_HOURS}ч<strong>{int(monitor.get('active_users', 0) or 0)}</strong></div>
+        <div class="mini-metric">Оплаты за {ALERT_LOW_PAYMENTS_LOOKBACK_HOURS}ч<strong>{int(monitor.get('payments_count', 0) or 0)}</strong></div>
+        <div class="mini-metric">Text cost {ALERT_SPEND_SPIKE_LOOKBACK_HOURS}ч<strong>{float(monitor.get('recent_text_cost_rub', 0.0) or 0.0):.0f} ₽</strong></div>
+        <div class="mini-metric">Baseline cost<strong>{float(monitor.get('baseline_text_cost_rub', 0.0) or 0.0):.0f} ₽</strong></div>
+      </div>
+      <p class="muted">Последний бэкап: {esc(str(backup_at))}<br/>{esc(str(backup_path))}</p>
+      <p class="muted">Polling: {'on' if report['polling_task'] else 'off'} • Backup loop: {'on' if report['backup_task'] else 'off'} • Monitor loop: {'on' if report['monitor_task'] else 'off'} • HTTP session: {'ok' if report['session_ready'] else 'closed'}</p>
+    </div>
+    <div class="card">
+      <h2>Smoke-check после деплоя</h2>
+      <table>
+        <tr><th>Проверка</th><th>Детали</th></tr>
+        {''.join(smoke_rows)}
+      </table>
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 @asynccontextmanager
@@ -7896,6 +8176,8 @@ async def lifespan(_: FastAPI):
         state.polling_task = asyncio.create_task(polling_loop())
     if AUTO_BACKUP_ENABLED:
         state.backup_task = asyncio.create_task(backup_loop())
+    if SERVICE_MONITOR_ENABLED:
+        state.monitor_task = asyncio.create_task(monitor_loop())
     try:
         yield
     finally:
@@ -7907,6 +8189,10 @@ async def lifespan(_: FastAPI):
             state.backup_task.cancel()
             with suppress(asyncio.CancelledError):
                 await state.backup_task
+        if state.monitor_task:
+            state.monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.monitor_task
         if state.session and not state.session.closed:
             await state.session.close()
 
@@ -7916,8 +8202,36 @@ app.mount("/assets", StaticFiles(directory=str(SITE_DIR / "assets")), name="asse
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "run_mode": RUN_MODE}
+async def health() -> dict[str, Any]:
+    report = service_status_report()
+    return {
+        "status": "ok" if report["db_exists"] and report["session_ready"] else "degraded",
+        "run_mode": report["run_mode"],
+        "uptime": report["uptime"],
+        "db_exists": report["db_exists"],
+        "backup_task": report["backup_task"],
+        "monitor_task": report["monitor_task"],
+    }
+
+
+@app.get("/health/deep")
+async def health_deep(request: Request, token: str = "") -> dict[str, Any]:
+    auth_token = resolve_admin_token(request, token)
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="auth required")
+    return service_status_report()
+
+
+@app.get("/status", response_class=HTMLResponse)
+async def status_page(request: Request, token: str = "") -> HTMLResponse:
+    auth_token = resolve_admin_token(request, token)
+    if not auth_token:
+        response = HTMLResponse(render_admin_login_html("Нужен пароль администратора."), status_code=401)
+        clear_admin_cookie(response)
+        return response
+    response = HTMLResponse(render_status_html(auth_token))
+    set_admin_cookie(response, auth_token)
+    return response
 
 
 @app.get("/", response_class=FileResponse)
@@ -8252,6 +8566,7 @@ def render_admin_analytics_html(token: str, days: int = 30) -> str:
       <div class="panel-nav">
         <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
         <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/status', token))}">Статус</a>
         <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
       </div>
       <div class="actions">{period_links}</div>
@@ -9221,6 +9536,7 @@ def render_admin_panel_html_v2(
       <div class="actions">
         <a class="btn" href="{esc(admin_url('/analytics', token))}">Аналитика</a>
         <a class="btn btn-primary" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/status', token))}">Статус</a>
         <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='backup'))}">Создать бэкап БД</a>
         <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='nudge'))}">Реактивировать free</a>
         <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
@@ -9308,6 +9624,7 @@ async def max_webhook(request: Request) -> dict[str, bool]:
         except Exception as exc:
             log.exception("Unhandled webhook processing error")
             capture_exception_safe(exc)
+            record_runtime_error()
             await notify_admin_alert("max_webhook", f"Unhandled webhook error: {exc}")
     return {"ok": True}
 
