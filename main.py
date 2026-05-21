@@ -3328,8 +3328,6 @@ def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) ->
     if str(row.get("plan", "free")) == "free":
         buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
     buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
-    if include_share:
-        buttons.append([{"type": "callback", "text": "📤 Поделиться картинкой", "payload": "image_share_manual"}])
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
@@ -6757,16 +6755,6 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 force_new=True,
             )
             return True
-
-    if payload == "image_share_manual":
-        if callback_id:
-            await answer_callback(callback_id, "Перешли это сообщение с картинкой другу.")
-        await max_send_message(
-            chat_id,
-            "Чтобы поделиться картинкой, просто перешли это сообщение с изображением другу.",
-            notify=False,
-        )
-        return True
 
     if payload.startswith("onboard:") and int(user_profile(chat_id).get("onboarding_done", 0) or 0) == 1:
         if callback_id:
