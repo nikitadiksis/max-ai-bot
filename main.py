@@ -2453,6 +2453,7 @@ class BotState:
         self.last_low_credits_nudge_at: dict[int, datetime] = {}
         self.error_alert_last_at: dict[str, datetime] = {}
         self.runtime_error_events: deque[datetime] = deque()
+        self.channel_chat_id_cache: str = ""
         self.ui_message_mid: dict[int, str] = {}
         self.onboarding_message_mid: dict[int, str] = {}
         self.ui_current_page: dict[int, str] = {}
@@ -2855,6 +2856,112 @@ def channel_chat_id_value() -> str:
     return value
 
 
+def normalize_channel_link(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw if raw.startswith(("http://", "https://")) else f"https://max.ru/{raw.strip('/')}")
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.strip("/").lower()
+    return f"{host}/{path}".rstrip("/")
+
+
+def extract_chats_from_response(data: Any) -> tuple[list[dict[str, Any]], str]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)], ""
+    if not isinstance(data, dict):
+        return [], ""
+    for key in ("chats", "items", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            marker = str(data.get("marker") or data.get("next_marker") or data.get("nextMarker") or "")
+            return [item for item in value if isinstance(item, dict)], marker
+    return [], ""
+
+
+def chat_id_from_chat_item(item: dict[str, Any]) -> str:
+    for key in ("chat_id", "chatId", "id"):
+        value = item.get(key)
+        if isinstance(value, (int, str)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def chat_item_link_values(item: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("link", "url", "invite_link", "inviteLink", "public_link", "publicLink"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+    for key in ("description", "payload", "settings"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            values.extend(chat_item_link_values(value))
+    return values
+
+
+async def resolve_channel_chat_id() -> str:
+    if CHANNEL_CHAT_ID:
+        return channel_chat_id_value()
+    if state.channel_chat_id_cache:
+        return state.channel_chat_id_cache
+    if not MAX_TOKEN:
+        return ""
+
+    session = await get_session()
+    marker = ""
+    target_link = normalize_channel_link(channel_url_value())
+    channel_candidates: list[dict[str, Any]] = []
+    for _ in range(5):
+        params = {"count": "100"}
+        if marker:
+            params["marker"] = marker
+        async with session.get(f"{MAX_API}/chats", headers=max_headers(), params=params) as resp:
+            data: Any
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = await resp.text()
+            if resp.status >= 400:
+                await notify_admin_alert("channel_gate_resolve", f"MAX chats resolve failed: status={resp.status}, body={str(data)[:300]}")
+                return ""
+        chats, marker = extract_chats_from_response(data)
+        for item in chats:
+            chat_type = str(item.get("type") or item.get("chat_type") or item.get("chatType") or "").lower()
+            status = str(item.get("status") or "").lower()
+            if chat_type and chat_type not in {"channel", "chat"}:
+                continue
+            if status and status not in {"active", "enabled"}:
+                continue
+            item_id = chat_id_from_chat_item(item)
+            if not item_id:
+                continue
+            normalized_links = [normalize_channel_link(value) for value in chat_item_link_values(item)]
+            if target_link and target_link in normalized_links:
+                state.channel_chat_id_cache = item_id
+                return item_id
+            if chat_type == "channel":
+                channel_candidates.append(item)
+        if not marker:
+            break
+
+    if len(channel_candidates) == 1:
+        item_id = chat_id_from_chat_item(channel_candidates[0])
+        if item_id:
+            state.channel_chat_id_cache = item_id
+            await notify_admin_alert(
+                "channel_gate_resolve",
+                f"CHANNEL_CHAT_ID не задан. Использую единственный найденный канал chat_id={item_id}.",
+            )
+            return item_id
+
+    await notify_admin_alert(
+        "channel_gate_resolve",
+        "Не удалось найти канал бота через /chats. Добавь бота в канал как админа или задай CHANNEL_CHAT_ID вручную.",
+    )
+    return ""
+
+
 def channel_subscription_cache_valid(row: dict[str, Any]) -> bool:
     subscribed_at = parse_iso_datetime(str(row.get("channel_subscribed_at", "") or ""))
     checked_at = parse_iso_datetime(str(row.get("channel_subscription_checked_at", "") or ""))
@@ -2912,11 +3019,11 @@ async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple
         await notify_admin_alert("channel_gate_user_id", f"Не удалось определить max_user_id для chat_id={chat_id}")
         return False, "no_user_id"
 
-    channel_id = channel_chat_id_value()
+    channel_id = await resolve_channel_chat_id()
     if not MAX_TOKEN or not channel_id:
         await notify_admin_alert(
             "channel_gate_config",
-            f"Проверка подписки включена, но не хватает MAX_TOKEN или CHANNEL_CHAT_ID. chat_id={chat_id}",
+            f"Проверка подписки включена, но не найден chat_id канала. chat_id={chat_id}",
         )
         return True, "config_missing"
 
@@ -2938,6 +3045,8 @@ async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple
                     "channel_gate_api",
                     f"MAX members check failed: status={resp.status}, channel_id={channel_id}, user_id={max_user_id}, body={str(data)[:300]}",
                 )
+                if resp.status == 400 and "dialogs" in str(data).lower():
+                    state.channel_chat_id_cache = ""
                 return True, f"api_error_{resp.status}"
     except Exception as exc:
         await notify_admin_alert(
@@ -3084,11 +3193,12 @@ def smoke_check_report() -> list[dict[str, str]]:
     add_check("Models config", CONFIG_PATH.exists(), str(CONFIG_PATH))
     add_check("Site index", site_file("index.html").exists(), str(site_file("index.html")))
     add_check("T-Bank", bool(TBANK_TERMINAL_KEY and TBANK_PASSWORD), "Терминал и пароль настроены" if TBANK_TERMINAL_KEY and TBANK_PASSWORD else "Проверь TBANK_TERMINAL_KEY / TBANK_PASSWORD")
-    channel_id = channel_chat_id_value()
+    channel_source = "manual" if CHANNEL_CHAT_ID else "auto"
+    channel_configured = channel_chat_id_value() if CHANNEL_CHAT_ID else channel_url_value()
     add_check(
         "Channel gate",
-        (not CHANNEL_GATE_ENABLED) or bool(MAX_TOKEN and channel_id),
-        "Включен, channel_id=" + channel_id if CHANNEL_GATE_ENABLED and channel_id else ("Выключен" if not CHANNEL_GATE_ENABLED else "Нет CHANNEL_CHAT_ID / CHANNEL_URL"),
+        (not CHANNEL_GATE_ENABLED) or bool(MAX_TOKEN and channel_configured),
+        f"Включен, source={channel_source}, configured={channel_configured}" if CHANNEL_GATE_ENABLED and channel_configured else ("Выключен" if not CHANNEL_GATE_ENABLED else "Нет CHANNEL_CHAT_ID / CHANNEL_URL"),
     )
     return checks
 
@@ -3122,7 +3232,8 @@ def service_status_report() -> dict[str, Any]:
         "recent_runtime_errors": recent_errors,
         "channel_gate": {
             "enabled": CHANNEL_GATE_ENABLED,
-            "channel_id": channel_chat_id_value(),
+            "configured_channel": channel_chat_id_value() if CHANNEL_CHAT_ID else channel_url_value(),
+            "resolved_channel_chat_id": state.channel_chat_id_cache,
             "cache_hours": CHANNEL_MEMBERSHIP_CACHE_HOURS,
         },
         "monitor": monitor,

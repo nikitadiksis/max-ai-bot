@@ -168,7 +168,7 @@ The bot also checks channel membership before normal usage when `CHANNEL_GATE_EN
 - add it to server `.env` as `PROMO_CODES=MAYPOST:120`
 - users open the bot, go to `Бонусы`, press `Промокод`, and enter the code
 - `/analytics` shows activations, paid users, conversion, issued credits, and revenue by promo code
-- `CHANNEL_CHAT_ID` can be left empty if `CHANNEL_URL` looks like `https://max.ru/id231128398751_biz`: the bot will use numeric `231128398751` for MAX API checks
+- `CHANNEL_CHAT_ID` can be left empty: the bot tries to resolve the real channel chat id from `/chats`; if resolution fails, add the bot to the channel as admin or set `CHANNEL_CHAT_ID` manually
 
 Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
 - `/admin help`
