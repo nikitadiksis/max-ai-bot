@@ -71,6 +71,7 @@ CREDIT_COST_GEMINI=5
 CREDIT_COST_GPT54=20
 CREDIT_COST_IMAGE=35
 CREDIT_COST_IMAGE_EDIT=55
+PUBLIC_REQUEST_UNIT_CREDITS=5
 VAR_CREDITS_PER_1K_DEEPSEEK=0
 VAR_CREDITS_PER_1K_GPT=1
 VAR_CREDITS_PER_1K_GPTO=1
@@ -107,7 +108,7 @@ CHANNEL_CHAT_ID=
 CHANNEL_MEMBERSHIP_CACHE_HOURS=12
 REFERRAL_BONUS_CREDITS=120
 PROMO_WELCOME_CREDITS=0
-# Campaign promo codes for channel posts/ads: CODE:credits,CODE2:credits
+# Campaign promo codes for channel posts/ads: CODE:internal_credits,CODE2:internal_credits
 PROMO_CODES=
 ADMIN_PANEL_TOKEN=change_me_strong_token
 ADMIN_MAX_USER_IDS=
@@ -139,6 +140,8 @@ SENTRY_ENVIRONMENT=production
 REFERENCE_IMAGE_TTL_MINUTES=180
 ```
 
+Public UI uses requests. Internally the database still stores credits for compatibility; `PUBLIC_REQUEST_UNIT_CREDITS=5` means 1 public request = 5 internal credits.
+
 ## Commands
 
 - `/start`, `/menu`, `/help`
@@ -147,7 +150,7 @@ REFERENCE_IMAGE_TTL_MINUTES=180
 - `/tariffs`
 - `/topup`
 - `/buy <lite|start|pro>`
-- `/credits`
+- `/credits`, `/requests`
 - `/payments`
 - `/ref [code]`
 - `/promo <code>`
@@ -167,7 +170,7 @@ The bot also checks channel membership before normal usage when `CHANNEL_GATE_EN
 - publish one code in the channel post, for example `MAYPOST:120`
 - add it to server `.env` as `PROMO_CODES=MAYPOST:120`
 - users open the bot, go to `Бонусы`, press `Промокод`, and enter the code
-- `/analytics` shows activations, paid users, conversion, issued credits, and revenue by promo code
+- `/analytics` shows activations, paid users, conversion, issued request bonuses, and revenue by promo code
 - `CHANNEL_CHAT_ID` can be left empty: the bot tries to resolve the real channel chat id from `/chats`; if resolution fails, add the bot to the channel as admin or set `CHANNEL_CHAT_ID` manually
 
 Admin (`ADMIN_IDS` or `ADMIN_MAX_USER_IDS`):
@@ -202,7 +205,7 @@ docker compose up -d --build bot
 Data persistence:
 
 - SQLite DB and local backups are stored in `./data`
-- Docker mounts `./data:/app/data`, so user plans, credits, and payments survive rebuild/restart
+- Docker mounts `./data:/app/data`, so user plans, request balances, and payments survive rebuild/restart
 
 Health check:
 

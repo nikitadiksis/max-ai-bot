@@ -5,7 +5,7 @@
 MAX AI bot with:
 - text answers through OpenRouter
 - image generation
-- tariffs, credits, promo/referral mechanics
+- tariffs, public requests, internal credits, promo/referral mechanics
 - T-Bank payments
 - static website in `site/`
 
@@ -76,7 +76,7 @@ Use `.env.example` only for documented placeholders/defaults.
 These are important project-specific UX rules:
 
 - User identity must be bound to stable MAX `user_id`; `chat_id` is only the current dialog route
-- If MAX creates a new `chat_id` after chat deletion/restart, subscription and free-credit state must follow the same user
+- If MAX creates a new `chat_id` after chat deletion/restart, subscription and free request balance state must follow the same user
 - Only model answers should create a fresh new message
 - UI screens should update/replace the current managed message
 - Replies after model output may open a new managed screen
@@ -95,7 +95,7 @@ T-Bank flow requirements:
 - do not start payment without buyer contact for receipt
 - recurring consent must be explicit before subscription payment
 - payment status screen should keep payment URL available
-- refund-related changes must keep plan/credits consistent
+- refund-related changes must keep plan/request balance consistent
 
 ## Website
 

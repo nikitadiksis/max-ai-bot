@@ -88,6 +88,7 @@ CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
 CREDIT_COST_IMAGE_EDIT = int(os.getenv("CREDIT_COST_IMAGE_EDIT", "55"))
+PUBLIC_REQUEST_UNIT_CREDITS = max(1, int(os.getenv("PUBLIC_REQUEST_UNIT_CREDITS", "5")))
 VAR_CREDITS_PER_1K_DEEPSEEK = int(os.getenv("VAR_CREDITS_PER_1K_DEEPSEEK", "0"))
 VAR_CREDITS_PER_1K_GPT = int(os.getenv("VAR_CREDITS_PER_1K_GPT", "1"))
 VAR_CREDITS_PER_1K_GPTO = int(os.getenv("VAR_CREDITS_PER_1K_GPTO", "1"))
@@ -313,13 +314,13 @@ HELP_TEXT = (
     "/image <описание> — сгенерировать картинку\n"
     "/image_ref <описание> — сгенерировать по последнему фото\n"
     "/tariffs — тарифы\n"
-    "/topup — пакеты кредитов\n"
+    "/topup — пакеты запросов\n"
     "/buy <lite|start|pro> — заявка на подписку\n"
     "/payments — мои заявки\n"
     "/ref [код] — реферальный код и активация\n"
     "/promo <код> — активировать промокод\n"
     "/channel — наш канал\n"
-    "/credits — остаток кредитов\n"
+    "/credits или /requests — остаток запросов\n"
     "/support — помощь по оплате и работе бота\n"
     "/clear — очистить контекст"
 )
@@ -658,7 +659,7 @@ def referral_share_message_v2(code: str) -> str:
         "3. Нажми «Ввести реф-код»\n"
         "4. Вставь код друга:\n"
         f"`{normalized}`\n\n"
-        f"После активации тебе и мне начислят по +{REFERRAL_BONUS_CREDITS} кредитов."
+        f"После активации тебе и мне начислят по +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов."
     )
 
 
@@ -3553,6 +3554,33 @@ def credits_for_plan(plan: str) -> int:
     return int(PLAN_CREDITS.get(plan, 0))
 
 
+def public_requests_from_credits(credits: int) -> int:
+    return max(0, int(credits or 0) // PUBLIC_REQUEST_UNIT_CREDITS)
+
+
+def public_request_cost_from_credits(credits: int) -> int:
+    credits = max(0, int(credits or 0))
+    if credits <= 0:
+        return 0
+    return (credits + PUBLIC_REQUEST_UNIT_CREDITS - 1) // PUBLIC_REQUEST_UNIT_CREDITS
+
+
+def credits_for_public_requests(requests: int) -> int:
+    return max(0, int(requests or 0)) * PUBLIC_REQUEST_UNIT_CREDITS
+
+
+def normalize_public_request_credit_cost(credits: int) -> int:
+    return credits_for_public_requests(public_request_cost_from_credits(credits))
+
+
+def request_balance_text(credits: int) -> str:
+    return str(public_requests_from_credits(credits))
+
+
+def request_cost_text(credits: int) -> str:
+    return str(public_request_cost_from_credits(credits))
+
+
 def topup_plan_code(code: str) -> str:
     return f"topup_{code}"
 
@@ -3576,7 +3604,11 @@ def text_credit_cost(alias: str) -> int:
 
 
 def image_credit_cost() -> int:
-    return CREDIT_COST_IMAGE
+    return normalize_public_request_credit_cost(CREDIT_COST_IMAGE)
+
+
+def image_edit_credit_cost() -> int:
+    return normalize_public_request_credit_cost(CREDIT_COST_IMAGE_EDIT)
 
 
 def text_var_credits_per_1k(alias: str) -> int:
@@ -4039,8 +4071,8 @@ def build_image_menu_text(chat_id: int) -> str:
         return (
             "🎨 Картинки\n\n"
             f"{availability_block}"
-            f"Генерация: {CREDIT_COST_IMAGE} кредитов.\n"
-            f"Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.\n\n"
+            f"Генерация: {request_cost_text(image_credit_cost())} запросов.\n"
+            f"Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов.\n\n"
             "Сначала выбери, что хочешь сделать:\n"
             "• сгенерировать новую картинку\n"
             "• изменить фото"
@@ -4057,7 +4089,7 @@ def build_image_menu_text(chat_id: int) -> str:
             "Выбери готовый сценарий или не выбирай его.\n"
             "После этого откроется шаг со стилем и форматом.\n\n"
             f"{availability_block}"
-            f"Стоимость: {CREDIT_COST_IMAGE} кредитов."
+            f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
         )
     if panel == "style":
         return (
@@ -4069,7 +4101,7 @@ def build_image_menu_text(chat_id: int) -> str:
         "🖼 Сценарии для фото\n\n"
         "Выбери готовый сценарий для редактирования фото или не выбирай его.\n"
         "После этого откроется шаг со стилем и форматом.\n\n"
-        f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+        f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
         f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
     )
 
@@ -4115,7 +4147,7 @@ def build_quick_topup_keyboard(code: str) -> list[dict[str, Any]]:
                     [
                         {
                             "type": "callback",
-                            "text": f"⚡ Быстро докупить {label} ({credits} кр / {price_rub}₽)",
+                            "text": f"⚡ Быстро докупить {label} ({request_balance_text(credits)} запросов / {price_rub}₽)",
                             "payload": f"topup_quick:{payload_code}",
                         }
                     ],
@@ -4169,7 +4201,7 @@ def build_tariffs_keyboard_pricing() -> list[dict[str, Any]]:
                     buy_row_1,
                     buy_row_2,
                     [
-                        {"type": "callback", "text": "⭐ Пакеты кредитов", "payload": "action:topups"},
+                        {"type": "callback", "text": "⭐ Пакеты запросов", "payload": "action:topups"},
                         {"type": "callback", "text": "Мои оплаты", "payload": "action:payments"},
                     ],
                     [
@@ -4194,21 +4226,21 @@ def build_topups_keyboard() -> list[dict[str, Any]]:
                     [
                         {
                             "type": "callback",
-                            "text": f"🪙 Small {small['credits']} кр • {small['price_rub']}₽",
+                            "text": f"🪙 Small {request_balance_text(int(small['credits']))} запросов • {small['price_rub']}₽",
                             "payload": "topup:small",
                         },
                     ],
                     [
                         {
                             "type": "callback",
-                            "text": f"💎 Medium {medium['credits']} кр • {medium['price_rub']}₽",
+                            "text": f"💎 Medium {request_balance_text(int(medium['credits']))} запросов • {medium['price_rub']}₽",
                             "payload": "topup:medium",
                         },
                     ],
                     [
                         {
                             "type": "callback",
-                            "text": f"🚀 Large {large['credits']} кр • {large['price_rub']}₽",
+                            "text": f"🚀 Large {request_balance_text(int(large['credits']))} запросов • {large['price_rub']}₽",
                             "payload": "topup:large",
                         },
                     ],
@@ -4289,11 +4321,15 @@ def model_line(model: ModelInfo, include_prices: bool) -> str:
         f"для чего: {model.description}",
     ]
     if model.kind == "text" and model.alias in MODEL_CREDIT_COSTS:
-        lines.append(f"списание: {MODEL_CREDIT_COSTS[model.alias]} кредитов/запрос")
+        fixed_requests = public_request_cost_from_credits(text_credit_cost(model.alias))
+        if text_var_credits_per_1k(model.alias) > 0:
+            lines.append(f"списание: обычно {fixed_requests} запрос, длинный ответ до {fixed_requests + 1}")
+        else:
+            lines.append(f"списание: {fixed_requests} запрос")
     if model.kind == "image":
         lines.append(
-            f"списание: {CREDIT_COST_IMAGE} кредитов/картинка, "
-            f"{CREDIT_COST_IMAGE_EDIT} кредитов/картинка по фото"
+            f"списание: {request_cost_text(image_credit_cost())} запросов/картинка, "
+            f"{request_cost_text(image_edit_credit_cost())} запросов/редактирование фото"
         )
     if include_prices:
         lines.append(f"цена: in ${model.input_price_usd_per_m}/M, out ${model.output_price_usd_per_m}/M")
@@ -4642,28 +4678,29 @@ def build_tariffs_text() -> str:
     pro_cfg = PLAN_CONFIGS["pro"]
     start_gpt54_line = f"+ GPT-5.4 в «Эксперт» до {start_cfg.daily_gpt54_limit}/день" if start_cfg.daily_gpt54_limit > 0 else "как Lite"
     pro_gpt54_line = f"+ GPT-5.4 без дневного лимита" if pro_cfg.daily_gpt54_limit <= 0 else f"+ GPT-5.4 до {pro_cfg.daily_gpt54_limit}/день"
-    free_nano_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_GPT))
-    free_ds_approx = max(0, FREE_DAILY_CREDITS // max(1, CREDIT_COST_DEEPSEEK))
+    free_requests = public_requests_from_credits(FREE_DAILY_CREDITS)
+    lite_requests = public_requests_from_credits(credits_for_plan("lite"))
+    start_requests = public_requests_from_credits(credits_for_plan("start"))
+    pro_requests = public_requests_from_credits(credits_for_plan("pro"))
+    gpt54_fixed_requests = request_cost_text(text_credit_cost("gpt54"))
+    gpt54_long_requests = request_cost_text(text_credit_cost("gpt54") + MAX_VARIABLE_CREDITS_PER_TEXT)
     return (
         "💠 Тарифы:\n"
-        f"• 🆓 **Free (бесплатный)**: {FREE_DAILY_CREDITS} кредитов/день (примерно {free_nano_approx} GPT-4.1 Nano или {free_ds_approx} DeepSeek запросов) + 1 картинка / 7 дней\n"
-        f"• 🍬 **Lite**: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {credits_for_plan('lite')} кредитов\n"
-        f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {credits_for_plan('start')} кредитов\n"
-        f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {credits_for_plan('pro')} кредитов\n\n"
+        f"• 🆓 **Free (бесплатный)**: {free_requests} запросов/день + 1 картинка / 7 дней\n"
+        f"• 🍬 **Lite**: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {lite_requests} запросов\n"
+        f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {start_requests} запросов\n"
+        f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {pro_requests} запросов\n\n"
         "Модели по тарифам:\n"
         "• **Free**: DeepSeek V4 Flash, GPT-4.1 Nano, Gemini 2.5 Flash Image (1 раз в 7 дней)\n"
         "• **Lite**: + GPT-4o Mini, Gemini 2.5 Flash, Gemini 2.5 Flash Image\n"
         f"• **Start**: {start_gpt54_line}\n"
         f"• **Pro**: {pro_gpt54_line}\n\n"
         "🪙 Обычно списывается:\n"
-        f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
-        f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
-        f"• GPT-4o Mini: ~{CREDIT_COST_GPTO + 1}\n"
-        f"• Gemini 2.5 Flash: ~{CREDIT_COST_GEMINI + 1}\n"
-        f"• GPT-5.4: ~{CREDIT_COST_GPT54 + 2}\n"
-        f"• Картинка: {CREDIT_COST_IMAGE}\n"
-        f"• По фото (image-to-image): {CREDIT_COST_IMAGE_EDIT}\n\n"
-        "Точное списание за текст зависит от длины и сложности ответа.\n"
+        "• Текст: 1 запрос\n"
+        "• Длинный ответ: до 2 запросов\n"
+        f"• GPT-5.4: {gpt54_fixed_requests}-{gpt54_long_requests} запросов\n"
+        f"• Картинка: {request_cost_text(image_credit_cost())} запросов\n"
+        f"• Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов\n\n"
         "Для платных тарифов действует автопродление.\n"
         "Перед оплатой мы отдельно попросим согласие с суммой и периодичностью.\n"
         "Отменить автопродление можно в разделе «Мой план»."
@@ -4721,14 +4758,14 @@ def usage_text(row: dict[str, Any]) -> str:
     text = (
         f"План: {plan_name}\n"
         f"Подписка до: {expires_text}\n"
-        f"Кредиты: {balance}"
+        f"Запросы: {request_balance_text(balance)}"
     )
     if bonus_total > 0 and bonus_expires:
         bonus_dt = parse_iso_datetime(bonus_expires)
         bonus_until = bonus_dt.strftime("%Y-%m-%d %H:%M UTC") if bonus_dt else bonus_expires
-        text += f"\n🎁 Временный бонус: {bonus_total} кредитов (сгорит {bonus_until})"
+        text += f"\n🎁 Временный бонус: {request_balance_text(bonus_total)} запросов (сгорит {bonus_until})"
     if plan_name == "free":
-        text += f"\nДневной бонус free: {FREE_DAILY_CREDITS} кредитов"
+        text += f"\nДневной бонус free: {request_balance_text(FREE_DAILY_CREDITS)} запросов"
         next_at = free_image_next_available_at(row)
         if free_image_is_available(row):
             text += "\nКартинки на free: 1/1 доступна сейчас"
@@ -4805,10 +4842,12 @@ async def maybe_send_low_credits_nudge(chat_id: int) -> None:
     balance = int(row.get("credits_balance", 0) or 0)
     threshold = low_credits_threshold_for_plan(plan_name)
     state.last_low_credits_nudge_at[chat_id] = datetime.utcnow()
+    balance_requests = request_balance_text(balance)
+    threshold_requests = request_balance_text(threshold)
     await max_send_message(
         chat_id,
         (
-            f"⚠️ Осталось мало кредитов: {balance} (порог уведомления: {threshold}).\n"
+            f"⚠️ Осталось мало запросов: {balance_requests} (порог уведомления: {threshold_requests}).\n"
             "Чтобы не прерывать диалог, можно быстро докупить пакет в 1 тап."
         ),
         attachments=build_quick_topup_keyboard(TOPUP_QUICK_CODE),
@@ -4839,14 +4878,16 @@ def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) ->
         return True, ""
     balance = int(row.get("credits_balance", 0) or 0)
     if balance < amount:
+        needed_requests = request_cost_text(amount)
+        available_requests = request_balance_text(balance)
         if plan_name == "free":
             return (
                 False,
-                f"На сегодня free-кредиты закончились для операции «{operation_name}». Нужно {amount}, доступно {balance}. Завтра бонус обновится, либо открой «Тарифы».",
+                f"На сегодня free-запросы закончились для операции «{operation_name}». Нужно {needed_requests}, доступно {available_requests}. Завтра бонус обновится, либо открой «Тарифы».",
             )
         return (
             False,
-            f"Недостаточно кредитов для операции «{operation_name}». Нужно {amount}, доступно {balance}. Открой «Тарифы».",
+            f"Недостаточно запросов для операции «{operation_name}». Нужно {needed_requests}, доступно {available_requests}. Открой «Тарифы».",
         )
     ok = state.user_store.consume_credits(chat_id, amount)
     if not ok:
@@ -4854,7 +4895,7 @@ def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) ->
         balance = int(row.get("credits_balance", 0) or 0)
         return (
             False,
-            f"Недостаточно кредитов для операции «{operation_name}». Нужно {amount}, доступно {balance}. Открой «Тарифы».",
+            f"Недостаточно запросов для операции «{operation_name}». Нужно {request_cost_text(amount)}, доступно {request_balance_text(balance)}. Открой «Тарифы».",
         )
     return True, ""
 
@@ -5390,7 +5431,7 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
         await max_send_message(chat_id, reason, attachments=build_keyboard())
         return True
 
-    edit_cost = max(CREDIT_COST_IMAGE_EDIT, CREDIT_COST_IMAGE + 1)
+    edit_cost = image_edit_credit_cost()
     ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
     if not ok_credit:
         await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
@@ -5667,27 +5708,27 @@ def build_topups_text() -> str:
     large = TOPUP_PACKS["large"]
 
     def approx_images(credits: int) -> int:
-        if CREDIT_COST_IMAGE <= 0:
+        if image_credit_cost() <= 0:
             return 0
-        return credits // CREDIT_COST_IMAGE
+        return credits // image_credit_cost()
 
     return (
-        "⭐ Пакеты кредитов\n\n"
-        f"• Small: {small['credits']} кредитов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
-        f"• Medium: {medium['credits']} кредитов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
-        f"• Large: {large['credits']} кредитов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
-        "Кредиты списываются за запросы к моделям и генерацию картинок.\n"
+        "⭐ Пакеты запросов\n\n"
+        f"• Small: {request_balance_text(int(small['credits']))} запросов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
+        f"• Medium: {request_balance_text(int(medium['credits']))} запросов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
+        f"• Large: {request_balance_text(int(large['credits']))} запросов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
+        "Запросы списываются за ответы моделей и генерацию картинок.\n"
         "Перед созданием оплаты бот попросит подтверждение покупки пакета."
     )
 
 
 def active_promo_lines() -> list[str]:
     promo_items = sorted(promo_catalog().items())
-    lines = [f"• {code}: +{credits} кредитов" for code, credits in promo_items[:6]]
+    lines = [f"• {code}: +{request_balance_text(credits)} запросов" for code, credits in promo_items[:6]]
     channel = channel_promo_meta()
     if channel["enabled"] and channel["active"]:
         lines.append(
-            f"• {channel['code']}: +{channel['credits']} кредитов "
+            f"• {channel['code']}: +{request_balance_text(int(channel['credits']))} запросов "
             f"(акция {channel['days_left']} дн, бонус на {channel['bonus_ttl_days']} дн)"
         )
     return lines
@@ -5700,7 +5741,7 @@ def build_growth_text(chat_id: int, row: dict[str, Any] | None = None) -> str:
     promo_lines = active_promo_lines()
     promo_block = "\n".join(promo_lines) if promo_lines else "• Сейчас активных промокодов нет"
     welcome_line = (
-        f"Базовый промокод: /promo WELCOME (+{PROMO_WELCOME_CREDITS} кредитов, 1 раз)\n"
+        f"Базовый промокод: /promo WELCOME (+{request_balance_text(PROMO_WELCOME_CREDITS)} запросов, 1 раз)\n"
         if PROMO_WELCOME_CREDITS > 0
         else ""
     )
@@ -5708,7 +5749,7 @@ def build_growth_text(chat_id: int, row: dict[str, Any] | None = None) -> str:
         "🎁 Бонусы и приглашения\n\n"
         f"Твой реф-код: {referral_code}\n"
         f"Приглашено друзей: {invited}\n"
-        f"Бонус за друга: {REFERRAL_BONUS_CREDITS} кредитов тебе и другу.\n"
+        f"Бонус за друга: {request_balance_text(REFERRAL_BONUS_CREDITS)} запросов тебе и другу.\n"
         "Кнопка «Поделиться» откроет готовый текст приглашения.\n\n"
         "Промокоды из канала и акций:\n"
         f"{promo_block}\n\n"
@@ -5882,7 +5923,7 @@ def build_onboarding_text(chat_id: int) -> str:
         "• 🧠 Качество — подробнее и аккуратнее\n"
         "• 🚀 Эксперт — сложные задачи, если доступно на тарифе\n\n"
         "Для картинок нажми «🎨 Картинка»: можно сгенерировать новую картинку или редактировать фото.\n\n"
-        "Кредиты списываются за ответы, картинки и модели. Баланс, тариф и дату следующей free-картинки можно смотреть в «Мой план».\n\n"
+        "Запросы списываются за ответы, картинки и модели. Баланс, тариф и дату следующей free-картинки можно смотреть в «Мой план».\n\n"
         f"Сейчас у тебя тариф: {str(row.get('plan', 'free')).title()}.\n"
         "Нажми «Начать!» — открою Главное меню."
     )
@@ -5994,14 +6035,14 @@ async def notify_referral_success(friend_chat_id: int, owner_chat_id: int, sourc
         source_tail = " Код применился автоматически по стартовой ссылке."
     await show_managed_content(
         friend_chat_id,
-        f"Готово! Реферальный код принят. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.{source_tail}",
+        f"Готово! Реферальный код принят. Начислено +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов.{source_tail}",
         attachments=build_growth_keyboard(friend_chat_id),
         page=UI_PAGE_GROWTH,
     )
     with suppress(Exception):
         await max_send_message(
             owner_chat_id,
-            f"🎉 По твоему коду зарегистрировался друг. Начислено +{REFERRAL_BONUS_CREDITS} кредитов.",
+            f"🎉 По твоему коду зарегистрировался друг. Начислено +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов.",
             attachments=build_keyboard(),
             notify=False,
         )
@@ -6065,21 +6106,19 @@ async def send_credits(chat_id: int) -> None:
     if plan_name not in PAID_PLANS:
         await send_managed_message(
             chat_id,
-            f"🆓 На free каждый день доступно {FREE_DAILY_CREDITS} кредитов.\nСейчас у тебя: {int(row.get('credits_balance', 0) or 0)}.",
+            f"🆓 На free каждый день доступно {request_balance_text(FREE_DAILY_CREDITS)} запросов.\nСейчас у тебя: {request_balance_text(int(row.get('credits_balance', 0) or 0))}.",
             attachments=build_tariffs_keyboard_pricing(),
             page=UI_PAGE_TARIFFS,
         )
         return
     text = (
-        f"🪙 Твой баланс: {int(row.get('credits_balance', 0) or 0)} кредитов.\n\n"
+        f"🪙 Твой баланс: {request_balance_text(int(row.get('credits_balance', 0) or 0))} запросов.\n\n"
         "Обычно списывается:\n"
-        f"• DeepSeek: ~{CREDIT_COST_DEEPSEEK + 1}\n"
-        f"• GPT-4.1 Nano: ~{CREDIT_COST_GPT + 1}\n"
-        f"• GPT-4o Mini: ~{CREDIT_COST_GPTO + 1}\n"
-        f"• Gemini 2.5 Flash: ~{CREDIT_COST_GEMINI + 1}\n"
-        f"• GPT-5.4: ~{CREDIT_COST_GPT54 + 2}\n"
-        f"• Картинка: {CREDIT_COST_IMAGE}\n"
-        f"• По фото: {CREDIT_COST_IMAGE_EDIT}"
+        "• Текст: 1 запрос\n"
+        "• Длинный ответ: до 2 запросов\n"
+        f"• GPT-5.4: {request_cost_text(text_credit_cost('gpt54'))}-{request_cost_text(text_credit_cost('gpt54') + MAX_VARIABLE_CREDITS_PER_TEXT)} запросов\n"
+        f"• Картинка: {request_cost_text(image_credit_cost())} запросов\n"
+        f"• Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов"
     )
     await send_managed_message(chat_id, text, attachments=build_keyboard(), page=UI_PAGE_PLAN)
 
@@ -6090,16 +6129,16 @@ async def send_topups(chat_id: int) -> None:
     large = TOPUP_PACKS["large"]
 
     def approx_images(credits: int) -> int:
-        if CREDIT_COST_IMAGE <= 0:
+        if image_credit_cost() <= 0:
             return 0
-        return credits // CREDIT_COST_IMAGE
+        return credits // image_credit_cost()
 
     text = (
-        "⭐ Пакеты кредитов\n\n"
-        f"• Small: {small['credits']} кредитов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
-        f"• Medium: {medium['credits']} кредитов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
-        f"• Large: {large['credits']} кредитов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
-        "Кредиты списываются за запросы к моделям и генерацию картинок.\n"
+        "⭐ Пакеты запросов\n\n"
+        f"• Small: {request_balance_text(int(small['credits']))} запросов за {small['price_rub']} ₽ (~{approx_images(int(small['credits']))} картинок)\n"
+        f"• Medium: {request_balance_text(int(medium['credits']))} запросов за {medium['price_rub']} ₽ (~{approx_images(int(medium['credits']))} картинок)\n"
+        f"• Large: {request_balance_text(int(large['credits']))} запросов за {large['price_rub']} ₽ (~{approx_images(int(large['credits']))} картинок)\n\n"
+        "Запросы списываются за ответы моделей и генерацию картинок.\n"
         "Перед созданием оплаты бот попросит подтверждение покупки пакета."
     )
     await send_managed_message(chat_id, text, attachments=build_topups_keyboard(), page=UI_PAGE_TOPUPS)
@@ -6114,11 +6153,11 @@ async def send_topup_consent(
 ) -> bool:
     pack = topup_spec(code)
     if not pack:
-        await max_send_message(chat_id, "Неизвестный пакет кредитов.", attachments=build_topups_keyboard(), notify=notify)
+        await max_send_message(chat_id, "Неизвестный пакет запросов.", attachments=build_topups_keyboard(), notify=notify)
         return False
     text = (
         f"Пакет: {pack['label']}\n"
-        f"Кредитов: {int(pack['credits'])}\n"
+        f"Запросов: {request_balance_text(int(pack['credits']))}\n"
         f"Стоимость: {int(pack['price_rub'])} ₽\n\n"
         "Это разовая покупка без автосписаний.\n"
         "Подтверди покупку кнопкой ниже."
@@ -6154,7 +6193,7 @@ def payment_item_human_name(plan: str) -> str:
     if is_topup_plan(plan):
         code = topup_code_from_plan(plan)
         pack = topup_spec(code)
-        return f"Пакет {pack['label']}" if pack else "Пакет кредитов"
+        return f"Пакет {pack['label']}" if pack else "Пакет запросов"
     return f"Тариф {plan.capitalize()}"
 
 
@@ -6188,7 +6227,7 @@ def build_payment_request_keyboard(request_id: int, payment_url: str = "", statu
             ]
         )
     elif status_lc == "paid":
-        primary_payload, primary_label = ("action:topups", "Пакеты кредитов") if is_topup_plan(plan) else ("action:plan", "Мой план")
+        primary_payload, primary_label = ("action:topups", "Пакеты запросов") if is_topup_plan(plan) else ("action:plan", "Мой план")
         buttons.append(
             [
                 {"type": "callback", "text": primary_label, "payload": primary_payload},
@@ -6251,7 +6290,7 @@ def build_payments_keyboard(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_payments_text(chat_id: int) -> tuple[str, list[dict[str, Any]]]:
     rows = state.user_store.list_user_payments(chat_id, limit=8)
     if not rows:
-        return "Моих оплат пока нет.\nОткрой «Тарифы» или «Пакеты кредитов», чтобы создать первую заявку.", build_keyboard()
+        return "Моих оплат пока нет.\nОткрой «Тарифы» или «Пакеты запросов», чтобы создать первую заявку.", build_keyboard()
     lines = ["💳 Мои оплаты"]
     for item in rows:
         status = str(item.get("status", "")).lower()
@@ -6274,14 +6313,14 @@ def usage_text(row: dict[str, Any]) -> str:
     balance = int(row.get("credits_balance", 0) or 0)
     bonus_total, bonus_expires = state.user_store.active_bonus_credits_summary(int(row.get("chat_id", 0) or 0))
 
-    lines = [f"План: {plan_name}", f"Кредиты: {balance}"]
+    lines = [f"План: {plan_name}", f"Запросы: {request_balance_text(balance)}"]
     if plan_name != "free":
         lines.insert(1, f"Доступ до: {format_msk_datetime(expires_at)}")
     if bonus_total > 0 and bonus_expires:
         bonus_dt = parse_iso_datetime(bonus_expires)
-        lines.append(f"🎁 Бонус: {bonus_total} кредитов до {format_msk_datetime(bonus_dt)}")
+        lines.append(f"🎁 Бонус: {request_balance_text(bonus_total)} запросов до {format_msk_datetime(bonus_dt)}")
     if plan_name == "free":
-        lines.append(f"Free-бонус в день: {FREE_DAILY_CREDITS} кредитов")
+        lines.append(f"Free-бонус в день: {request_balance_text(FREE_DAILY_CREDITS)} запросов")
         next_at = free_image_next_available_at(row)
         if free_image_is_available(row):
             lines.append("Картинка на Free: доступна сейчас")
@@ -6376,7 +6415,7 @@ async def request_receipt_contact(
     source_mid: str | None = None,
 ) -> None:
     state.pending_receipt_plan[chat_id] = plan
-    target_label = "подписки" if not plan.startswith("topup") else "пакета кредитов"
+    target_label = "подписки" if not plan.startswith("topup") else "пакета запросов"
     await show_managed_content(
         chat_id,
         (
@@ -6471,7 +6510,7 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
         code = topup_code_from_plan(plan)
         pack = topup_spec(code)
         if pack:
-            item = f"topup:{code} ({pack['credits']} credits)"
+            item = f"topup:{code} ({request_balance_text(int(pack['credits']))} requests)"
     text = (
         f"Пользователь подтвердил оплату по заявке #{request_id}.\n"
         f"user={target}, item={item}, amount={amount} RUB, days={days}\n"
@@ -6667,10 +6706,10 @@ async def activate_payment_request(request_id: int, source: str) -> tuple[bool, 
         with suppress(Exception):
             await max_send_message(
                 target,
-                f"Оплата подтверждена ({source}). Зачислено {credits} кредитов.",
+                f"Оплата подтверждена ({source}). Зачислено {request_balance_text(credits)} запросов.",
                 attachments=build_keyboard(),
             )
-        return True, f"credits+{credits}"
+        return True, f"requests+{request_balance_text(credits)}"
 
     selected = best_default_alias_for_plan(plan)
     recurring_for_user = source.lower().startswith("t-bank")
@@ -6727,11 +6766,11 @@ async def process_refund_payment_request(request_id: int, source: str, bank_stat
                 target,
                 (
                     f"Возврат подтвержден ({source}, статус {bank_status}).\n"
-                    f"Пакет кредитов отменен, списано {credits} кредитов."
+                    f"Пакет запросов отменен, списано {request_balance_text(credits)} запросов."
                 ),
                 attachments=build_keyboard(),
             )
-        return True, f"topup credits-{credits}"
+        return True, f"topup requests-{request_balance_text(credits)}"
 
     row = user_profile(target)
     changed = False
@@ -6820,14 +6859,14 @@ async def create_buy_request_v2(chat_id: int, plan: str, consent_text: str = "")
 async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, str]:
     pack = topup_spec(code)
     if not pack:
-        return None, "Неизвестный пакет кредитов."
+        return None, "Неизвестный пакет запросов."
 
     amount = int(pack["price_rub"])
     credits = int(pack["credits"])
     row = user_profile(chat_id)
     receipt_email, receipt_phone = effective_receipt_contact(row)
     if not (receipt_email or receipt_phone):
-        return None, "Нужен email или телефон для чека. Нажми «Пакеты кредитов» и начни покупку заново."
+        return None, "Нужен email или телефон для чека. Нажми «Пакеты запросов» и начни покупку заново."
 
     request_id = state.user_store.create_payment_request(
         chat_id,
@@ -6839,13 +6878,13 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
         receipt_email=receipt_email,
         receipt_phone=receipt_phone,
     )
-    payment_purpose = f"Пакет кредитов {pack['label']}, заказ #{request_id}"
+    payment_purpose = f"Пакет запросов {pack['label']}, заказ #{request_id}"
     if tbank_enabled():
         try:
             payment_url, payment_id = await tbank_init_payment(
                 request_id=request_id,
                 amount_rub=amount,
-                description=f"Пакет кредитов {pack['label']}, заказ #{request_id}",
+                description=f"Пакет запросов {pack['label']}, заказ #{request_id}",
                 receipt_email=receipt_email,
                 receipt_phone=receipt_phone,
             )
@@ -6854,11 +6893,11 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
             text = (
                 f"Заявка #{request_id} создана\n"
                 f"{payment_item_human_name(topup_plan_code(code))}\n"
-                f"Кредитов: {credits}\n"
+                f"Запросов: {request_balance_text(credits)}\n"
                 f"Сумма: {amount} ₽\n"
                 f"Чек: {receipt_email or receipt_phone}\n\n"
                 "Открой оплату по кнопке ниже.\n"
-                "После успешной оплаты кредиты зачислятся автоматически."
+                "После успешной оплаты запросы зачислятся автоматически."
             )
             return request_id, text
         except Exception as exc:
@@ -6875,7 +6914,7 @@ async def create_topup_request_v2(chat_id: int, code: str) -> tuple[int | None, 
     text = (
         f"Заявка #{request_id} создана\n"
         f"{payment_item_human_name(topup_plan_code(code))}\n"
-        f"Кредитов: {credits}\n"
+        f"Запросов: {request_balance_text(credits)}\n"
         f"Сумма: {amount} ₽\n"
         f"Чек: {receipt_email or receipt_phone}\n\n"
         "Куда оплачивать:\n"
@@ -6944,7 +6983,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         state.user_store.set_credits(target, credits_for_plan(new_plan))
         await max_send_message(
             chat_id,
-            f"План пользователя {target} -> {new_plan}. Модель -> {selected}. Кредиты -> {credits_for_plan(new_plan)}.",
+            f"План пользователя {target} -> {new_plan}. Модель -> {selected}. Запросы -> {request_balance_text(credits_for_plan(new_plan))}.",
         )
         return True
 
@@ -7352,7 +7391,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 f"👥 Твой реф-код: {code}\n"
                 f"Приглашено друзей: {invited}\n\n"
                 f"Пригласи друга через кнопку «Поделиться» или попроси его ввести /ref {code}\n"
-                f"После активации — бонус +{REFERRAL_BONUS_CREDITS} кредитов вам обоим."
+                f"После активации — бонус +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов вам обоим."
             ),
             attachments=build_growth_keyboard(chat_id),
             callback_id=callback_id,
@@ -7562,7 +7601,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{preset_hint}"
             f"{image_params_summary(chat_id)}\n"
-            f"Стоимость: {CREDIT_COST_IMAGE} кредитов.",
+            f"Стоимость: {request_cost_text(image_credit_cost())} запросов.",
             attachments=build_image_prompt_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
@@ -7594,7 +7633,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             (
                 "Пришли фото и коротко опиши, что сделать.\n"
                 f"{preset_hint}"
-                f"Стоимость: {CREDIT_COST_IMAGE_EDIT} кредитов.\n"
+                f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
                 "Если фото уже отправлено — просто напиши описание (например: «нарисуй её в стиле аниме»)."
             ),
             attachments=build_image_prompt_keyboard(),
@@ -7724,7 +7763,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if not pack:
             if callback_id:
                 await answer_callback(callback_id, "Неверный пакет")
-            await max_send_message(chat_id, "Неизвестный пакет кредитов.", attachments=build_topups_keyboard(), notify=False)
+            await max_send_message(chat_id, "Неизвестный пакет запросов.", attachments=build_topups_keyboard(), notify=False)
             return True
 
         row = user_profile(chat_id)
@@ -8003,7 +8042,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         await send_plan(chat_id)
         return True
 
-    if command == "/credits":
+    if command in {"/credits", "/requests"}:
         await send_credits(chat_id)
         return True
 
@@ -8048,7 +8087,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
                 (
                     f"👥 Твой реф-код: {code}\n"
                     f"Приглашено друзей: {invited}\n"
-                    f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
+                    f"Бонус за каждого друга: +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов вам обоим.\n\n"
                     f"Нажми «Поделиться» или попроси друга ввести: /ref {code}"
                 ),
                 attachments=build_growth_keyboard(chat_id),
@@ -8062,7 +8101,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
                 (
                     f"👥 Твой реф-код: {code}\n"
                     f"Приглашено друзей: {invited}\n"
-                    f"Бонус за каждого друга: +{REFERRAL_BONUS_CREDITS} кредитов вам обоим.\n\n"
+                    f"Бонус за каждого друга: +{request_balance_text(REFERRAL_BONUS_CREDITS)} запросов вам обоим.\n\n"
                     "Нажми «Поделиться» или попроси друга открыть Меню → Бонусы → Ввести реф-код."
                 ),
                 attachments=build_growth_keyboard(chat_id),
@@ -8101,7 +8140,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             details=f"code={code};source=command",
         )
         ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
-        await max_send_message(chat_id, f"Промокод активирован: +{info} кредитов.{ttl_tail}", attachments=build_growth_keyboard(chat_id))
+        await max_send_message(chat_id, f"Промокод активирован: +{request_balance_text(int(info))} запросов.{ttl_tail}", attachments=build_growth_keyboard(chat_id))
         return True
 
     if command == "/preset":
@@ -8180,7 +8219,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             state.pending_image_ref_prompt.add(chat_id)
             await max_send_message(
                 chat_id,
-                f"Сначала отправь фото. Стоимость режима «по фото»: {CREDIT_COST_IMAGE_EDIT} кредитов.",
+                f"Сначала отправь фото. Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов.",
                 attachments=build_image_prompt_keyboard(),
             )
             return True
@@ -8215,7 +8254,7 @@ async def handle_pending_receipt_input(chat_id: int, text: str) -> bool:
 
     email, phone = parse_receipt_contact(text)
     if not (email or phone):
-        target_label = "подписки" if not plan.startswith("topup") else "пакета кредитов"
+        target_label = "подписки" if not plan.startswith("topup") else "пакета запросов"
         await show_managed_content(
             chat_id,
             (
@@ -8311,7 +8350,7 @@ async def handle_pending_promo_input(chat_id: int, text: str) -> bool:
     ttl_tail = f" Срок действия бонуса: {bonus_ttl_days} дн." if bonus_ttl_days > 0 else ""
     await show_managed_content(
         chat_id,
-        f"Промокод активирован: +{info} кредитов.{ttl_tail}",
+        f"Промокод активирован: +{request_balance_text(int(info))} запросов.{ttl_tail}",
         attachments=build_growth_keyboard(chat_id),
         page=UI_PAGE_GROWTH,
     )
@@ -8380,7 +8419,7 @@ async def process_update(update: dict[str, Any]) -> None:
                 (
                     "Фото получил ✅\n"
                     "Теперь напиши, что с ним сделать (например: «нарисуй её в стиле аниме»).\n"
-                    f"Стоимость режима «по фото»: {CREDIT_COST_IMAGE_EDIT} кредитов."
+                    f"Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов."
                 ),
                 attachments=build_image_prompt_keyboard(),
             )
@@ -8442,7 +8481,7 @@ async def process_update(update: dict[str, Any]) -> None:
         estimated_prompt_tokens = estimate_tokens_from_messages(estimated_messages)
         estimated_total_tokens = estimated_prompt_tokens + completion_tokens_for_plan(plan_name)
         reserved_var_cost = variable_text_credits(selected_alias, estimated_total_tokens)
-        reserved_total_cost = fixed_text_cost + reserved_var_cost
+        reserved_total_cost = normalize_public_request_credit_cost(fixed_text_cost + reserved_var_cost)
 
         ok_credit, reason_credit = check_and_consume_credits(
             chat_id,
@@ -8463,11 +8502,11 @@ async def process_update(update: dict[str, Any]) -> None:
         try:
             result = await ask_text_model(chat_id, text, selected_alias=selected_alias)
             actual_var_cost = variable_text_credits(selected_alias, result.total_tokens)
-            actual_total_cost = fixed_text_cost + actual_var_cost
-            if reserved_var_cost > actual_var_cost:
-                state.user_store.refund_credits(chat_id, reserved_var_cost - actual_var_cost)
-            elif actual_var_cost > reserved_var_cost:
-                extra_cost = actual_var_cost - reserved_var_cost
+            actual_total_cost = normalize_public_request_credit_cost(fixed_text_cost + actual_var_cost)
+            if reserved_total_cost > actual_total_cost:
+                state.user_store.refund_credits(chat_id, reserved_total_cost - actual_total_cost)
+            elif actual_total_cost > reserved_total_cost:
+                extra_cost = actual_total_cost - reserved_total_cost
                 ok_extra, _ = check_and_consume_credits(chat_id, extra_cost, f"сложность ({model_label})")
                 if not ok_extra:
                     log.warning(
@@ -8849,10 +8888,10 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     def money(value: int | float) -> str:
         return f"{int(round(value)):,}".replace(",", " ")
 
-    def credits_per_rub(credits: int, price_rub: int) -> str:
+    def requests_per_rub(credits: int, price_rub: int) -> str:
         if price_rub <= 0:
             return "0.00"
-        return f"{credits / float(price_rub):.2f}"
+        return f"{public_requests_from_credits(credits) / float(price_rub):.2f}"
 
     def fmt_msk(value: Any) -> str:
         text = str(value or "").strip()
@@ -8974,7 +9013,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             f"<td>{activations}</td>"
             f"<td>{paid_users}</td>"
             f"<td>{conversion:.1f}%</td>"
-            f"<td>{money(int(row.get('credits', 0) or 0))}</td>"
+            f"<td>{request_balance_text(int(row.get('credits', 0) or 0))}</td>"
             f"<td>{money(int(row.get('revenue_rub', 0) or 0))} ₽</td>"
             "</tr>"
         )
@@ -8986,8 +9025,8 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     for plan in ("lite", "start", "pro"):
         amount, period_days = plan_price_and_days(plan)
         credits = credits_for_plan(plan)
-        ratio = credits_per_rub(credits, amount)
-        daily_credits = credits / max(1, period_days)
+        ratio = requests_per_rub(credits, amount)
+        daily_requests = public_requests_from_credits(credits) / max(1, period_days)
         models_text = {
             "lite": "DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash",
             "start": f"DeepSeek, GPT-4.1 Nano, GPT-4o Mini, Gemini 2.5 Flash, GPT-5.4 в режиме «Эксперт» до {PLAN_CONFIGS['start'].daily_gpt54_limit}/день",
@@ -8998,8 +9037,8 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             f"<td>{esc(plan.title())}</td>"
             f"<td>{money(amount)} ₽</td>"
             f"<td>{period_days}</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{daily_credits:.0f}</td>"
+            f"<td>{request_cost_text(credits)}</td>"
+            f"<td>{daily_requests:.0f}</td>"
             f"<td>{ratio}</td>"
             f"<td>{esc(models_text)}</td>"
             "</tr>"
@@ -9009,7 +9048,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             "<tr>"
             f"<td>{esc(plan.title())}</td>"
             f"<td>{money(amount)} ₽</td>"
-            f"<td>{money(credits)}</td>"
+            f"<td>{request_cost_text(credits)}</td>"
             f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
             f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
             f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
@@ -9028,8 +9067,8 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             "<tr>"
             f"<td>{esc(str(pack['label']))}</td>"
             f"<td>{money(price_rub)} ₽</td>"
-            f"<td>{money(credits)}</td>"
-            f"<td>{credits_per_rub(credits, price_rub)}</td>"
+            f"<td>{request_balance_text(credits)}</td>"
+            f"<td>{requests_per_rub(credits, price_rub)}</td>"
             "</tr>"
         )
         econ = expected_unit_economics(price_rub, credits)
@@ -9037,7 +9076,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             "<tr>"
             f"<td>{esc(str(pack['label']))}</td>"
             f"<td>{money(price_rub)} ₽</td>"
-            f"<td>{money(credits)}</td>"
+            f"<td>{request_balance_text(credits)}</td>"
             f"<td>{money(econ['expected_cost_rub'])} ₽</td>"
             f"<td>{money(econ['payment_fee_rub'])} ₽</td>"
             f"<td>{money(econ['receipt_fee_rub'])} ₽</td>"
@@ -9085,7 +9124,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             f"<td>{requests_count}</td>"
             f"<td>{money(tokens)}</td>"
             f"<td>{money(avg_model_tokens)}</td>"
-            f"<td>{credits}</td>"
+            f"<td>{request_cost_text(credits)}</td>"
             f"<td>{estimated_cost_cell}</td>"
             "</tr>"
         )
@@ -9177,12 +9216,12 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         <div class="metric"><div class="metric-label">ARPU / ARPPU</div><div class="metric-value">{money(arpu)} / {money(arppu)} ₽</div><div class="metric-note">На активного и на платящего</div></div>
         <div class="metric"><div class="metric-label">Средний чек</div><div class="metric-value">{money(avg_check)} ₽</div><div class="metric-note">{payments_count} оплат, refund rate {refund_rate_pct:.1f}%</div></div>
         <div class="metric"><div class="metric-label">Текстовые запросы</div><div class="metric-value">{text_requests}</div><div class="metric-note">Среднее {avg_tokens:.0f} токенов на текст</div></div>
-        <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Списано {image_credits} кредитов</div></div>
-        <div class="metric"><div class="metric-label">Все кредиты</div><div class="metric-value">{total_credits}</div><div class="metric-note">Текст {text_credits} / картинки {image_credits}</div></div>
+        <div class="metric"><div class="metric-label">Картинки</div><div class="metric-value">{image_requests}</div><div class="metric-note">Списано {request_cost_text(image_credits)} запросов</div></div>
+        <div class="metric"><div class="metric-label">Все запросы</div><div class="metric-value">{request_cost_text(total_credits)}</div><div class="metric-note">Текст {request_cost_text(text_credits)} / картинки {request_cost_text(image_credits)}</div></div>
         <div class="metric"><div class="metric-label">Себестоимость текста</div><div class="metric-value">{money(estimated_text_cost_rub)} ₽</div><div class="metric-note">{text_cost_share_pct:.1f}% от чистой выручки</div></div>
         <div class="metric"><div class="metric-label">Оценочная маржа</div><div class="metric-value">{money(estimated_text_contribution_rub)} ₽</div><div class="metric-note">{estimated_text_margin_pct:.1f}% от чистой выручки, пока без image-cost</div></div>
         <div class="metric"><div class="metric-label">Реф. активации</div><div class="metric-value">{referral_activations}</div><div class="metric-note">Реф. плательщики: {referred_payers}, конверсия {referral_conversion_pct:.1f}%</div></div>
-        <div class="metric"><div class="metric-label">Бонусы рефералки</div><div class="metric-value">{referral_bonus_credits}</div><div class="metric-note">Выдано кредитов по реферальной механике</div></div>
+        <div class="metric"><div class="metric-label">Бонусы рефералки</div><div class="metric-value">{request_balance_text(referral_bonus_credits)}</div><div class="metric-note">Выдано запросов по реферальной механике</div></div>
       </div>
     </div>
     <div class="grid">
@@ -9275,26 +9314,26 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
         <h2>Промокоды кампаний</h2>
         <p class="muted">Для рекламы в канал проще давать в посте один код кампании. Лид в боте считается после активации кода, дальше видно оплаты и выручку.</p>
         <table>
-          <tr><th>Код</th><th>Активаций</th><th>Платных</th><th>Конверсия</th><th>Кредитов выдано</th><th>Выручка</th></tr>
+          <tr><th>Код</th><th>Активаций</th><th>Платных</th><th>Конверсия</th><th>Запросов выдано</th><th>Выручка</th></tr>
           {''.join(promo_code_rows)}
         </table>
       </div>
     </div>
     <div class="card table-card">
       <h2>Экономика проекта</h2>
-      <p>Шпаргалка по текущей сетке: цены, кредиты, модели, бумажная маржа и допущения.</p>
+      <p>Шпаргалка по текущей сетке: цены, запросы, модели, бумажная маржа и допущения.</p>
       <div class="grid">
         <div class="card table-card">
           <h3>Подписки</h3>
           <table>
-            <tr><th>Тариф</th><th>Цена</th><th>Дней</th><th>Кредитов</th><th>Средне в день</th><th>Кр/₽</th><th>Модели</th></tr>
+            <tr><th>Тариф</th><th>Цена</th><th>Дней</th><th>Запросов</th><th>Средне в день</th><th>Запр/₽</th><th>Модели</th></tr>
             {''.join(economics_plan_rows)}
           </table>
         </div>
         <div class="card table-card">
-          <h3>Пакеты кредитов</h3>
+          <h3>Пакеты запросов</h3>
           <table>
-            <tr><th>Пакет</th><th>Цена</th><th>Кредитов</th><th>Кр/₽</th></tr>
+            <tr><th>Пакет</th><th>Цена</th><th>Запросов</th><th>Запр/₽</th></tr>
             {''.join(economics_pack_rows)}
           </table>
         </div>
@@ -9302,23 +9341,23 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
       <div class="grid">
         <div class="card table-card">
           <h3>Free и лимиты</h3>
-          <p>Free: {FREE_DAILY_CREDITS} кредитов в день и 1 картинка каждые 7 дней.</p>
-          <p>Картинка: {image_credit_cost()} кредитов. Редактирование фото: {CREDIT_COST_IMAGE_EDIT} кредитов.</p>
-          <p>Макс. переменная доплата за текст: {MAX_VARIABLE_CREDITS_PER_TEXT} кредита.</p>
+          <p>Free: {request_balance_text(FREE_DAILY_CREDITS)} запросов в день и 1 картинка каждые 7 дней.</p>
+          <p>Картинка: {request_cost_text(image_credit_cost())} запросов. Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов.</p>
+          <p>Макс. переменная доплата за текст: {request_cost_text(MAX_VARIABLE_CREDITS_PER_TEXT)} запрос.</p>
         </div>
         <div class="card table-card">
           <h3>Расчётные допущения</h3>
           <p>Курс для аналитики: {money(ANALYTICS_USD_TO_RUB)} ₽ за $1.</p>
           <p>Текстовая себестоимость выше считается по фактическим prompt/completion токенам и ценам из реестра моделей.</p>
-          <p>Для бумажной экономики используем: эквайринг {ANALYTICS_PAYMENT_FEE_PCT:.2f}%, Т-Чеки {ANALYTICS_RECEIPT_FEE_PCT:.2f}%, налог {ANALYTICS_TAX_PCT:.2f}%, ожидаемая себестоимость 1 кредита {ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB:.3f} ₽.</p>
+          <p>Для бумажной экономики используем: эквайринг {ANALYTICS_PAYMENT_FEE_PCT:.2f}%, Т-Чеки {ANALYTICS_RECEIPT_FEE_PCT:.2f}%, налог {ANALYTICS_TAX_PCT:.2f}%, ожидаемая себестоимость 1 запроса {(ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB * PUBLIC_REQUEST_UNIT_CREDITS):.3f} ₽.</p>
           <p class="muted">Настраивается через <code>ANALYTICS_USD_TO_RUB</code>, <code>ANALYTICS_PAYMENT_FEE_PCT</code>, <code>ANALYTICS_RECEIPT_FEE_PCT</code>, <code>ANALYTICS_TAX_PCT</code> и <code>ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB</code>.</p>
         </div>
       </div>
       <div class="card table-card">
         <h3>Ожидаемая юнит-экономика</h3>
-        <p>Стрессовый сценарий: считаем, что купленные кредиты будут полностью выбраны. Это помогает видеть, остаётся ли прибыль на бумаге ещё до масштабирования.</p>
+        <p>Стрессовый сценарий: считаем, что купленные запросы будут полностью выбраны. Это помогает видеть, остаётся ли прибыль на бумаге ещё до масштабирования.</p>
         <table>
-          <tr><th>Продукт</th><th>Цена</th><th>Кредитов</th><th>Себестоимость</th><th>Эквайринг</th><th>Т-Чеки</th><th>Налог</th><th>Маржа</th><th>Маржа %</th></tr>
+          <tr><th>Продукт</th><th>Цена</th><th>Запросов</th><th>Себестоимость</th><th>Эквайринг</th><th>Т-Чеки</th><th>Налог</th><th>Маржа</th><th>Маржа %</th></tr>
           {''.join(unit_margin_rows)}
         </table>
       </div>
@@ -9334,9 +9373,9 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     <div class="grid">
       <div class="card table-card">
         <h2>Расход по моделям</h2>
-        <p>Для текстовых моделей считаем токены, кредиты и оценочную себестоимость. Для картинок в этой таблице стоимость не считаем, поэтому стоит «—».</p>
+        <p>Для текстовых моделей считаем токены, запросы и оценочную себестоимость. Для картинок в этой таблице стоимость не считаем, поэтому стоит «—».</p>
         <table>
-          <tr><th>Модель</th><th>Тип</th><th>Запросов</th><th>Токенов</th><th>Ср./запрос</th><th>Кредитов</th><th>Себестоимость</th></tr>
+          <tr><th>Модель</th><th>Тип</th><th>Событий</th><th>Токенов</th><th>Ср./событие</th><th>Запросов списано</th><th>Себестоимость</th></tr>
           {''.join(models_rows)}
         </table>
       </div>
@@ -9462,7 +9501,7 @@ async def admin_panel_action(
         elif action == "add_credits" and chat_id is not None and amount != 0:
             user_profile(chat_id)
             balance = state.user_store.adjust_credits(chat_id, amount)
-            message = f"Баланс пользователя {chat_id}: {balance}"
+            message = f"Баланс пользователя {chat_id}: {request_balance_text(balance)} запросов"
         elif action == "cancel_recurring" and chat_id is not None:
             row = user_profile(chat_id)
             expires_at = str(row.get("subscription_expires_at", "") or "")
@@ -9561,7 +9600,7 @@ def render_admin_panel_html_v2(
         selected_user_summary = (
             "<div class='mini-grid'>"
             f"<div class='mini-metric'>Тариф<strong>{esc(selected_plan)}</strong></div>"
-            f"<div class='mini-metric'>Кредиты<strong>{int(selected_user.get('credits_balance', 0) or 0)}</strong></div>"
+            f"<div class='mini-metric'>Запросы<strong>{request_balance_text(int(selected_user.get('credits_balance', 0) or 0))}</strong></div>"
             f"<div class='mini-metric'>Модель<strong>{esc(selected_model_label)}</strong></div>"
             f"<div class='mini-metric'>Автопродление<strong>{yes_no(selected_user.get('recurring_enabled', 0))}</strong></div>"
             f"<div class='mini-metric'>Блок<strong>{yes_no(selected_user.get('is_blocked', 0))}</strong></div>"
@@ -9608,7 +9647,7 @@ def render_admin_panel_html_v2(
                 "<tr>"
                 f"<td>{esc(label)}</td>"
                 f"<td>{esc(str(item.get('model_alias', '') or '—'))}</td>"
-                f"<td>{int(item.get('credits_spent', 0) or 0)}</td>"
+                f"<td>{request_cost_text(int(item.get('credits_spent', 0) or 0))}</td>"
                 f"<td>{int(item.get('rub_amount', 0) or 0)} ₽</td>"
                 f"<td>{esc(details[:90] + ('…' if len(details) > 90 else ''))}</td>"
                 f"<td>{esc(format_msk_datetime(parse_iso_datetime(str(item.get('created_at', '') or ''))))}</td>"
@@ -9624,7 +9663,7 @@ def render_admin_panel_html_v2(
             + "".join(payment_history_rows)
             + "</table>"
             + "<h3>Последние действия пользователя</h3>"
-            + "<table><tr><th>Событие</th><th>Модель</th><th>Кредиты</th><th>Сумма</th><th>Детали</th><th>Когда</th></tr>"
+            + "<table><tr><th>Событие</th><th>Модель</th><th>Запросы</th><th>Сумма</th><th>Детали</th><th>Когда</th></tr>"
             + "".join(event_history_rows)
             + "</table>"
             + f"<details><summary>Сырой JSON пользователя</summary><pre>{esc(json.dumps(selected_user, ensure_ascii=False, indent=2))}</pre></details>"
@@ -9651,7 +9690,7 @@ def render_admin_panel_html_v2(
             f"<td>{cid}</td>"
             f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('plan', '')))}</td>"
-            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
+            f"<td>{request_balance_text(int(row.get('credits_balance', 0) or 0))}</td>"
             f"<td>{recurring}</td>"
             f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
@@ -9680,7 +9719,7 @@ def render_admin_panel_html_v2(
             f"<td>{int(row.get('chat_id', 0) or 0)}</td>"
             f"<td>{int(row.get('max_user_id', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('plan', '') or ''))}</td>"
-            f"<td>{int(row.get('credits_balance', 0) or 0)}</td>"
+            f"<td>{request_balance_text(int(row.get('credits_balance', 0) or 0))}</td>"
             f"<td>{esc(str(row.get('risk_reason', '') or ''))}</td>"
             f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
             f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=int(row.get('chat_id', 0) or 0)))}'>Открыть</a></td>"
@@ -9731,10 +9770,10 @@ def render_admin_panel_html_v2(
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='pro'))}'>Pro на 30 дней</a>"
             "</p>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=100))}'>+100 кредитов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=500))}'>+500 кредитов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-100))}'>-100 кредитов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-500 кредитов</a>"
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=100))}'>+20 запросов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=500))}'>+100 запросов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-100))}'>-20 запросов</a> | "
+            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-100 запросов</a>"
             "</p>"
             "<p>"
             f"<a href='{esc(admin_url('/admin/panel/action', token, type='cancel_recurring', chat_id=cid))}'>Отключить автопродление</a>"
@@ -9804,14 +9843,14 @@ def render_admin_panel_html_v2(
     </div>
     <div class="card">
       <h2>Последние пользователи</h2>
-      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>credits</th><th>recur</th><th>blocked</th><th>last_active_at</th><th></th></tr>
+      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>requests</th><th>recur</th><th>blocked</th><th>last_active_at</th><th></th></tr>
       {''.join(user_rows)}
       </table>
     </div>
     <div class="card">
       <h2>Подозрительные случаи</h2>
       <p>Здесь показываются платные аккаунты без успешной оплаченной заявки и случаи, где оплата подтверждалась вручную через админку. Это не приговор, а очередь на проверку.</p>
-      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>credits</th><th>Причина</th><th>last_active_at</th><th></th></tr>
+      <table><tr><th>chat_id</th><th>user_id</th><th>plan</th><th>requests</th><th>Причина</th><th>last_active_at</th><th></th></tr>
       {''.join(suspicious_rows)}
       </table>
     </div>
