@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import hmac
 import hashlib
 import html
 from io import BytesIO
@@ -15,6 +16,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -159,6 +161,10 @@ CHANNEL_PROMO_BONUS_TTL_DAYS = int(os.getenv("CHANNEL_PROMO_BONUS_TTL_DAYS", "7"
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
 ADMIN_SESSION_COOKIE = "aimax_admin_session"
 ADMIN_SESSION_MAX_AGE = 60 * 60 * 24 * 14
+ADMIN_LOGIN_WINDOW_SECONDS = int(os.getenv("ADMIN_LOGIN_WINDOW_SECONDS", "300"))
+ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "8"))
+ADMIN_LOGIN_BLOCK_SECONDS = int(os.getenv("ADMIN_LOGIN_BLOCK_SECONDS", "900"))
+PAYMENT_STATUS_TOKEN_TTL_SECONDS = int(os.getenv("PAYMENT_STATUS_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 7)))
 BACKUP_KEEP_FILES = int(os.getenv("BACKUP_KEEP_FILES", "12"))
 AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 AUTO_BACKUP_INTERVAL_HOURS = int(os.getenv("AUTO_BACKUP_INTERVAL_HOURS", "24"))
@@ -329,13 +335,11 @@ ADMIN_HELP_TEXT = (
     "\n\nАдмин:\n"
     "/admin help\n"
     "/admin user <chat_id>\n"
-    "/admin plan <chat_id> <free|lite|start|pro>\n"
-    "/admin sub <chat_id> <lite|start|pro> <days>\n"
     "/admin block <chat_id> <on|off>\n"
-    "/admin pay <request_id> <paid|cancel>\n"
     "/admin templates\n"
     "/admin backup\n"
     "/admin nudge [days] [limit]\n"
+    "Изменение тарифов/платежей — через /admin/panel\n"
     "/costs — модели и цены\n"
     "/id — твой chat_id и user_id"
 )
@@ -749,6 +753,8 @@ class UserStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _init(self) -> None:
@@ -2460,6 +2466,9 @@ class BotState:
         self.ui_current_page: dict[int, str] = {}
         self.ui_back_stack: dict[int, list[str]] = {}
         self.ui_forward_stack: dict[int, list[str]] = {}
+        self.admin_sessions: dict[str, datetime] = {}
+        self.admin_login_attempts: dict[str, deque[datetime]] = {}
+        self.admin_login_blocked_until: dict[str, datetime] = {}
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.backup_task: asyncio.Task[None] | None = None
@@ -2715,6 +2724,11 @@ def add_request_id_to_url(url: str, request_id: int) -> str:
     parsed = urlsplit(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query["request_id"] = str(request_id)
+    expires_at = int((datetime.utcnow() + timedelta(seconds=max(60, PAYMENT_STATUS_TOKEN_TTL_SECONDS))).timestamp())
+    status_sig = payment_status_signature(request_id, expires_at)
+    if status_sig:
+        query["status_ts"] = str(expires_at)
+        query["status_sig"] = status_sig
     return urlunsplit(
         (
             parsed.scheme,
@@ -3091,21 +3105,57 @@ def admin_panel_authorized(token: str) -> bool:
     return bool(ADMIN_PANEL_TOKEN) and token.strip() == ADMIN_PANEL_TOKEN
 
 
-def resolve_admin_token(request: Request, token: str = "") -> str:
+def request_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        first = forwarded.split(",", 1)[0].strip()
+        if first:
+            return first
+    client = request.client
+    return client.host if client and client.host else "unknown"
+
+
+def prune_admin_sessions() -> None:
+    now = datetime.utcnow()
+    expired = [sid for sid, exp in state.admin_sessions.items() if exp <= now]
+    for sid in expired:
+        state.admin_sessions.pop(sid, None)
+
+
+def issue_admin_session() -> str:
+    sid = secrets.token_urlsafe(32)
+    state.admin_sessions[sid] = datetime.utcnow() + timedelta(seconds=ADMIN_SESSION_MAX_AGE)
+    return sid
+
+
+def admin_session_valid(session_id: str) -> bool:
+    if not session_id:
+        return False
+    prune_admin_sessions()
+    expires_at = state.admin_sessions.get(session_id)
+    if not expires_at:
+        return False
+    if expires_at <= datetime.utcnow():
+        state.admin_sessions.pop(session_id, None)
+        return False
+    return True
+
+
+def resolve_admin_session(request: Request, token: str = "") -> str:
+    cookie_sid = request.cookies.get(ADMIN_SESSION_COOKIE, "").strip()
+    if admin_session_valid(cookie_sid):
+        return cookie_sid
     provided = token.strip()
     if admin_panel_authorized(provided):
-        return provided
-    cookie_token = request.cookies.get(ADMIN_SESSION_COOKIE, "").strip()
-    if admin_panel_authorized(cookie_token):
-        return cookie_token
+        return issue_admin_session()
     return ""
 
 
-def set_admin_cookie(response: HTMLResponse | RedirectResponse, token: str) -> None:
+def set_admin_cookie(response: HTMLResponse | RedirectResponse, session_id: str) -> None:
     secure = PUBLIC_BASE_URL.startswith("https://")
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE,
-        value=token,
+        value=session_id,
         max_age=ADMIN_SESSION_MAX_AGE,
         httponly=True,
         secure=secure,
@@ -3116,6 +3166,53 @@ def set_admin_cookie(response: HTMLResponse | RedirectResponse, token: str) -> N
 
 def clear_admin_cookie(response: HTMLResponse | RedirectResponse) -> None:
     response.delete_cookie(key=ADMIN_SESSION_COOKIE, path="/")
+
+
+def admin_csrf_token(session_id: str) -> str:
+    if not session_id:
+        return ""
+    payload = f"{session_id}:csrf:v1"
+    return hmac.new(ADMIN_PANEL_TOKEN.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def admin_csrf_valid(session_id: str, csrf_token: str) -> bool:
+    if not session_id or not csrf_token:
+        return False
+    expected = admin_csrf_token(session_id)
+    return bool(expected) and hmac.compare_digest(expected, csrf_token.strip())
+
+
+def admin_login_allowed(request: Request) -> tuple[bool, str]:
+    ip = request_client_ip(request)
+    now = datetime.utcnow()
+    blocked_until = state.admin_login_blocked_until.get(ip)
+    if blocked_until and blocked_until > now:
+        left = int((blocked_until - now).total_seconds())
+        return False, f"Слишком много попыток. Повтори через {max(1, left)} сек."
+    attempts = state.admin_login_attempts.setdefault(ip, deque())
+    cutoff = now - timedelta(seconds=max(30, ADMIN_LOGIN_WINDOW_SECONDS))
+    while attempts and attempts[0] < cutoff:
+        attempts.popleft()
+    if len(attempts) >= max(1, ADMIN_LOGIN_MAX_ATTEMPTS):
+        state.admin_login_blocked_until[ip] = now + timedelta(seconds=max(60, ADMIN_LOGIN_BLOCK_SECONDS))
+        return False, "Слишком много попыток входа. Попробуй позже."
+    return True, ""
+
+
+def admin_login_register_failure(request: Request) -> None:
+    ip = request_client_ip(request)
+    now = datetime.utcnow()
+    attempts = state.admin_login_attempts.setdefault(ip, deque())
+    cutoff = now - timedelta(seconds=max(30, ADMIN_LOGIN_WINDOW_SECONDS))
+    while attempts and attempts[0] < cutoff:
+        attempts.popleft()
+    attempts.append(now)
+
+
+def admin_login_register_success(request: Request) -> None:
+    ip = request_client_ip(request)
+    state.admin_login_attempts.pop(ip, None)
+    state.admin_login_blocked_until.pop(ip, None)
 
 
 def admin_url(path: str, token: str = "", **params: Any) -> str:
@@ -6534,8 +6631,7 @@ async def notify_admin_about_payment_claim(request_id: int, payment: dict[str, A
     text = (
         f"Пользователь подтвердил оплату по заявке #{request_id}.\n"
         f"user={target}, item={item}, amount={amount} RUB, days={days}\n"
-        f"Проверка: /admin pay {request_id} paid\n"
-        f"Отмена: /admin pay {request_id} cancel"
+        f"Проверка/отмена: /admin/panel?request_id={request_id}"
     )
     for admin_id in targets:
         with suppress(Exception):
@@ -8611,7 +8707,7 @@ async def monitor_loop() -> None:
             await notify_admin_alert("service_monitor", f"Service monitor loop failed: {exc}")
 
 
-def render_status_html(token: str) -> str:
+def render_status_html() -> str:
     report = service_status_report()
     esc = html.escape
     smoke_rows = []
@@ -8648,10 +8744,10 @@ def render_status_html(token: str) -> str:
       <div class="top"><span class="badge">Состояние сервиса</span><span class="badge">Срез: {esc(str(report['generated_at']))}</span></div>
       <h1>Статус бота</h1>
       <div class="actions">
-        <a class="btn" href="{esc(admin_url('/analytics', token))}">Аналитика</a>
-        <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
-        <a class="btn btn-primary" href="{esc(admin_url('/status', token))}">Обновить</a>
-        <a class="btn" href="{esc(admin_url('/health/deep', token))}">JSON</a>
+        <a class="btn" href="/analytics">Аналитика</a>
+        <a class="btn" href="/admin/panel">Админка</a>
+        <a class="btn btn-primary" href="/status">Обновить</a>
+        <a class="btn" href="/health/deep">JSON</a>
       </div>
       <div class="mini-grid">
         <div class="mini-metric">Run mode<strong>{esc(str(report['run_mode']))}</strong></div>
@@ -8728,21 +8824,21 @@ async def health() -> dict[str, Any]:
 
 @app.get("/health/deep")
 async def health_deep(request: Request, token: str = "") -> dict[str, Any]:
-    auth_token = resolve_admin_token(request, token)
-    if not auth_token:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
         raise HTTPException(status_code=401, detail="auth required")
     return service_status_report()
 
 
 @app.get("/status", response_class=HTMLResponse)
 async def status_page(request: Request, token: str = "") -> HTMLResponse:
-    auth_token = resolve_admin_token(request, token)
-    if not auth_token:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
         response = HTMLResponse(render_admin_login_html("Нужен пароль администратора."), status_code=401)
         clear_admin_cookie(response)
         return response
-    response = HTMLResponse(render_status_html(auth_token))
-    set_admin_cookie(response, auth_token)
+    response = HTMLResponse(render_status_html())
+    set_admin_cookie(response, session_id)
     return response
 
 
@@ -8920,7 +9016,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
             f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
             f"<td>{esc(fmt_msk(row.get('last_referral_at')))}</td>"
-            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', chat_id=cid))}'>Открыть</a></td>"
             "</tr>"
         )
     if not top_referrer_rows:
@@ -8937,7 +9033,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
             f"<td>{int(row.get('referrals_invited', 0) or 0)}</td>"
             f"<td>{int(row.get('active_recent_referrals', 0) or 0)}</td>"
             f"<td>{int(row.get('paid_referrals', 0) or 0)}</td>"
-            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', chat_id=cid))}'>Открыть</a></td>"
             "</tr>"
         )
     if not suspicious_referral_rows:
@@ -9349,30 +9445,40 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
 
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page(request: Request, token: str = "", days: int = 30) -> HTMLResponse:
-    auth_token = resolve_admin_token(request, token)
-    if not auth_token:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
         return HTMLResponse(render_admin_login_html())
 
     response = HTMLResponse(render_admin_analytics_html_v2(token="", days=days))
-    set_admin_cookie(response, auth_token)
+    set_admin_cookie(response, session_id)
     return response
 
 
 @app.post("/analytics/login", response_class=HTMLResponse)
 async def analytics_login(request: Request) -> HTMLResponse:
+    allowed, reason = admin_login_allowed(request)
+    if not allowed:
+        return HTMLResponse(render_admin_login_html(reason), status_code=429)
+
     raw_body = (await request.body()).decode("utf-8", errors="ignore")
     form_data = dict(parse_qsl(raw_body, keep_blank_values=True))
     password = str(form_data.get("password", "")).strip()
     if not admin_panel_authorized(password):
+        admin_login_register_failure(request)
         return HTMLResponse(render_admin_login_html("Неверный пароль."), status_code=401)
 
+    admin_login_register_success(request)
+    session_id = issue_admin_session()
     response = RedirectResponse(url="/analytics", status_code=303)
-    set_admin_cookie(response, password)
+    set_admin_cookie(response, session_id)
     return response
 
 
 @app.get("/analytics/logout")
-async def analytics_logout() -> RedirectResponse:
+async def analytics_logout(request: Request) -> RedirectResponse:
+    session_id = request.cookies.get(ADMIN_SESSION_COOKIE, "").strip()
+    if session_id:
+        state.admin_sessions.pop(session_id, None)
     response = RedirectResponse(url="/analytics", status_code=303)
     clear_admin_cookie(response)
     return response
@@ -9387,38 +9493,81 @@ async def admin_panel(
     q: str = "",
     payment_status: str = "",
 ) -> HTMLResponse:
-    auth_token = resolve_admin_token(request, token)
-    if not auth_token:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
         raise HTTPException(status_code=403, detail="forbidden")
     response = HTMLResponse(
         render_admin_panel_html_v2(
-            token="",
+            csrf_token=admin_csrf_token(session_id),
             chat_id=chat_id,
             request_id=request_id,
             q=q,
             payment_status=payment_status,
         )
     )
-    set_admin_cookie(response, auth_token)
+    set_admin_cookie(response, session_id)
     return response
 
 
+def payment_status_signing_secret() -> str:
+    return WEBHOOK_SECRET or TBANK_PASSWORD or ADMIN_PANEL_TOKEN
+
+
+def payment_status_signature(request_id: int, status_ts: int) -> str:
+    secret = payment_status_signing_secret()
+    if not secret:
+        return ""
+    payload = f"{int(request_id)}:{int(status_ts)}"
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def payment_status_signature_valid(request_id: int, status_ts_raw: str, status_sig: str) -> bool:
+    if not status_sig:
+        return False
+    if not status_ts_raw.strip().isdigit():
+        return False
+    status_ts = int(status_ts_raw.strip())
+    now_ts = int(datetime.utcnow().timestamp())
+    # Allow small clock skew and enforce finite link lifetime.
+    if status_ts < now_ts - 120:
+        return False
+    if status_ts > now_ts + max(60, PAYMENT_STATUS_TOKEN_TTL_SECONDS):
+        return False
+    expected = payment_status_signature(request_id, status_ts)
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, status_sig.strip())
+
+
 @app.get("/admin/panel/action", response_class=HTMLResponse)
+async def admin_panel_action_get() -> HTMLResponse:
+    return HTMLResponse("Method Not Allowed", status_code=405)
+
+
+@app.post("/admin/panel/action", response_class=HTMLResponse)
 async def admin_panel_action(
     request: Request,
-    token: str = "",
-    type: str = "",
-    chat_id: int | None = None,
-    request_id: int | None = None,
-    plan: str = "",
-    amount: int = 0,
-    value: str = "",
 ) -> HTMLResponse:
-    auth_token = resolve_admin_token(request, token)
-    if not auth_token:
+    session_id = resolve_admin_session(request, "")
+    if not session_id:
         raise HTTPException(status_code=403, detail="forbidden")
+    raw_body = (await request.body()).decode("utf-8", errors="ignore")
+    form_data = dict(parse_qsl(raw_body, keep_blank_values=True))
+    csrf = str(form_data.get("csrf", "")).strip()
+    if not admin_csrf_valid(session_id, csrf):
+        raise HTTPException(status_code=403, detail="csrf failed")
+
+    action = str(form_data.get("type", "")).strip().lower()
+    chat_raw = str(form_data.get("chat_id", "")).strip()
+    request_raw = str(form_data.get("request_id", "")).strip()
+    plan = str(form_data.get("plan", "")).strip()
+    value = str(form_data.get("value", "")).strip()
+    amount_raw = str(form_data.get("amount", "")).strip()
+
+    chat_id = int(chat_raw) if chat_raw.isdigit() else None
+    request_id = int(request_raw) if request_raw.isdigit() else None
+    amount = int(amount_raw) if re.fullmatch(r"-?\d+", amount_raw) else 0
     message = "Готово"
-    action = type.strip().lower()
     try:
         if action == "backup":
             backup_file = create_db_backup()
@@ -9497,8 +9646,15 @@ async def admin_panel_action(
         capture_exception_safe(exc)
         message = f"Ошибка: {exc}"
 
-    response = HTMLResponse(render_admin_panel_html_v2(token="", chat_id=chat_id, request_id=request_id, message=message))
-    set_admin_cookie(response, auth_token)
+    response = HTMLResponse(
+        render_admin_panel_html_v2(
+            csrf_token=admin_csrf_token(session_id),
+            chat_id=chat_id,
+            request_id=request_id,
+            message=message,
+        )
+    )
+    set_admin_cookie(response, session_id)
     return response
 
 
@@ -9538,7 +9694,7 @@ def payment_status_view(request_id: int | None) -> dict[str, Any]:
 
 
 def render_admin_panel_html_v2(
-    token: str,
+    csrf_token: str,
     chat_id: int | None = None,
     request_id: int | None = None,
     message: str = "",
@@ -9555,6 +9711,19 @@ def render_admin_panel_html_v2(
     selected_user_payments = state.user_store.list_user_payments(chat_id, limit=8) if chat_id else []
     selected_user_events = state.user_store.list_user_usage_events(chat_id, limit=12) if chat_id else []
     esc = html.escape
+
+    def action_form(label: str, **params: Any) -> str:
+        hidden = [f"<input type='hidden' name='csrf' value='{esc(csrf_token)}'/>"]
+        for key, value in params.items():
+            if value is None or value == "":
+                continue
+            hidden.append(f"<input type='hidden' name='{esc(str(key))}' value='{esc(str(value))}'/>")
+        return (
+            "<form method='post' action='/admin/panel/action' style='display:inline-block; margin:0 6px 6px 0;'>"
+            + "".join(hidden)
+            + f"<button class='btn' type='submit'>{esc(label)}</button>"
+            + "</form>"
+        )
 
     def yes_no(flag: Any) -> str:
         return "да" if int(flag or 0) == 1 else "нет"
@@ -9667,7 +9836,7 @@ def render_admin_panel_html_v2(
             f"<td>{recurring}</td>"
             f"<td>{int(row.get('is_blocked', 0) or 0)}</td>"
             f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
-            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=cid))}'>Открыть</a></td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', chat_id=cid))}'>Открыть</a></td>"
             "</tr>"
         )
 
@@ -9681,7 +9850,7 @@ def render_admin_panel_html_v2(
             f"<td>{esc(str(row.get('plan', '')))}</td>"
             f"<td>{int(row.get('amount_rub', 0) or 0)}</td>"
             f"<td>{esc(payment_status_label(str(row.get('status', ''))))}</td>"
-            f"<td><a href='{esc(admin_url('/admin/panel', token, request_id=rid))}'>Открыть</a></td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', request_id=rid))}'>Открыть</a></td>"
             "</tr>"
         )
 
@@ -9695,7 +9864,7 @@ def render_admin_panel_html_v2(
             f"<td>{request_balance_text(int(row.get('credits_balance', 0) or 0))}</td>"
             f"<td>{esc(str(row.get('risk_reason', '') or ''))}</td>"
             f"<td>{esc(str(row.get('last_active_at', '') or '-'))}</td>"
-            f"<td><a href='{esc(admin_url('/admin/panel', token, chat_id=int(row.get('chat_id', 0) or 0)))}'>Открыть</a></td>"
+            f"<td><a href='{esc(admin_url('/admin/panel', chat_id=int(row.get('chat_id', 0) or 0)))}'>Открыть</a></td>"
             "</tr>"
         )
     if not suspicious_rows:
@@ -9713,7 +9882,6 @@ def render_admin_panel_html_v2(
     refunded_count = sum(1 for row in payments if str(row.get("status", "") or "").lower() == "refunded")
     search_form = (
         "<form class='actions' method='get' action='/admin/panel'>"
-        f"<input type='hidden' name='token' value='{esc(token)}'/>"
         f"<input class='input' type='text' name='q' value='{esc(query)}' placeholder='chat_id / user_id / тариф / заявка'/>"
         "<select class='input' name='payment_status'>"
         f"<option value='' {'selected' if not status_filter else ''}>Все статусы платежей</option>"
@@ -9724,7 +9892,7 @@ def render_admin_panel_html_v2(
         f"<option value='refunded' {'selected' if status_filter == 'refunded' else ''}>Возврат</option>"
         "</select>"
         "<button class='btn btn-primary' type='submit'>Искать</button>"
-        f"<a class='btn' href='{esc(admin_url('/admin/panel', token))}'>Сбросить</a>"
+        "<a class='btn' href='/admin/panel'>Сбросить</a>"
         "</form>"
     )
 
@@ -9734,37 +9902,35 @@ def render_admin_panel_html_v2(
         recurring_on = int(selected_user.get("recurring_enabled", 0) or 0) == 1
         action_block = (
             "<h3>Ручная корректировка</h3>"
+            "<p>" + action_form("Вернуть на free", type="set_plan", chat_id=cid, plan="free") + "</p>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_plan', chat_id=cid, plan='free'))}'>Вернуть на free</a>"
-            "</p>"
+            + action_form("Lite на 30 дней", type="set_sub", chat_id=cid, plan="lite")
+            + action_form("Start на 30 дней", type="set_sub", chat_id=cid, plan="start")
+            + action_form("Pro на 30 дней", type="set_sub", chat_id=cid, plan="pro")
+            + "</p>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='lite'))}'>Lite на 30 дней</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='start'))}'>Start на 30 дней</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='set_sub', chat_id=cid, plan='pro'))}'>Pro на 30 дней</a>"
-            "</p>"
+            + action_form("+20 запросов", type="add_credits", chat_id=cid, amount=100)
+            + action_form("+100 запросов", type="add_credits", chat_id=cid, amount=500)
+            + action_form("-20 запросов", type="add_credits", chat_id=cid, amount=-100)
+            + action_form("-100 запросов", type="add_credits", chat_id=cid, amount=-500)
+            + "</p>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=100))}'>+20 запросов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=500))}'>+100 запросов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-100))}'>-20 запросов</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='add_credits', chat_id=cid, amount=-500))}'>-100 запросов</a>"
-            "</p>"
+            + action_form("Отключить автопродление", type="cancel_recurring", chat_id=cid)
+            + f"{' ✅' if recurring_on else ' (уже выключено)'}"
+            + "</p>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='cancel_recurring', chat_id=cid))}'>Отключить автопродление</a>"
-            f"{' ✅' if recurring_on else ' (уже выключено)'}"
-            "</p>"
-            "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='block', chat_id=cid, value='on'))}'>Block ON</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='block', chat_id=cid, value='off'))}'>Block OFF</a>"
-            "</p>"
+            + action_form("Block ON", type="block", chat_id=cid, value="on")
+            + action_form("Block OFF", type="block", chat_id=cid, value="off")
+            + "</p>"
         )
     if selected_payment:
         rid = int(selected_payment["id"])
         action_block += (
             "<h3>Платёж</h3>"
             "<p>"
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='payment', request_id=rid, value='paid'))}'>Подтвердить оплату</a> | "
-            f"<a href='{esc(admin_url('/admin/panel/action', token, type='payment', request_id=rid, value='cancel'))}'>Отменить</a>"
-            "</p>"
+            + action_form("Подтвердить оплату", type="payment", request_id=rid, value="paid")
+            + action_form("Отменить", type="payment", request_id=rid, value="cancel")
+            + "</p>"
         )
 
     return f"""<!doctype html>
@@ -9793,12 +9959,12 @@ def render_admin_panel_html_v2(
       </div>
       <h1>Управление ботом</h1>
       <div class="actions">
-        <a class="btn" href="{esc(admin_url('/analytics', token))}">Аналитика</a>
-        <a class="btn btn-primary" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
-        <a class="btn" href="{esc(admin_url('/status', token))}">Статус</a>
-        <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='backup'))}">Создать бэкап БД</a>
-        <a class="btn" href="{esc(admin_url('/admin/panel/action', token, type='nudge'))}">Реактивировать free</a>
-        <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
+        <a class="btn" href="/analytics">Аналитика</a>
+        <a class="btn btn-primary" href="/admin/panel">Админка</a>
+        <a class="btn" href="/status">Статус</a>
+        {action_form("Создать бэкап БД", type="backup")}
+        {action_form("Реактивировать free", type="nudge")}
+        <a class="btn" href="/analytics/logout">Выйти</a>
       </div>
       {search_form}
       <div class="mini-grid">
@@ -9839,7 +10005,20 @@ def render_admin_panel_html_v2(
 
 
 @app.get("/payment/status")
-async def payment_status(request_id: int | None = None) -> dict[str, Any]:
+async def payment_status(
+    request: Request,
+    request_id: int | None = None,
+    status_ts: str = "",
+    status_sig: str = "",
+) -> dict[str, Any]:
+    session_id = resolve_admin_session(request, "")
+    is_admin_request = bool(session_id)
+    if is_admin_request:
+        # Keep admin session alive while inspecting statuses manually.
+        pass
+    elif request_id is None or not payment_status_signature_valid(request_id, status_ts, status_sig):
+        raise HTTPException(status_code=401, detail="auth required")
+
     view = payment_status_view(request_id)
     if request_id is None or not view.get("known"):
         return view

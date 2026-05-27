@@ -59,7 +59,8 @@
     }
 
     async function refreshStatus() {
-      const qs = requestId ? ("?request_id=" + encodeURIComponent(requestId)) : "";
+      const rawQs = params.toString();
+      const qs = rawQs ? ("?" + rawQs) : "";
       try {
         const resp = await fetch("/payment/status" + qs, { cache: "no-store" });
         const data = await resp.json();
