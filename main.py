@@ -3330,11 +3330,11 @@ def text_model_allowed_for_plan(plan: str, model_alias: str) -> bool:
 
 
 def is_admin(chat_id: int) -> bool:
-    if chat_id in ADMIN_IDS:
-        return True
     row = state.user_store.get_user(chat_id)
     max_user_id = int((row or {}).get("max_user_id", 0) or 0)
-    return max_user_id > 0 and max_user_id in ADMIN_MAX_USER_IDS
+    if ADMIN_MAX_USER_IDS:
+        return max_user_id > 0 and max_user_id in ADMIN_MAX_USER_IDS
+    return chat_id in ADMIN_IDS
 
 
 def admin_target_chat_ids() -> set[int]:
@@ -6943,13 +6943,11 @@ async def handle_admin(chat_id: int, text: str) -> bool:
             chat_id,
             "Админ-команды:\n"
             "/admin user <chat_id>\n"
-            "/admin plan <chat_id> <free|lite|start|pro>\n"
-            "/admin sub <chat_id> <lite|start|pro> <days>\n"
             "/admin block <chat_id> <on|off>\n"
-            "/admin pay <request_id> <paid|cancel>\n"
             "/admin templates\n"
             "/admin backup\n"
-            "/admin nudge [days] [limit]",
+            "/admin nudge [days] [limit]\n\n"
+            "Изменение тарифов и ручное подтверждение платежей — только через веб-админку.",
         )
         return True
 
@@ -6964,44 +6962,11 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         return True
 
     if action == "plan" and len(parts) >= 4:
-        target = parse_admin_target(parts[2])
-        new_plan = parts[3].lower()
-        if target is None or new_plan not in PLAN_CONFIGS:
-            await max_send_message(chat_id, "Используй: /admin plan <chat_id> <free|lite|start|pro>")
-            return True
-        user_profile(target)
-        selected = best_default_alias_for_plan(new_plan)
-        if new_plan in PAID_PLANS:
-            expires_at = state.user_store.set_subscription(target, new_plan, 30, selected, recurring_enabled=False)
-            await max_send_message(
-                chat_id,
-                f"Подписка пользователя {target} -> {new_plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}.",
-            )
-            return True
-        state.user_store.set_plan(target, new_plan)
-        state.user_store.set_selected_model(target, selected)
-        state.user_store.set_credits(target, credits_for_plan(new_plan))
-        await max_send_message(
-            chat_id,
-            f"План пользователя {target} -> {new_plan}. Модель -> {selected}. Запросы -> {request_balance_text(credits_for_plan(new_plan))}.",
-        )
+        await max_send_message(chat_id, "Команда отключена. Изменение тарифов делай через веб-админку: /admin/panel")
         return True
 
     if action == "sub" and len(parts) >= 5:
-        target = parse_admin_target(parts[2])
-        plan = parts[3].lower()
-        days_raw = parts[4]
-        if target is None or plan not in BUYABLE_PLANS or not days_raw.isdigit():
-            await max_send_message(chat_id, "Используй: /admin sub <chat_id> <lite|start|pro> <days>")
-            return True
-        days = int(days_raw)
-        if days <= 0 or days > 365:
-            await max_send_message(chat_id, "Дни должны быть в диапазоне 1..365")
-            return True
-        user_profile(target)
-        selected = best_default_alias_for_plan(plan)
-        expires_at = state.user_store.set_subscription(target, plan, days, selected)
-        await max_send_message(chat_id, f"Подписка активирована: user={target} plan={plan} days={days} until={expires_at}")
+        await max_send_message(chat_id, "Команда отключена. Изменение тарифов делай через веб-админку: /admin/panel")
         return True
 
     if action == "block" and len(parts) >= 4:
@@ -7016,33 +6981,7 @@ async def handle_admin(chat_id: int, text: str) -> bool:
         return True
 
     if action == "pay" and len(parts) >= 4:
-        req_raw = parts[2]
-        decision = parts[3].lower()
-        if not req_raw.isdigit() or decision not in {"paid", "cancel"}:
-            await max_send_message(chat_id, "Используй: /admin pay <request_id> <paid|cancel>")
-            return True
-        req_id = int(req_raw)
-        payment = state.user_store.get_payment(req_id)
-        if not payment:
-            await max_send_message(chat_id, f"Заявка #{req_id} не найдена")
-            return True
-        if payment["status"] not in {"pending", "claimed"}:
-            await max_send_message(chat_id, f"Заявка #{req_id} уже обработана: {payment['status']}")
-            return True
-        if decision == "cancel":
-            state.user_store.set_payment_status(req_id, "canceled")
-            await max_send_message(chat_id, f"Заявка #{req_id} отменена")
-            return True
-
-        activated, info = await activate_payment_request(req_id, source="admin manual")
-        if not activated:
-            await max_send_message(chat_id, f"Заявка #{req_id}: {info}")
-            return True
-        payment = state.user_store.get_payment(req_id) or payment
-        await max_send_message(
-            chat_id,
-            f"Оплата #{req_id} подтверждена. user={payment['chat_id']} item={payment['plan']} result={info}",
-        )
+        await max_send_message(chat_id, "Команда отключена. Проверку/подтверждение платежей делай через веб-админку: /admin/panel")
         return True
 
     if action == "templates":
@@ -7874,10 +7813,33 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         request_id = int(request_raw)
         payment = state.user_store.get_payment(request_id)
         if not payment or int(payment["chat_id"]) != chat_id:
-            if callback_id:
-                await answer_callback(callback_id, "Заявка не найдена")
-            await max_send_message(chat_id, "Заявка не найдена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
+            await show_managed_content(
+                chat_id,
+                "Заявка не найдена.",
+                attachments=build_tariffs_keyboard_pricing(),
+                callback_id=callback_id,
+                source_mid=source_mid,
+                notification="Заявка не найдена",
+            )
             return True
+
+        async def render_payment_state(
+            payment_row: dict[str, Any],
+            *,
+            bank_status: str = "",
+            notification: str = "Обновил",
+        ) -> None:
+            current_status = str((payment_row or {}).get("status", "pending")).lower()
+            payment_url = str((payment_row or {}).get("payment_url", "") or "")
+            await show_managed_content(
+                chat_id,
+                payment_user_status_text(payment_row or {}, bank_status=bank_status),
+                attachments=build_payment_request_keyboard(request_id, payment_url=payment_url, status=current_status),
+                callback_id=callback_id,
+                source_mid=source_mid,
+                notification=notification,
+            )
+
         status = str(payment["status"]).lower()
         provider_ref = str(payment.get("provider_ref", ""))
         if provider_ref.startswith("tbank:") and status == "pending":
@@ -7885,79 +7847,49 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 payment, bank_status = await refresh_payment_from_tbank(request_id, source="T-Bank GetState (user button)")
             except Exception:
                 log.exception("T-Bank GetState failed from paid button for request_id=%s", request_id)
-                if callback_id:
-                    await answer_callback(callback_id, "проверка банка")
-                await max_send_message(
+                payment = state.user_store.get_payment(request_id) or payment
+                await show_managed_content(
                     chat_id,
                     (
                         "Не удалось мгновенно получить ответ от банка.\n"
                         "Платеж продолжает проверяться автоматически, обычно до 1-2 минут."
                     ),
-                    attachments=build_tariffs_keyboard_pricing(),
-                    notify=False,
+                    attachments=build_payment_request_keyboard(
+                        request_id,
+                        payment_url=str((payment or {}).get("payment_url", "") or ""),
+                        status=str((payment or {}).get("status", "pending")).lower(),
+                    ),
+                    callback_id=callback_id,
+                    source_mid=source_mid,
+                    notification="Проверка банка",
                 )
                 return True
 
             refreshed_status = str((payment or {}).get("status", "pending")).lower()
             if refreshed_status == "paid":
-                if callback_id:
-                    await answer_callback(callback_id, "Оплата подтверждена")
-                await max_send_message(chat_id, "Оплата подтверждена. Подписка уже активирована.", attachments=build_keyboard(), notify=False)
+                await render_payment_state(payment or {}, bank_status=bank_status, notification="Оплата подтверждена")
                 return True
             if refreshed_status == "refunded":
-                if callback_id:
-                    await answer_callback(callback_id, "Возврат")
-                await max_send_message(chat_id, "Банк отметил возврат по этой заявке.", attachments=build_keyboard(), notify=False)
+                await render_payment_state(payment or {}, bank_status=bank_status, notification="Возврат")
                 return True
             if refreshed_status == "canceled":
-                if callback_id:
-                    await answer_callback(callback_id, "Оплата отменена")
-                await max_send_message(
-                    chat_id,
-                    "Оплата по этой заявке не завершена. Создай новую заявку в «Тарифы».",
-                    attachments=build_tariffs_keyboard_pricing(),
-                    notify=False,
-                )
+                await render_payment_state(payment or {}, bank_status=bank_status, notification="Оплата отменена")
                 return True
-            if callback_id:
-                await answer_callback(callback_id, "ожидаем банк")
-            await max_send_message(
-                chat_id,
-                (
-                    "Платеж еще в обработке банка.\n"
-                    f"Текущий статус банка: {bank_status or 'pending'}.\n"
-                    "Обычно подтверждение приходит в течение 1-2 минут."
-                ),
-                attachments=build_tariffs_keyboard_pricing(),
-                notify=False,
-            )
+            await render_payment_state(payment or {}, bank_status=bank_status, notification="Ожидаем банк")
             return True
         if status == "paid":
-            if callback_id:
-                await answer_callback(callback_id, "Уже подтверждено")
-            await max_send_message(chat_id, "Эта заявка уже подтверждена.", attachments=build_keyboard(), notify=False)
+            await render_payment_state(payment, notification="Уже подтверждено")
             return True
         if status == "claimed":
-            if callback_id:
-                await answer_callback(callback_id, "already sent")
-            await max_send_message(chat_id, "Заявка уже отправлена админу на проверку.", attachments=build_tariffs_keyboard_pricing(), notify=False)
+            await render_payment_state(payment, notification="Уже на проверке")
             return True
         if status == "canceled":
-            if callback_id:
-                await answer_callback(callback_id, "Заявка отменена")
-            await max_send_message(chat_id, "Эта заявка уже отменена.", attachments=build_tariffs_keyboard_pricing(), notify=False)
+            await render_payment_state(payment, notification="Заявка отменена")
             return True
         state.user_store.set_payment_status(request_id, "claimed")
         payment = state.user_store.get_payment(request_id) or payment
         await notify_admin_about_payment_claim(request_id, payment)
-        if callback_id:
-            await answer_callback(callback_id, "Передано админу")
-        await max_send_message(
-            chat_id,
-            "Отметили оплату. Админ проверит платеж и активирует тариф.",
-            attachments=build_tariffs_keyboard_pricing(),
-            notify=False,
-        )
+        await render_payment_state(payment, notification="Передано админу")
         return True
 
     return False
@@ -9482,11 +9414,23 @@ async def admin_panel_action(
                     selected,
                     recurring_enabled=False,
                 )
+                state.user_store.record_usage_event(
+                    chat_id=chat_id,
+                    event_type="admin_plan_change",
+                    plan=plan,
+                    details=f"source=admin_panel;mode=set_plan;expires_at={expires_at}",
+                )
                 message = f"Подписка пользователя {chat_id} -> {plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}"
             else:
                 state.user_store.set_plan(chat_id, plan)
                 state.user_store.set_selected_model(chat_id, selected)
                 state.user_store.set_credits(chat_id, credits_for_plan(plan))
+                state.user_store.record_usage_event(
+                    chat_id=chat_id,
+                    event_type="admin_plan_change",
+                    plan=plan,
+                    details=f"source=admin_panel;mode=set_plan",
+                )
                 message = f"План пользователя {chat_id} -> {plan}"
         elif action == "set_sub" and chat_id is not None and plan in PAID_PLANS:
             user_profile(chat_id)
@@ -9496,6 +9440,12 @@ async def admin_panel_action(
                 30,
                 best_default_alias_for_plan(plan),
                 recurring_enabled=False,
+            )
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="admin_plan_change",
+                plan=plan,
+                details=f"source=admin_panel;mode=set_sub;expires_at={expires_at}",
             )
             message = f"Подписка пользователя {chat_id} -> {plan} до {format_msk_datetime(parse_iso_datetime(expires_at))}"
         elif action == "add_credits" and chat_id is not None and amount != 0:
