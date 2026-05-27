@@ -2529,6 +2529,8 @@ def migrate_runtime_chat_state(old_chat_id: int, new_chat_id: int) -> None:
 
 
 def ensure_update_user_binding(chat_id: int, update: dict[str, Any]) -> None:
+    if chat_id <= 0:
+        return
     actor_user_id = parse_actor_user_id(update)
     rebound_from = state.user_store.ensure_user_binding(chat_id, actor_user_id, best_default_alias_for_plan("free"))
     if rebound_from and rebound_from != chat_id:
@@ -4434,6 +4436,24 @@ def is_channel_update(update: dict[str, Any]) -> bool:
     chat_type = _walk_for_string_value(update, {"type", "chat_type", "chatType"}).lower()
     if chat_type == "channel":
         return True
+
+    callback = update.get("callback")
+    if isinstance(callback, dict):
+        cb_message = callback.get("message")
+        if isinstance(cb_message, dict):
+            recipient = cb_message.get("recipient")
+            if isinstance(recipient, dict):
+                if str(recipient.get("type") or "").lower() == "channel":
+                    return True
+                if int(recipient.get("chat_id") or 0) < 0 and not recipient.get("dialog_with_user"):
+                    return True
+            cb_chat = cb_message.get("chat")
+            if isinstance(cb_chat, dict):
+                if str(cb_chat.get("type") or cb_chat.get("chat_type") or cb_chat.get("chatType") or "").lower() == "channel":
+                    return True
+                if int(cb_chat.get("chat_id") or 0) < 0 and not cb_chat.get("dialog_with_user"):
+                    return True
+
     message = update.get("message")
     if isinstance(message, dict):
         recipient = message.get("recipient")
@@ -8307,6 +8327,9 @@ async def process_update(update: dict[str, Any]) -> None:
     chat_id, text = parse_incoming_text(update)
     incoming_image_url = parse_incoming_image_url(update)
     if chat_id is None:
+        return
+    if chat_id <= 0:
+        log.info("Non-dialog update skipped chat_id=%s update_type=%s", chat_id, update_type)
         return
 
     ensure_update_user_binding(chat_id, update)
