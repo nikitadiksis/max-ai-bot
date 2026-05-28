@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 from contextlib import asynccontextmanager, suppress
 from collections import deque
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from datetime import date, datetime, timedelta
 import hmac
 import hashlib
 import html
-from io import BytesIO
+from io import StringIO, BytesIO
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -29,6 +31,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
+from fastapi.responses import Response
 import uvicorn
 
 load_dotenv()
@@ -149,15 +152,9 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").stri
 CHANNEL_GATE_ENABLED = os.getenv("CHANNEL_GATE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
 CHANNEL_MEMBERSHIP_CACHE_HOURS = int(os.getenv("CHANNEL_MEMBERSHIP_CACHE_HOURS", "12"))
-REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "120"))
+REFERRAL_BONUS_CREDITS = int(os.getenv("REFERRAL_BONUS_CREDITS", "70"))
 PROMO_WELCOME_CREDITS = int(os.getenv("PROMO_WELCOME_CREDITS", "0"))
 PROMO_CODES_RAW = os.getenv("PROMO_CODES", "").strip()
-CHANNEL_PROMO_ENABLED = os.getenv("CHANNEL_PROMO_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-CHANNEL_PROMO_CODE = os.getenv("CHANNEL_PROMO_CODE", "CHANNEL").strip()
-CHANNEL_PROMO_CREDITS = int(os.getenv("CHANNEL_PROMO_CREDITS", "70"))
-CHANNEL_PROMO_START_DATE = os.getenv("CHANNEL_PROMO_START_DATE", datetime.utcnow().date().isoformat()).strip()
-CHANNEL_PROMO_CAMPAIGN_DAYS = int(os.getenv("CHANNEL_PROMO_CAMPAIGN_DAYS", "7"))
-CHANNEL_PROMO_BONUS_TTL_DAYS = int(os.getenv("CHANNEL_PROMO_BONUS_TTL_DAYS", "7"))
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
 ADMIN_SESSION_COOKIE = "aimax_admin_session"
 ADMIN_SESSION_MAX_AGE = 60 * 60 * 24 * 14
@@ -180,6 +177,10 @@ ALERT_LOW_PAYMENTS_MAX_PAYMENTS = int(os.getenv("ALERT_LOW_PAYMENTS_MAX_PAYMENTS
 ALERT_SPEND_SPIKE_LOOKBACK_HOURS = int(os.getenv("ALERT_SPEND_SPIKE_LOOKBACK_HOURS", "1"))
 ALERT_SPEND_SPIKE_MIN_RUB = float(os.getenv("ALERT_SPEND_SPIKE_MIN_RUB", "150"))
 ALERT_SPEND_SPIKE_MULTIPLIER = float(os.getenv("ALERT_SPEND_SPIKE_MULTIPLIER", "3.0"))
+ALERT_CPU_LOAD_PER_CORE_THRESHOLD = float(os.getenv("ALERT_CPU_LOAD_PER_CORE_THRESHOLD", "1.2"))
+ALERT_MEMORY_USED_PCT_THRESHOLD = float(os.getenv("ALERT_MEMORY_USED_PCT_THRESHOLD", "92"))
+ALERT_DISK_USED_PCT_THRESHOLD = float(os.getenv("ALERT_DISK_USED_PCT_THRESHOLD", "90"))
+ALERT_BACKUP_STALE_HOURS = int(os.getenv("ALERT_BACKUP_STALE_HOURS", "36"))
 REENGAGE_DORMANT_DAYS = int(os.getenv("REENGAGE_DORMANT_DAYS", "5"))
 REENGAGE_BATCH_LIMIT = int(os.getenv("REENGAGE_BATCH_LIMIT", "30"))
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
@@ -288,6 +289,24 @@ IMAGE_EDIT_PRESET_OPTIONS: dict[str, dict[str, str]] = {
         "prompt": "turn the reference photo into polished digital art with strong composition",
     },
 }
+ADS_MEDIA_CHANNELS: list[tuple[str, str, int, str]] = [
+    ("AD01", "КиберПоток | ИИ & Нейросети", 601, "https://telega.in/channels/Kiber_potok/card"),
+    ("AD02", "Технологичка | Dev/IT", 825, "https://telega.in/channels/technologichka/card"),
+    ("AD03", "Code Learning", 839, "https://telega.in/channels/codelearning_tg/card"),
+    ("AD04", "Техносплит – Нейросети, Технологии, Новости IT", 1259, "https://telega.in/channels/technosplit/card"),
+    ("AD05", "AI Simplify", 1399, "https://telega.in/channels/simplify_ai/card"),
+    ("AD06", "Machine Learning | Нейронные сети, ИИ, Big Data", 3357, "https://telega.in/channels/ML_secrets/card"),
+    ("AD07", "ChatGpt | Нейросеть", 4196, "https://telega.in/channels/gpt_chat1/card"),
+    ("AD08", "Техконтент | Ai | ChatGPT", 4895, "https://telega.in/channels/tech_contents/card"),
+    ("AD09", "Нейро Лептик", 4895, "https://telega.in/channels/neiro_leptik/card"),
+    ("AD10", "Bard AI | Нейросети & IT", 5594, "https://telega.in/channels/NeuralToday/card"),
+    ("AD11", "Дневник ChatGPT", 8392, "https://telega.in/channels/chatgptmachine/card"),
+    ("AD12", "StudGPT (ChatGPT) Ai | ИИ", 11189, "https://telega.in/channels/studgpt/card"),
+    ("AD13", "Библиотека нейротекста | ChatGPT, Gemini, Bing", 12028, "https://telega.in/channels/neuro_text/card"),
+    ("AD14", "Искусственный интеллект. Высокие технологии", 20280, "https://telega.in/channels/vistehno/card"),
+    ("AD15", "ИИволюция", 27972, "https://telega.in/channels/ai_volution/card"),
+    ("AD16", "Tips AI | IT & AI", 39161, "https://telega.in/channels/tips_ai/card"),
+]
 DEFAULT_IMAGE_STYLE = "auto"
 DEFAULT_IMAGE_ASPECT = "square"
 
@@ -667,38 +686,17 @@ def referral_share_message_v2(code: str) -> str:
     )
 
 
-def parse_date_ymd(value: str) -> date | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw)
-    except Exception:
-        return None
-
-
 def channel_promo_meta(today: date | None = None) -> dict[str, Any]:
-    promo_code = normalize_referral_code(CHANNEL_PROMO_CODE)
-    start = parse_date_ymd(CHANNEL_PROMO_START_DATE) or datetime.utcnow().date()
-    duration_days = max(1, CHANNEL_PROMO_CAMPAIGN_DAYS)
-    end_exclusive = start + timedelta(days=duration_days)
-    current = today or datetime.utcnow().date()
-    active = (
-        CHANNEL_PROMO_ENABLED
-        and bool(promo_code)
-        and CHANNEL_PROMO_CREDITS > 0
-        and start <= current < end_exclusive
-    )
-    days_left = max(0, (end_exclusive - current).days)
+    # Legacy channel promo is intentionally disabled.
     return {
         "enabled": False,
         "active": False,
-        "code": promo_code,
-        "credits": max(0, CHANNEL_PROMO_CREDITS),
-        "start": start,
-        "end_exclusive": end_exclusive,
-        "days_left": days_left,
-        "bonus_ttl_days": max(0, CHANNEL_PROMO_BONUS_TTL_DAYS),
+        "code": "",
+        "credits": 0,
+        "start": (today or datetime.utcnow().date()),
+        "end_exclusive": (today or datetime.utcnow().date()),
+        "days_left": 0,
+        "bonus_ttl_days": 0,
     }
 
 
@@ -707,7 +705,6 @@ def promo_offer_for_code(code: str) -> tuple[int, int, str]:
     if not promo_code:
         return 0, 0, "Пустой промокод."
 
-    channel = channel_promo_meta()
     if promo_code == channel["code"] and channel["enabled"]:
         if channel["active"]:
             return int(channel["credits"]), int(channel["bonus_ttl_days"]), ""
@@ -3329,7 +3326,11 @@ def service_status_report() -> dict[str, Any]:
         "monitor_task": bool(state.monitor_task and not state.monitor_task.done()),
         "latest_backup_path": str(backup_file) if backup_file else "",
         "latest_backup_at": backup_mtime.isoformat() if backup_mtime else "",
+        "latest_backup_age_hours": (
+            round((now - backup_mtime).total_seconds() / 3600.0, 2) if backup_mtime else None
+        ),
         "recent_runtime_errors": recent_errors,
+        "system": system_resource_snapshot(),
         "channel_gate": {
             "enabled": CHANNEL_GATE_ENABLED,
             "configured_channel": channel_chat_id_value() if CHANNEL_CHAT_ID else channel_url_value(),
@@ -3338,6 +3339,59 @@ def service_status_report() -> dict[str, Any]:
         },
         "monitor": monitor,
         "smoke_checks": smoke_check_report(),
+    }
+
+
+def system_resource_snapshot() -> dict[str, Any]:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    load1 = 0.0
+    try:
+        load1 = float(os.getloadavg()[0])
+    except Exception:
+        load1 = 0.0
+    cpu_per_core = load1 / cpu_count if cpu_count > 0 else load1
+
+    mem_total_kb = 0
+    mem_available_kb = 0
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    mem_total_kb = int(parts[1]) if len(parts) > 1 else 0
+                elif line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    mem_available_kb = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        mem_total_kb = 0
+        mem_available_kb = 0
+    mem_used_pct = 0.0
+    if mem_total_kb > 0:
+        mem_used_pct = max(0.0, min(100.0, (1.0 - (mem_available_kb / mem_total_kb)) * 100.0))
+
+    disk_total = 0
+    disk_used = 0
+    disk_used_pct = 0.0
+    try:
+        usage = shutil.disk_usage(str(DATA_DIR))
+        disk_total = int(usage.total)
+        disk_used = int(usage.used)
+        disk_used_pct = (disk_used * 100.0 / disk_total) if disk_total > 0 else 0.0
+    except Exception:
+        disk_total = 0
+        disk_used = 0
+        disk_used_pct = 0.0
+
+    return {
+        "cpu_count": cpu_count,
+        "cpu_load_1m": round(load1, 3),
+        "cpu_load_1m_per_core": round(cpu_per_core, 3),
+        "memory_total_kb": mem_total_kb,
+        "memory_available_kb": mem_available_kb,
+        "memory_used_pct": round(mem_used_pct, 2),
+        "disk_total_bytes": disk_total,
+        "disk_used_bytes": disk_used,
+        "disk_used_pct": round(disk_used_pct, 2),
     }
 
 
@@ -4146,7 +4200,7 @@ def build_image_prompt_keyboard() -> list[dict[str, Any]]:
 
 def image_availability_text(chat_id: int) -> str:
     row = user_profile(chat_id)
-    plan_name = str(row.get("plan", "free"))
+    plan_name = str(row.get("plan", "free")).strip().lower()
     if plan_name != "free":
         return ""
     if plan_name == "free":
@@ -4162,15 +4216,22 @@ def image_availability_text(chat_id: int) -> str:
 
 def build_image_menu_text(chat_id: int) -> str:
     prefs = get_image_prefs(chat_id)
+    row = user_profile(chat_id)
+    is_free_plan = str(row.get("plan", "free")).strip().lower() == "free"
     mode = prefs.get("mode", "")
     panel = prefs.get("panel", "root")
     availability = image_availability_text(chat_id)
     availability_block = f"{availability}\n" if availability else ""
+    generation_line = (
+        "Лимит Free: 1 картинка в неделю с момента последней генерации.\n"
+        if is_free_plan
+        else f"Генерация: {request_cost_text(image_credit_cost())} запросов.\n"
+    )
     if not mode:
         return (
             "🎨 Картинки\n\n"
             f"{availability_block}"
-            f"Генерация: {request_cost_text(image_credit_cost())} запросов.\n"
+            f"{generation_line}"
             f"Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов.\n\n"
             "Сначала выбери, что хочешь сделать:\n"
             "• сгенерировать новую картинку\n"
@@ -4188,7 +4249,11 @@ def build_image_menu_text(chat_id: int) -> str:
             "Выбери готовый сценарий или не выбирай его.\n"
             "После этого откроется шаг со стилем и форматом.\n\n"
             f"{availability_block}"
-            f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
+            + (
+                "Лимит Free: 1 картинка в неделю с момента последней генерации."
+                if is_free_plan
+                else f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
+            )
         )
     if panel == "style":
         return (
@@ -4990,7 +5055,9 @@ def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
 
 def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) -> tuple[bool, str]:
     row = user_profile(chat_id)
-    plan_name = str(row.get("plan", "free"))
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    if plan_name == "free" and operation_name.strip().lower() == "картинка":
+        return True, ""
     if amount <= 0:
         return True, ""
     balance = int(row.get("credits_balance", 0) or 0)
@@ -5126,6 +5193,10 @@ async def max_send_message(
                 raise RuntimeError(f"MAX send error {resp.status}: {body[:500]}")
             if index == 0 and isinstance(body_json, dict):
                 first_mid = extract_message_mid(body_json)
+    if first_mid and attachments and any(
+        isinstance(item, dict) and item.get("type") == "inline_keyboard" for item in attachments
+    ):
+        state.ui_message_mid[chat_id] = first_mid
     return first_mid
 
 
@@ -5464,29 +5535,57 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
         return True
 
     row = user_profile(chat_id)
-    if row["plan"] != "free" and not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
-        await max_send_message(
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        await show_managed_content(
             chat_id,
             f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
             attachments=build_tariffs_keyboard_pricing(),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Тарифы",
         )
         return True
 
     ok, reason = check_limit_only(chat_id, "images")
     if not ok:
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
         return True
 
-    img_cost = image_credit_cost()
-    ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
-    if not ok_credit:
-        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
-        return True
+    is_free_plan = plan_name == "free"
+    img_cost = 0 if is_free_plan else image_credit_cost()
+    if img_cost > 0:
+        ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
+        if not ok_credit:
+            await show_managed_content(
+                chat_id,
+                reason_credit,
+                attachments=purchase_help_keyboard_for_row(row),
+                page=UI_PAGE_TARIFFS,
+                push_history=False,
+                notification="Недостаточно запросов",
+            )
+            return True
 
     ok, reason = check_and_consume_limit(chat_id, "images")
     if not ok:
-        state.user_store.refund_credits(chat_id, img_cost)
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        if img_cost > 0:
+            state.user_store.refund_credits(chat_id, img_cost)
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
         return True
 
     await max_send_message(chat_id, "Генерирую картинку, это может занять немного времени...")
@@ -5507,11 +5606,13 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
         with suppress(Exception):
             await maybe_send_low_credits_nudge(chat_id)
     except RuntimeError as exc:
-        state.user_store.refund_credits(chat_id, img_cost)
+        if img_cost > 0:
+            state.user_store.refund_credits(chat_id, img_cost)
         log.warning("Image generation failed for chat_id=%s: %s", chat_id, exc)
         await max_send_message(chat_id, friendly_image_generation_error(exc), attachments=build_image_menu_keyboard(chat_id))
     except Exception:
-        state.user_store.refund_credits(chat_id, img_cost)
+        if img_cost > 0:
+            state.user_store.refund_credits(chat_id, img_cost)
         raise
     return True
 
@@ -5530,11 +5631,15 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
         return True
 
     row = user_profile(chat_id)
-    if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
-        await max_send_message(
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        await show_managed_content(
             chat_id,
             f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
             attachments=build_tariffs_keyboard_pricing(),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Тарифы",
         )
         return True
 
@@ -5545,19 +5650,40 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
 
     ok, reason = check_limit_only(chat_id, "images")
     if not ok:
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
         return True
 
     edit_cost = image_edit_credit_cost()
     ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
     if not ok_credit:
-        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
+        await show_managed_content(
+            chat_id,
+            reason_credit,
+            attachments=purchase_help_keyboard_for_row(row),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Недостаточно запросов",
+        )
         return True
 
     ok, reason = check_and_consume_limit(chat_id, "images")
     if not ok:
         state.user_store.refund_credits(chat_id, edit_cost)
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
         return True
 
     await max_send_message(chat_id, "Обрабатываю фото и генерирую вариант, это может занять немного времени...")
@@ -5767,9 +5893,12 @@ def add_ui_nav_buttons(chat_id: int, attachments: list[dict[str, Any]] | None) -
 def resolve_edit_target_mid(chat_id: int, source_mid: str | None, force_new: bool = False) -> str | None:
     if force_new:
         return None
+    managed_mid = state.ui_message_mid.get(chat_id)
+    if managed_mid:
+        return managed_mid
     if source_mid:
         return source_mid
-    return state.ui_message_mid.get(chat_id)
+    return None
 
 
 def current_model_focus_block(chat_id: int) -> str:
@@ -5842,7 +5971,7 @@ def build_topups_text() -> str:
 def active_promo_lines() -> list[str]:
     promo_items = sorted(promo_catalog().items())
     lines = [f"• {code}: +{request_balance_text(credits)} запросов" for code, credits in promo_items[:6]]
-    channel = channel_promo_meta()
+    channel = {"enabled": False, "active": False, "code": "", "credits": 0, "days_left": 0, "bonus_ttl_days": 0}
     if channel["enabled"] and channel["active"]:
         lines.append(
             f"• {channel['code']}: +{request_balance_text(int(channel['credits']))} запросов "
@@ -7628,14 +7757,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "image_prompt:start":
         row = user_profile(chat_id)
-        if row["plan"] != "free" and not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+        plan_name = str(row.get("plan", "free")).strip().lower()
+        if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             if callback_id:
                 await answer_callback(callback_id, "Недоступно на текущем тарифе")
-            await max_send_message(
+            await show_managed_content(
                 chat_id,
                 f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
                 attachments=build_tariffs_keyboard_pricing(),
-                notify=False,
+                source_mid=source_mid,
+                page=UI_PAGE_TARIFFS,
+                push_history=False,
             )
             return True
 
@@ -7643,7 +7775,16 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if not ok_limit:
             if callback_id:
                 await answer_callback(callback_id, "Лимит достигнут")
-            await max_send_message(chat_id, reason_limit, attachments=build_tariffs_keyboard_pricing(), notify=False)
+            await show_managed_content(
+                chat_id,
+                reason_limit,
+                attachments=build_tariffs_keyboard_pricing(),
+                callback_id=None,
+                source_mid=source_mid,
+                page=UI_PAGE_TARIFFS,
+                push_history=False,
+                notification="Лимит достигнут",
+            )
             return True
         state.pending_image_prompt.add(chat_id)
         prefs = get_image_prefs(chat_id)
@@ -7651,12 +7792,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if prefs.get("preset", "") in IMAGE_PRESET_OPTIONS:
             chosen = IMAGE_PRESET_OPTIONS[prefs["preset"]]
             preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
+        generation_cost_line = (
+            "Лимит Free: 1 картинка в неделю с момента последней генерации."
+            if str(row.get("plan", "free")).strip().lower() == "free"
+            else f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
+        )
         await show_managed_content(
             chat_id,
             "Напиши, что нарисовать одним сообщением.\n\n"
             f"{preset_hint}"
             f"{image_params_summary(chat_id)}\n"
-            f"Стоимость: {request_cost_text(image_credit_cost())} запросов.",
+            f"{generation_cost_line}",
             attachments=build_image_prompt_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
@@ -7667,14 +7813,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "image_ref:start":
         row = user_profile(chat_id)
-        if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+        plan_name = str(row.get("plan", "free")).strip().lower()
+        if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             if callback_id:
                 await answer_callback(callback_id, "Недоступно на текущем тарифе")
-            await max_send_message(
+            await show_managed_content(
                 chat_id,
                 f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
                 attachments=build_tariffs_keyboard_pricing(),
-                notify=False,
+                source_mid=source_mid,
+                page=UI_PAGE_TARIFFS,
+                push_history=False,
             )
             return True
         state.pending_image_ref_prompt.add(chat_id)
@@ -8255,7 +8404,8 @@ async def handle_command(chat_id: int, text: str) -> bool:
 
     if command == "/image_ref":
         row = user_profile(chat_id)
-        if row["plan"] == "free" or not plan_allowed(row["plan"], DEFAULT_IMAGE_MODEL.min_plan):
+        plan_name = str(row.get("plan", "free")).strip().lower()
+        if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             await max_send_message(
                 chat_id,
                 f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
@@ -8633,6 +8783,48 @@ async def polling_loop() -> None:
             updates, marker = await get_updates(marker)
             for update in updates:
                 await process_update(update)
+            cpu_per_core = float(system.get("cpu_load_1m_per_core", 0.0) or 0.0)
+            if cpu_per_core >= max(0.1, ALERT_CPU_LOAD_PER_CORE_THRESHOLD):
+                await notify_admin_alert(
+                    "cpu_pressure",
+                    (
+                        f"CPU load per core (1m): {cpu_per_core:.2f} "
+                        f"(threshold {ALERT_CPU_LOAD_PER_CORE_THRESHOLD:.2f})."
+                    ),
+                )
+            mem_used_pct = float(system.get("memory_used_pct", 0.0) or 0.0)
+            if mem_used_pct >= max(1.0, ALERT_MEMORY_USED_PCT_THRESHOLD):
+                await notify_admin_alert(
+                    "memory_pressure",
+                    (
+                        f"Memory used: {mem_used_pct:.1f}% "
+                        f"(threshold {ALERT_MEMORY_USED_PCT_THRESHOLD:.1f}%)."
+                    ),
+                )
+            disk_used_pct = float(system.get("disk_used_pct", 0.0) or 0.0)
+            if disk_used_pct >= max(1.0, ALERT_DISK_USED_PCT_THRESHOLD):
+                await notify_admin_alert(
+                    "disk_pressure",
+                    (
+                        f"Disk used: {disk_used_pct:.1f}% "
+                        f"(threshold {ALERT_DISK_USED_PCT_THRESHOLD:.1f}%)."
+                    ),
+                )
+            backup_age_hours_raw = report.get("latest_backup_age_hours")
+            backup_age_hours = float(backup_age_hours_raw) if backup_age_hours_raw is not None else None
+            if backup_age_hours is None:
+                await notify_admin_alert(
+                    "backup_missing",
+                    "No DB backup file found in data/backups.",
+                )
+            elif backup_age_hours >= max(1, ALERT_BACKUP_STALE_HOURS):
+                await notify_admin_alert(
+                    "backup_stale",
+                    (
+                        f"Latest backup age is {backup_age_hours:.1f}h "
+                        f"(threshold {ALERT_BACKUP_STALE_HOURS}h)."
+                    ),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8668,6 +8860,7 @@ async def monitor_loop() -> None:
             await asyncio.sleep(interval_seconds)
             report = service_status_report()
             monitor = report["monitor"]
+            system = report.get("system", {}) if isinstance(report, dict) else {}
             recent_errors = int(report["recent_runtime_errors"] or 0)
             if recent_errors >= max(1, ALERT_HIGH_ERRORS_THRESHOLD):
                 await notify_admin_alert(
@@ -9257,6 +9450,9 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
       <div class="panel-nav">
         <a class="btn btn-primary" href="{esc(admin_url('/analytics', token, days=days))}">Аналитика</a>
         <a class="btn" href="{esc(admin_url('/admin/panel', token))}">Админка</a>
+        <a class="btn" href="{esc(admin_url('/analytics/export/media-plan.xlsx', token, days=days))}">Excel медиаплан</a>
+        <a class="btn" href="{esc(admin_url('/analytics/export/campaigns.csv', token, days=days))}">CSV кампаний</a>
+        <a class="btn" href="{esc(admin_url('/analytics/export/campaigns.json', token, days=days))}">JSON кампаний</a>
         <a class="btn" href="{esc(admin_url('/analytics/logout', token))}">Выйти</a>
       </div>
       <div class="actions">{period_links}</div>
@@ -9443,6 +9639,232 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
 </html>"""
 
 
+def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
+    report = state.user_store.kpi_report(days=days)
+    source_rows = report.get("sources", []) or []
+    promo_rows = report.get("promo_codes", []) or []
+
+    by_campaign: dict[str, dict[str, Any]] = {}
+
+    for row in source_rows:
+        source = str(row.get("source", "") or "direct").strip().lower() or "direct"
+        campaign = str(row.get("campaign", "") or "-").strip().lower() or "-"
+        key = campaign if campaign != "-" else f"source:{source}"
+        item = by_campaign.setdefault(
+            key,
+            {
+                "campaign": campaign,
+                "source": source,
+                "users_count": 0,
+                "promo_activations": 0,
+                "paid_users": 0,
+                "revenue_rub": 0,
+            },
+        )
+        item["users_count"] += int(row.get("users_count", 0) or 0)
+        item["paid_users"] += int(row.get("paid_users", 0) or 0)
+        item["revenue_rub"] += int(row.get("revenue_rub", 0) or 0)
+
+    for row in promo_rows:
+        promo_code = str(row.get("promo_code", "") or "").strip().lower()
+        if not promo_code:
+            continue
+        item = by_campaign.setdefault(
+            promo_code,
+            {
+                "campaign": promo_code,
+                "source": "promo",
+                "users_count": 0,
+                "promo_activations": 0,
+                "paid_users": 0,
+                "revenue_rub": 0,
+            },
+        )
+        item["promo_activations"] += int(row.get("activations", 0) or 0)
+        item["paid_users"] = max(item["paid_users"], int(row.get("paid_users", 0) or 0))
+        item["revenue_rub"] = max(item["revenue_rub"], int(row.get("revenue_rub", 0) or 0))
+
+    rows = sorted(
+        by_campaign.values(),
+        key=lambda x: (
+            -int(x.get("revenue_rub", 0) or 0),
+            -int(x.get("paid_users", 0) or 0),
+            -int(x.get("promo_activations", 0) or 0),
+            -int(x.get("users_count", 0) or 0),
+            str(x.get("campaign", "")),
+        ),
+    )
+
+    for item in rows:
+        promo_activations = int(item.get("promo_activations", 0) or 0)
+        paid_users = int(item.get("paid_users", 0) or 0)
+        item["conversion_paid_from_promo_pct"] = (
+            round(paid_users * 100.0 / promo_activations, 2) if promo_activations > 0 else 0.0
+        )
+
+    return rows
+
+
+def campaign_export_csv(days: int = 30) -> str:
+    rows = campaign_export_rows(days=days)
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "campaign",
+            "source",
+            "users_count",
+            "promo_activations",
+            "paid_users",
+            "revenue_rub",
+            "conversion_paid_from_promo_pct",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                str(row.get("campaign", "") or ""),
+                str(row.get("source", "") or ""),
+                int(row.get("users_count", 0) or 0),
+                int(row.get("promo_activations", 0) or 0),
+                int(row.get("paid_users", 0) or 0),
+                int(row.get("revenue_rub", 0) or 0),
+                float(row.get("conversion_paid_from_promo_pct", 0.0) or 0.0),
+            ]
+        )
+    return buf.getvalue()
+
+
+def campaign_media_plan_xlsx(days: int = 30) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
+    except Exception as exc:
+        raise RuntimeError(f"xlsx_builder_unavailable: {exc}")
+
+    rows = campaign_export_rows(days=days)
+    by_campaign = {
+        str(item.get("campaign", "") or "").strip().lower(): dict(item)
+        for item in rows
+        if str(item.get("campaign", "") or "").strip()
+    }
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Media Plan"
+    headers = [
+        "Priority",
+        "Campaign",
+        "Channel",
+        "Placement URL",
+        "Planned Budget (RUB)",
+        "Promo Status",
+        "Channel Link",
+        "Post Date",
+        "Spent (RUB)",
+        "Starts (users_count)",
+        "Promo Activations",
+        "Paid Users",
+        "Revenue (RUB)",
+        "CPL",
+        "CPA Paid",
+        "ROMI",
+    ]
+    ws.append(headers)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="D9D9D9")
+    for col, title in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=title)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    channel_link = CHANNEL_URL if CHANNEL_URL else "https://max.ru"
+    for idx, (campaign, channel_name, budget, placement_url) in enumerate(ADS_MEDIA_CHANNELS, start=1):
+        row_idx = idx + 1
+        live = by_campaign.get(campaign.lower(), {})
+        users_count = int(live.get("users_count", 0) or 0)
+        promo_activations = int(live.get("promo_activations", 0) or 0)
+        paid_users = int(live.get("paid_users", 0) or 0)
+        revenue_rub = int(live.get("revenue_rub", 0) or 0)
+        spent_rub = int(budget)
+
+        ws.cell(row=row_idx, column=1, value=idx)
+        ws.cell(row=row_idx, column=2, value=campaign)
+        ws.cell(row=row_idx, column=3, value=channel_name)
+        placement_cell = ws.cell(row=row_idx, column=4, value="Open placement")
+        placement_cell.hyperlink = placement_url
+        placement_cell.style = "Hyperlink"
+        ws.cell(row=row_idx, column=5, value=budget)
+        ws.cell(row=row_idx, column=6, value="planned")
+        channel_cell = ws.cell(row=row_idx, column=7, value="Open MAX channel")
+        channel_cell.hyperlink = channel_link
+        channel_cell.style = "Hyperlink"
+        ws.cell(row=row_idx, column=8, value="")
+        ws.cell(row=row_idx, column=9, value=spent_rub)
+        ws.cell(row=row_idx, column=10, value=users_count)
+        ws.cell(row=row_idx, column=11, value=promo_activations)
+        ws.cell(row=row_idx, column=12, value=paid_users)
+        ws.cell(row=row_idx, column=13, value=revenue_rub)
+        ws.cell(row=row_idx, column=14, value=f"=IF(K{row_idx}>0,I{row_idx}/K{row_idx},0)")
+        ws.cell(row=row_idx, column=15, value=f"=IF(L{row_idx}>0,I{row_idx}/L{row_idx},0)")
+        ws.cell(row=row_idx, column=16, value=f"=IF(I{row_idx}>0,(M{row_idx}-I{row_idx})/I{row_idx},0)")
+
+    total_row = len(ADS_MEDIA_CHANNELS) + 3
+    ws.cell(row=total_row, column=1, value="TOTAL").font = Font(bold=True)
+    for col in (5, 9, 10, 11, 12, 13):
+        letter = get_column_letter(col)
+        ws.cell(row=total_row, column=col, value=f"=SUM({letter}2:{letter}{total_row-1})")
+    ws.cell(row=total_row, column=14, value=f"=IF(K{total_row}>0,I{total_row}/K{total_row},0)")
+    ws.cell(row=total_row, column=15, value=f"=IF(L{total_row}>0,I{total_row}/L{total_row},0)")
+    ws.cell(row=total_row, column=16, value=f"=IF(I{total_row}>0,(M{total_row}-I{total_row})/I{total_row},0)")
+
+    for r in range(2, total_row + 1):
+        for c in range(1, 17):
+            cell = ws.cell(row=r, column=c)
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            if c in (1, 2, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(vertical="center")
+
+    for col in (5, 9, 13, 14, 15):
+        for r in range(2, total_row + 1):
+            ws.cell(row=r, column=col).number_format = "#,##0.00"
+    for r in range(2, total_row + 1):
+        ws.cell(row=r, column=16).number_format = "0.00%"
+
+    widths = {
+        1: 10, 2: 12, 3: 42, 4: 20, 5: 20, 6: 14, 7: 18, 8: 14,
+        9: 12, 10: 16, 11: 16, 12: 12, 13: 14, 14: 10, 15: 12, 16: 10,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:P{total_row-1}"
+    status_validation = DataValidation(type="list", formula1='"planned,booked,posted,done,cancelled"', allow_blank=True)
+    ws.add_data_validation(status_validation)
+    status_validation.add(f"F2:F{total_row-1}")
+
+    guide = wb.create_sheet("Guide")
+    guide["A1"] = "Обновление данных"
+    guide["A1"].font = Font(size=14, bold=True)
+    guide["A3"] = "Файл генерируется автоматически из /analytics/export/campaigns.*."
+    guide["A4"] = "Чтобы обновить цифры, просто скачай Excel снова из аналитики."
+    guide["A5"] = "Лиды считаем по Promo Activations, деньги по Revenue."
+    guide["A6"] = f"Период среза: {max(1, min(int(days), 365))} дней."
+    guide.column_dimensions["A"].width = 120
+
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page(request: Request, token: str = "", days: int = 30) -> HTMLResponse:
     session_id = resolve_admin_session(request, token)
@@ -9450,6 +9872,49 @@ async def analytics_page(request: Request, token: str = "", days: int = 30) -> H
         return HTMLResponse(render_admin_login_html())
 
     response = HTMLResponse(render_admin_analytics_html_v2(token="", days=days))
+    set_admin_cookie(response, session_id)
+    return response
+
+
+@app.get("/analytics/export/campaigns.json")
+async def analytics_export_campaigns_json(request: Request, token: str = "", days: int = 30) -> dict[str, Any]:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return {
+        "days": max(1, min(int(days), 365)),
+        "generated_at": datetime.utcnow().isoformat(),
+        "rows": campaign_export_rows(days=days),
+    }
+
+
+@app.get("/analytics/export/campaigns.csv")
+async def analytics_export_campaigns_csv(request: Request, token: str = "", days: int = 30) -> PlainTextResponse:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    csv_body = campaign_export_csv(days=days)
+    response = PlainTextResponse(csv_body, media_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = "attachment; filename=campaigns_export.csv"
+    set_admin_cookie(response, session_id)
+    return response
+
+
+@app.get("/analytics/export/media-plan.xlsx")
+async def analytics_export_media_plan_xlsx(request: Request, token: str = "", days: int = 30) -> Response:
+    session_id = resolve_admin_session(request, token)
+    if not session_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        content = campaign_media_plan_xlsx(days=days)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"xlsx_export_failed: {exc}")
+    filename = f"media_plan_{max(1, min(int(days), 365))}d.xlsx"
+    response = Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     set_admin_cookie(response, session_id)
     return response
 
