@@ -5106,7 +5106,7 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
                 return (
                     False,
                     f"На free доступна 1 картинка каждые 7 дней. Новая генерация будет доступна с {format_msk_datetime(next_at)}. "
-                    "Хочешь больше — открой «Тарифы».",
+                    "Хочешь больше — выбери тариф ниже или пакет запросов.",
                 )
             return True, ""
 
