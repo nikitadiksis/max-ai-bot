@@ -5163,6 +5163,7 @@ async def max_send_message(
     text_format: str | None = None,
 ) -> str | None:
     session = await get_session()
+    attachments = normalize_channel_link_buttons(attachments)
     chunks = split_message(text)
     if not chunks and attachments:
         chunks = [""]
@@ -5227,6 +5228,7 @@ async def max_edit_message(
     text_format: str | None = None,
 ) -> bool:
     session = await get_session()
+    attachments = normalize_channel_link_buttons(attachments)
     payload: dict[str, Any] = {
         "type": "text",
         "text": text,
@@ -5247,6 +5249,34 @@ async def max_edit_message(
             log.warning("MAX edit error %s (chat_id=%s, mid=%s): %s", resp.status, chat_id, message_mid, body[:300])
             return False
     return True
+
+
+def normalize_channel_link_buttons(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if not attachments:
+        return attachments
+    channel_url = channel_url_value()
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        if attachment.get("type") != "inline_keyboard":
+            continue
+        payload = attachment.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        rows = payload.get("buttons")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            for button in row:
+                if not isinstance(button, dict):
+                    continue
+                if button.get("type") == "callback" and str(button.get("payload", "")).strip() == "action:channel":
+                    button["type"] = "link"
+                    button["url"] = channel_url
+                    button.pop("payload", None)
+    return attachments
 
 
 async def answer_callback(
