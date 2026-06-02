@@ -148,6 +148,7 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши нам, поможем быстро.").strip()
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
+BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
 CHANNEL_GATE_ENABLED = os.getenv("CHANNEL_GATE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
@@ -669,6 +670,32 @@ def acquisition_meta_from_start_payload(update: dict[str, Any]) -> tuple[str, st
 
 def max_share_url(text: str) -> str:
     return f"https://max.ru/:share?text={quote(str(text or ''), safe='')}"
+
+
+def bot_public_url_value() -> str:
+    return (BOT_PUBLIC_URL or "").strip()
+
+
+def campaign_start_payload(campaign: str, source: str = "ads") -> str:
+    campaign_value = re.sub(r"[^a-z0-9_-]", "", str(campaign or "").strip().lower())[:48]
+    source_value = re.sub(r"[^a-z0-9_-]", "", str(source or "").strip().lower())[:32]
+    params: list[tuple[str, str]] = []
+    if source_value:
+        params.append(("source", source_value))
+    if campaign_value:
+        params.append(("campaign", campaign_value))
+    return urlencode(params)
+
+
+def campaign_deep_link(campaign: str, source: str = "ads") -> str:
+    base_url = bot_public_url_value().rstrip("/")
+    if not base_url:
+        return ""
+    payload = campaign_start_payload(campaign, source=source)
+    if not payload:
+        return base_url
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}start={payload}"
 
 
 def referral_share_message_v2(code: str) -> str:
@@ -9786,6 +9813,7 @@ def campaign_media_plan_xlsx(days: int = 30) -> bytes:
     ws.title = "Media Plan"
     headers = [
         "Priority",
+        "Ad Link",
         "Campaign",
         "Channel",
         "Placement URL",
@@ -9822,64 +9850,69 @@ def campaign_media_plan_xlsx(days: int = 30) -> bytes:
         paid_users = int(live.get("paid_users", 0) or 0)
         revenue_rub = int(live.get("revenue_rub", 0) or 0)
         spent_rub = int(budget)
+        ad_link = campaign_deep_link(campaign)
 
         ws.cell(row=row_idx, column=1, value=idx)
-        ws.cell(row=row_idx, column=2, value=campaign)
-        ws.cell(row=row_idx, column=3, value=channel_name)
-        placement_cell = ws.cell(row=row_idx, column=4, value="Open placement")
+        ad_link_cell = ws.cell(row=row_idx, column=2, value=ad_link or "Set BOT_PUBLIC_URL in .env")
+        if ad_link:
+            ad_link_cell.hyperlink = ad_link
+            ad_link_cell.style = "Hyperlink"
+        ws.cell(row=row_idx, column=3, value=campaign)
+        ws.cell(row=row_idx, column=4, value=channel_name)
+        placement_cell = ws.cell(row=row_idx, column=5, value="Open placement")
         placement_cell.hyperlink = placement_url
         placement_cell.style = "Hyperlink"
-        ws.cell(row=row_idx, column=5, value=budget)
-        ws.cell(row=row_idx, column=6, value="planned")
-        channel_cell = ws.cell(row=row_idx, column=7, value="Open MAX channel")
+        ws.cell(row=row_idx, column=6, value=budget)
+        ws.cell(row=row_idx, column=7, value="planned")
+        channel_cell = ws.cell(row=row_idx, column=8, value="Open MAX channel")
         channel_cell.hyperlink = channel_link
         channel_cell.style = "Hyperlink"
-        ws.cell(row=row_idx, column=8, value="")
-        ws.cell(row=row_idx, column=9, value=spent_rub)
-        ws.cell(row=row_idx, column=10, value=users_count)
-        ws.cell(row=row_idx, column=11, value=promo_activations)
-        ws.cell(row=row_idx, column=12, value=paid_users)
-        ws.cell(row=row_idx, column=13, value=revenue_rub)
-        ws.cell(row=row_idx, column=14, value=f"=IF(K{row_idx}>0,I{row_idx}/K{row_idx},0)")
-        ws.cell(row=row_idx, column=15, value=f"=IF(L{row_idx}>0,I{row_idx}/L{row_idx},0)")
-        ws.cell(row=row_idx, column=16, value=f"=IF(I{row_idx}>0,(M{row_idx}-I{row_idx})/I{row_idx},0)")
+        ws.cell(row=row_idx, column=9, value="")
+        ws.cell(row=row_idx, column=10, value=spent_rub)
+        ws.cell(row=row_idx, column=11, value=users_count)
+        ws.cell(row=row_idx, column=12, value=promo_activations)
+        ws.cell(row=row_idx, column=13, value=paid_users)
+        ws.cell(row=row_idx, column=14, value=revenue_rub)
+        ws.cell(row=row_idx, column=15, value=f"=IF(L{row_idx}>0,J{row_idx}/L{row_idx},0)")
+        ws.cell(row=row_idx, column=16, value=f"=IF(M{row_idx}>0,J{row_idx}/M{row_idx},0)")
+        ws.cell(row=row_idx, column=17, value=f"=IF(J{row_idx}>0,(N{row_idx}-J{row_idx})/J{row_idx},0)")
 
     total_row = len(ADS_MEDIA_CHANNELS) + 3
     ws.cell(row=total_row, column=1, value="TOTAL").font = Font(bold=True)
-    for col in (5, 9, 10, 11, 12, 13):
+    for col in (6, 10, 11, 12, 13, 14):
         letter = get_column_letter(col)
         ws.cell(row=total_row, column=col, value=f"=SUM({letter}2:{letter}{total_row-1})")
-    ws.cell(row=total_row, column=14, value=f"=IF(K{total_row}>0,I{total_row}/K{total_row},0)")
-    ws.cell(row=total_row, column=15, value=f"=IF(L{total_row}>0,I{total_row}/L{total_row},0)")
-    ws.cell(row=total_row, column=16, value=f"=IF(I{total_row}>0,(M{total_row}-I{total_row})/I{total_row},0)")
+    ws.cell(row=total_row, column=15, value=f"=IF(L{total_row}>0,J{total_row}/L{total_row},0)")
+    ws.cell(row=total_row, column=16, value=f"=IF(M{total_row}>0,J{total_row}/M{total_row},0)")
+    ws.cell(row=total_row, column=17, value=f"=IF(J{total_row}>0,(N{total_row}-J{total_row})/J{total_row},0)")
 
     for r in range(2, total_row + 1):
-        for c in range(1, 17):
+        for c in range(1, 18):
             cell = ws.cell(row=r, column=c)
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            if c in (1, 2, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16):
+            if c in (1, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
                 cell.alignment = Alignment(vertical="center")
 
-    for col in (5, 9, 13, 14, 15):
+    for col in (6, 10, 14, 15, 16):
         for r in range(2, total_row + 1):
             ws.cell(row=r, column=col).number_format = "#,##0.00"
     for r in range(2, total_row + 1):
-        ws.cell(row=r, column=16).number_format = "0.00%"
+        ws.cell(row=r, column=17).number_format = "0.00%"
 
     widths = {
-        1: 10, 2: 12, 3: 42, 4: 20, 5: 20, 6: 14, 7: 18, 8: 14,
-        9: 12, 10: 16, 11: 16, 12: 12, 13: 14, 14: 10, 15: 12, 16: 10,
+        1: 10, 2: 48, 3: 12, 4: 42, 5: 20, 6: 20, 7: 14, 8: 18, 9: 14,
+        10: 12, 11: 16, 12: 16, 13: 12, 14: 14, 15: 10, 16: 12, 17: 10,
     }
     for col, width in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = width
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:P{total_row-1}"
+    ws.auto_filter.ref = f"A1:Q{total_row-1}"
     status_validation = DataValidation(type="list", formula1='"planned,booked,posted,done,cancelled"', allow_blank=True)
     ws.add_data_validation(status_validation)
-    status_validation.add(f"F2:F{total_row-1}")
+    status_validation.add(f"G2:G{total_row-1}")
 
     guide = wb.create_sheet("Guide")
     guide["A1"] = "Обновление данных"
