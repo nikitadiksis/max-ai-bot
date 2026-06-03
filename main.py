@@ -5823,7 +5823,7 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
 
 
 async def process_image_generation(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
-    return await process_image_generation_v2(chat_id, user_prompt, model_prompt=model_prompt)
+    return await _process_image_generation_queued(chat_id, user_prompt, model_prompt=model_prompt)
 
     prompt = user_prompt.strip()
     if not prompt:
@@ -5926,7 +5926,7 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
 
 
 async def process_image_edit_generation(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
-    return await process_image_edit_generation_v2(chat_id, user_prompt, reference_image_data_url)
+    return await _process_image_edit_generation_queued(chat_id, user_prompt, reference_image_data_url)
 
     prompt = user_prompt.strip()
     if not prompt:
@@ -6023,7 +6023,7 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
     return True
 
 
-async def process_image_generation_v2(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
+async def _process_image_generation_queued(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
     prompt = user_prompt.strip()
     if not prompt:
         await max_send_message(chat_id, "Опиши, что нужно сгенерировать.", attachments=build_image_prompt_keyboard())
@@ -6112,7 +6112,7 @@ async def process_image_generation_v2(chat_id: int, user_prompt: str, model_prom
     return True
 
 
-async def process_image_edit_generation_v2(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
+async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
     prompt = user_prompt.strip()
     if not prompt:
         await max_send_message(chat_id, "Опиши, что изменить на фото.", attachments=build_image_prompt_keyboard())
@@ -6215,7 +6215,7 @@ async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
 
     state.pending_image_prompt.discard(chat_id)
     prepared_prompt = build_image_prompt(text.strip(), chat_id)
-    await process_image_generation_v2(chat_id, text.strip(), model_prompt=prepared_prompt)
+    await process_image_generation(chat_id, text.strip(), model_prompt=prepared_prompt)
     return True
 
 
@@ -6243,7 +6243,7 @@ async def handle_pending_image_ref_prompt_input(chat_id: int, text: str) -> bool
         return True
 
     state.pending_image_ref_prompt.discard(chat_id)
-    await process_image_edit_generation_v2(chat_id, text.strip(), reference)
+    await process_image_edit_generation(chat_id, text.strip(), reference)
     return True
 
 
@@ -8894,7 +8894,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await send_image_menu(chat_id)
             return True
         prepared_prompt = build_image_prompt(arg, chat_id)
-        return await process_image_generation_v2(chat_id, arg, model_prompt=prepared_prompt)
+        return await process_image_generation(chat_id, arg, model_prompt=prepared_prompt)
 
     if command == "/image_ref":
         row = user_profile(chat_id)
@@ -8923,7 +8923,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
                 attachments=build_image_prompt_keyboard(),
             )
             return True
-        return await process_image_edit_generation_v2(chat_id, arg, reference)
+        return await process_image_edit_generation(chat_id, arg, reference)
 
     if command.startswith("/admin"):
         return await handle_admin(chat_id, text)
@@ -9104,7 +9104,7 @@ async def process_update(update: dict[str, Any]) -> None:
 
         if text and (chat_id in state.pending_image_ref_prompt or looks_like_image_ref_request(text)):
             state.pending_image_ref_prompt.discard(chat_id)
-            await process_image_edit_generation_v2(chat_id, text, get_recent_reference_image(chat_id))
+            await process_image_edit_generation(chat_id, text, get_recent_reference_image(chat_id))
             return
 
         if not text:
@@ -9146,7 +9146,7 @@ async def process_update(update: dict[str, Any]) -> None:
             return
         recent_reference = get_recent_reference_image(chat_id)
         if recent_reference and looks_like_image_ref_request(text) and not text.strip().startswith("/"):
-            await process_image_edit_generation_v2(chat_id, text, recent_reference)
+            await process_image_edit_generation(chat_id, text, recent_reference)
             return
         if await handle_command(chat_id, text):
             return
