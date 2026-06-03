@@ -22,12 +22,24 @@ fi
 
 echo "Creating backup: ${ARCHIVE_PATH}"
 
-tar -czf "${ARCHIVE_PATH}" \
-  .env \
-  data \
-  logs \
-  deploy/certbot \
-  docker-compose.yml \
-  deploy/nginx.conf
+items=(
+  ".env"
+  "data"
+)
+
+optional_items=(
+  "logs"
+  "deploy/certbot"
+  "docker-compose.yml"
+  "deploy/nginx.conf"
+)
+
+for item in "${optional_items[@]}"; do
+  if [ -e "${item}" ]; then
+    items+=("${item}")
+  fi
+done
+
+tar -czf "${ARCHIVE_PATH}" "${items[@]}"
 
 echo "Done: ${ARCHIVE_PATH}"
