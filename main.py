@@ -476,6 +476,17 @@ class TextAnswerResult:
 
 
 @dataclass(slots=True)
+class ImageJob:
+    kind: str
+    chat_id: int
+    user_prompt: str
+    model_prompt: str
+    credits_spent: int
+    details: str
+    reference_image_data_url: str = ""
+
+
+@dataclass(slots=True)
 class ModelInfo:
     alias: str
     provider: str
@@ -2506,6 +2517,8 @@ class BotState:
         self.pending_promo_code_input: set[int] = set()
         self.pending_referral_code_input: set[int] = set()
         self.image_request_prefs: dict[int, dict[str, str]] = {}
+        self.pending_image_jobs: set[int] = set()
+        self.image_job_queue: asyncio.Queue[ImageJob] = asyncio.Queue()
         self.last_reference_image_data_url: dict[int, str] = {}
         self.last_reference_image_at: dict[int, datetime] = {}
         self.processed_updates: deque[str] = deque()
@@ -2532,6 +2545,7 @@ class BotState:
         self.polling_task: asyncio.Task[None] | None = None
         self.backup_task: asyncio.Task[None] | None = None
         self.monitor_task: asyncio.Task[None] | None = None
+        self.image_worker_tasks: list[asyncio.Task[None]] = []
         self.user_store = UserStore(DB_PATH)
 
     def history(self, chat_id: int) -> deque[dict[str, str]]:
@@ -5565,6 +5579,80 @@ def get_recent_reference_image(chat_id: int) -> str:
     return data_url
 
 
+def image_job_already_pending(chat_id: int) -> bool:
+    return chat_id in state.pending_image_jobs
+
+
+async def enqueue_image_job(job: ImageJob) -> int:
+    queue_size_before = state.image_job_queue.qsize()
+    state.pending_image_jobs.add(job.chat_id)
+    await state.image_job_queue.put(job)
+    return queue_size_before
+
+
+async def process_image_job(job: ImageJob) -> None:
+    chat_id = int(job.chat_id)
+    try:
+        if job.kind == "edit":
+            image = await generate_image_from_reference(job.model_prompt, job.reference_image_data_url)
+            await send_generated_image(chat_id, job.model_prompt, image, display_prompt=job.user_prompt)
+            final_row = user_profile(chat_id)
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="image_request",
+                plan=str(final_row.get("plan", "")),
+                model_alias=f"{DEFAULT_IMAGE_MODEL.alias}:edit",
+                credits_spent=int(job.credits_spent),
+                tokens_total=0,
+                details=job.details,
+            )
+        else:
+            image = await generate_image(job.model_prompt)
+            await send_generated_image(chat_id, job.model_prompt, image, display_prompt=job.user_prompt)
+            final_row = user_profile(chat_id)
+            state.user_store.record_usage_event(
+                chat_id=chat_id,
+                event_type="image_request",
+                plan=str(final_row.get("plan", "")),
+                model_alias=DEFAULT_IMAGE_MODEL.alias,
+                credits_spent=int(job.credits_spent),
+                tokens_total=0,
+                details=job.details,
+            )
+        with suppress(Exception):
+            await maybe_send_low_credits_nudge(chat_id)
+    except RuntimeError as exc:
+        if int(job.credits_spent) > 0:
+            state.user_store.refund_credits(chat_id, int(job.credits_spent))
+        log.warning("Image job failed for chat_id=%s kind=%s: %s", chat_id, job.kind, exc)
+        await max_send_message(chat_id, friendly_image_generation_error(exc, is_edit=job.kind == "edit"), attachments=build_image_menu_keyboard(chat_id))
+    except Exception:
+        if int(job.credits_spent) > 0:
+            state.user_store.refund_credits(chat_id, int(job.credits_spent))
+        raise
+    finally:
+        state.pending_image_jobs.discard(chat_id)
+
+
+async def image_worker_loop(worker_index: int) -> None:
+    log.info("Image worker started: #%s", worker_index)
+    while True:
+        try:
+            job = await state.image_job_queue.get()
+            try:
+                await process_image_job(job)
+            finally:
+                state.image_job_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Image worker loop error")
+            capture_exception_safe(exc)
+            record_runtime_error()
+            await notify_admin_alert("image_worker", f"Image worker #{worker_index} error: {exc}")
+            await asyncio.sleep(1)
+
+
 def looks_like_image_ref_request(text: str) -> bool:
     value = text.strip().lower()
     if not value:
@@ -5735,6 +5823,8 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
 
 
 async def process_image_generation(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
+    return await process_image_generation_v2(chat_id, user_prompt, model_prompt=model_prompt)
+
     prompt = user_prompt.strip()
     if not prompt:
         await max_send_message(chat_id, "Опиши, что нужно сгенерировать.", attachments=build_image_prompt_keyboard())
@@ -5836,6 +5926,8 @@ async def process_image_generation(chat_id: int, user_prompt: str, model_prompt:
 
 
 async def process_image_edit_generation(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
+    return await process_image_edit_generation_v2(chat_id, user_prompt, reference_image_data_url)
+
     prompt = user_prompt.strip()
     if not prompt:
         await max_send_message(chat_id, "Опиши, что изменить на фото.", attachments=build_image_prompt_keyboard())
@@ -5931,6 +6023,182 @@ async def process_image_edit_generation(chat_id: int, user_prompt: str, referenc
     return True
 
 
+async def process_image_generation_v2(chat_id: int, user_prompt: str, model_prompt: str | None = None) -> bool:
+    prompt = user_prompt.strip()
+    if not prompt:
+        await max_send_message(chat_id, "Опиши, что нужно сгенерировать.", attachments=build_image_prompt_keyboard())
+        return True
+    if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+        await max_send_message(chat_id, f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.", attachments=build_keyboard())
+        return True
+    if image_job_already_pending(chat_id):
+        await max_send_message(chat_id, "У тебя уже есть активная задача по картинке. Дождись результата или ошибки, потом запускай следующую.", attachments=build_image_menu_keyboard(chat_id))
+        return True
+
+    ok_cd, reason_cd = check_cooldown(chat_id, "image")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+
+    row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        await show_managed_content(
+            chat_id,
+            f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+            attachments=build_tariffs_keyboard_pricing(),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Тарифы",
+        )
+        return True
+
+    ok, reason = check_limit_only(chat_id, "images")
+    if not ok:
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
+        return True
+
+    is_free_plan = plan_name == "free"
+    img_cost = 0 if is_free_plan else image_credit_cost()
+    if img_cost > 0:
+        ok_credit, reason_credit = check_and_consume_credits(chat_id, img_cost, "картинка")
+        if not ok_credit:
+            await show_managed_content(
+                chat_id,
+                reason_credit,
+                attachments=purchase_help_keyboard_for_row(row),
+                page=UI_PAGE_TARIFFS,
+                push_history=False,
+                notification="Недостаточно запросов",
+            )
+            return True
+
+    ok, reason = check_and_consume_limit(chat_id, "images")
+    if not ok:
+        if img_cost > 0:
+            state.user_store.refund_credits(chat_id, img_cost)
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
+        return True
+
+    request_for_model = model_prompt or prompt
+    queue_before = await enqueue_image_job(
+        ImageJob(
+            kind="generate",
+            chat_id=chat_id,
+            user_prompt=prompt,
+            model_prompt=request_for_model,
+            credits_spent=img_cost,
+            details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+        )
+    )
+    if queue_before > 0:
+        await max_send_message(chat_id, f"Поставил картинку в очередь. Перед тобой задач: {queue_before}. Пришлю результат отдельным сообщением.", attachments=build_image_menu_keyboard(chat_id))
+    else:
+        await max_send_message(chat_id, "Генерирую картинку, это может занять немного времени...", attachments=build_image_menu_keyboard(chat_id))
+    return True
+
+
+async def process_image_edit_generation_v2(chat_id: int, user_prompt: str, reference_image_data_url: str) -> bool:
+    prompt = user_prompt.strip()
+    if not prompt:
+        await max_send_message(chat_id, "Опиши, что изменить на фото.", attachments=build_image_prompt_keyboard())
+        return True
+    if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+        await max_send_message(chat_id, f"Слишком длинный промпт. Максимум {MAX_IMAGE_PROMPT_CHARS} символов.", attachments=build_keyboard())
+        return True
+    if image_job_already_pending(chat_id):
+        await max_send_message(chat_id, "У тебя уже есть активная задача по картинке. Дождись результата или ошибки, потом запускай следующую.", attachments=build_image_menu_keyboard(chat_id))
+        return True
+
+    row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        await show_managed_content(
+            chat_id,
+            f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
+            attachments=build_tariffs_keyboard_pricing(),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Тарифы",
+        )
+        return True
+
+    ok_cd, reason_cd = check_cooldown(chat_id, "image")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+
+    ok, reason = check_limit_only(chat_id, "images")
+    if not ok:
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
+        return True
+
+    edit_cost = image_edit_credit_cost()
+    ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
+    if not ok_credit:
+        await show_managed_content(
+            chat_id,
+            reason_credit,
+            attachments=purchase_help_keyboard_for_row(row),
+            page=UI_PAGE_TARIFFS,
+            push_history=False,
+            notification="Недостаточно запросов",
+        )
+        return True
+
+    ok, reason = check_and_consume_limit(chat_id, "images")
+    if not ok:
+        state.user_store.refund_credits(chat_id, edit_cost)
+        await show_managed_content(
+            chat_id,
+            reason,
+            attachments=build_image_menu_keyboard(chat_id),
+            page=UI_PAGE_IMAGE_MENU,
+            push_history=False,
+            notification="Лимит достигнут",
+        )
+        return True
+
+    prepared_prompt = build_image_prompt(prompt, chat_id)
+    queue_before = await enqueue_image_job(
+        ImageJob(
+            kind="edit",
+            chat_id=chat_id,
+            user_prompt=prompt,
+            model_prompt=prepared_prompt,
+            credits_spent=edit_cost,
+            details=f"mode=image_edit;style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+            reference_image_data_url=reference_image_data_url,
+        )
+    )
+    if queue_before > 0:
+        await max_send_message(chat_id, f"Поставил обработку фото в очередь. Перед тобой задач: {queue_before}. Пришлю результат отдельным сообщением.", attachments=build_image_menu_keyboard(chat_id))
+    else:
+        await max_send_message(chat_id, "Обрабатываю фото и готовлю вариант, это может занять немного времени...", attachments=build_image_menu_keyboard(chat_id))
+    return True
+
+
 async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
     if chat_id not in state.pending_image_prompt:
         return False
@@ -5947,7 +6215,7 @@ async def handle_pending_image_prompt_input(chat_id: int, text: str) -> bool:
 
     state.pending_image_prompt.discard(chat_id)
     prepared_prompt = build_image_prompt(text.strip(), chat_id)
-    await process_image_generation(chat_id, text.strip(), model_prompt=prepared_prompt)
+    await process_image_generation_v2(chat_id, text.strip(), model_prompt=prepared_prompt)
     return True
 
 
@@ -5975,7 +6243,7 @@ async def handle_pending_image_ref_prompt_input(chat_id: int, text: str) -> bool
         return True
 
     state.pending_image_ref_prompt.discard(chat_id)
-    await process_image_edit_generation(chat_id, text.strip(), reference)
+    await process_image_edit_generation_v2(chat_id, text.strip(), reference)
     return True
 
 
@@ -8626,7 +8894,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
             await send_image_menu(chat_id)
             return True
         prepared_prompt = build_image_prompt(arg, chat_id)
-        return await process_image_generation(chat_id, arg, model_prompt=prepared_prompt)
+        return await process_image_generation_v2(chat_id, arg, model_prompt=prepared_prompt)
 
     if command == "/image_ref":
         row = user_profile(chat_id)
@@ -8655,7 +8923,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
                 attachments=build_image_prompt_keyboard(),
             )
             return True
-        return await process_image_edit_generation(chat_id, arg, reference)
+        return await process_image_edit_generation_v2(chat_id, arg, reference)
 
     if command.startswith("/admin"):
         return await handle_admin(chat_id, text)
@@ -8836,7 +9104,7 @@ async def process_update(update: dict[str, Any]) -> None:
 
         if text and (chat_id in state.pending_image_ref_prompt or looks_like_image_ref_request(text)):
             state.pending_image_ref_prompt.discard(chat_id)
-            await process_image_edit_generation(chat_id, text, get_recent_reference_image(chat_id))
+            await process_image_edit_generation_v2(chat_id, text, get_recent_reference_image(chat_id))
             return
 
         if not text:
@@ -8878,7 +9146,7 @@ async def process_update(update: dict[str, Any]) -> None:
             return
         recent_reference = get_recent_reference_image(chat_id)
         if recent_reference and looks_like_image_ref_request(text) and not text.strip().startswith("/"):
-            await process_image_edit_generation(chat_id, text, recent_reference)
+            await process_image_edit_generation_v2(chat_id, text, recent_reference)
             return
         if await handle_command(chat_id, text):
             return
@@ -9200,6 +9468,11 @@ async def lifespan(_: FastAPI):
     validate_pricing_sanity()
     init_sentry_if_enabled()
     await get_session()
+    worker_count = max(1, OPENROUTER_IMAGE_CONCURRENCY)
+    state.image_worker_tasks = [
+        asyncio.create_task(image_worker_loop(index + 1))
+        for index in range(worker_count)
+    ]
     if RUN_MODE == "polling":
         state.polling_task = asyncio.create_task(polling_loop())
     if AUTO_BACKUP_ENABLED:
@@ -9209,6 +9482,12 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        for task in state.image_worker_tasks:
+            task.cancel()
+        for task in state.image_worker_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        state.image_worker_tasks.clear()
         if state.polling_task:
             state.polling_task.cancel()
             with suppress(asyncio.CancelledError):
