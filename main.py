@@ -33,6 +33,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
 from fastapi.responses import Response
 import uvicorn
+from storage_backend import StorageBackend, create_storage_backend
 
 load_dotenv()
 
@@ -64,6 +65,8 @@ MAX_MESSAGE_LEN = int(os.getenv("MAX_MESSAGE_LEN", str(DEFAULT_MAX_MESSAGE_LEN))
 DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "300"))
 PROCESSED_UPDATE_TTL_HOURS = int(os.getenv("PROCESSED_UPDATE_TTL_HOURS", "72"))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.sqlite3")))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_BACKEND = create_storage_backend(DB_PATH, DATABASE_URL)
 MAX_TEXT_INPUT_CHARS = int(os.getenv("MAX_TEXT_INPUT_CHARS", "2500"))
 MAX_IMAGE_PROMPT_CHARS = int(os.getenv("MAX_IMAGE_PROMPT_CHARS", "800"))
 MAX_ASSISTANT_OUTPUT_CHARS = int(os.getenv("MAX_ASSISTANT_OUTPUT_CHARS", "1400"))
@@ -788,23 +791,24 @@ def promo_catalog() -> dict[str, int]:
 
 
 class UserStore:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
+    def __init__(self, backend: StorageBackend) -> None:
+        self.backend = backend
         self._init()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+    def _connect(self) -> Any:
+        return self.backend.connect()
 
     def _init(self) -> None:
         with self._connect() as conn:
+            users_pk = "chat_id BIGINT PRIMARY KEY" if self.backend.kind == "postgres" else "chat_id INTEGER PRIMARY KEY"
+            payment_pk = "id BIGSERIAL PRIMARY KEY" if self.backend.kind == "postgres" else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+            usage_pk = "id BIGSERIAL PRIMARY KEY" if self.backend.kind == "postgres" else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+            promo_pk = "id BIGSERIAL PRIMARY KEY" if self.backend.kind == "postgres" else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+            grant_pk = "id BIGSERIAL PRIMARY KEY" if self.backend.kind == "postgres" else "id INTEGER PRIMARY KEY AUTOINCREMENT"
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS users (
-                    chat_id INTEGER PRIMARY KEY,
+                    {users_pk},
                     max_user_id INTEGER NOT NULL DEFAULT 0,
                     acquisition_source TEXT NOT NULL DEFAULT '',
                     acquisition_campaign TEXT NOT NULL DEFAULT '',
@@ -841,9 +845,9 @@ class UserStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS payment_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {payment_pk},
                     chat_id INTEGER NOT NULL,
                     plan TEXT NOT NULL,
                     days INTEGER NOT NULL,
@@ -864,9 +868,9 @@ class UserStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS usage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {usage_pk},
                     chat_id INTEGER NOT NULL,
                     event_type TEXT NOT NULL,
                     plan TEXT NOT NULL DEFAULT '',
@@ -880,9 +884,9 @@ class UserStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS promo_activations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {promo_pk},
                     chat_id INTEGER NOT NULL,
                     promo_code TEXT NOT NULL,
                     credits INTEGER NOT NULL DEFAULT 0,
@@ -892,9 +896,9 @@ class UserStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS promo_bonus_grants (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {grant_pk},
                     chat_id INTEGER NOT NULL,
                     promo_code TEXT NOT NULL,
                     amount_total INTEGER NOT NULL DEFAULT 0,
@@ -981,11 +985,36 @@ class UserStore:
             )
             conn.commit()
 
-    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
+    def _ensure_column(
+        self,
+        conn: Any,
+        table: str,
+        column: str,
+        sqlite_spec: str,
+        postgres_spec: str | None = None,
+    ) -> None:
+        if self.backend.kind == "postgres":
+            exists_row = conn.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = ?
+                  AND column_name = ?
+                LIMIT 1
+                """,
+                (table, column),
+            ).fetchone()
+            if exists_row:
+                return
+            spec = postgres_spec or sqlite_spec
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {spec}')
+            return
+
         info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         names = {row["name"] for row in info}
         if column not in names:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_spec}")
 
     def _today(self) -> str:
         return date.today().isoformat()
@@ -2434,6 +2463,26 @@ class UserStore:
                 "top_presets": top_presets,
             }
 
+    def export_logical_backup(self) -> dict[str, Any]:
+        tables = (
+            "users",
+            "payment_requests",
+            "usage_events",
+            "promo_activations",
+            "promo_bonus_grants",
+            "processed_updates",
+        )
+        snapshot: dict[str, Any] = {
+            "backend": self.backend.kind,
+            "generated_at": datetime.utcnow().isoformat(),
+            "tables": {},
+        }
+        with self._connect() as conn:
+            for table in tables:
+                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+                snapshot["tables"][table] = [dict(row) for row in rows]
+        return snapshot
+
     def service_monitor_report(
         self,
         payments_hours: int = 24,
@@ -2546,7 +2595,7 @@ class BotState:
         self.backup_task: asyncio.Task[None] | None = None
         self.monitor_task: asyncio.Task[None] | None = None
         self.image_worker_tasks: list[asyncio.Task[None]] = []
-        self.user_store = UserStore(DB_PATH)
+        self.user_store = UserStore(DB_BACKEND)
 
     def history(self, chat_id: int) -> deque[dict[str, str]]:
         if chat_id not in self.user_histories:
@@ -3317,10 +3366,14 @@ def backups_dir() -> Path:
 
 def create_db_backup() -> Path:
     stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    target = backups_dir() / f"bot-{stamp}.sqlite3"
-    with sqlite3.connect(DB_PATH) as src, sqlite3.connect(target) as dst:
-        src.backup(dst)
-    files = sorted(backups_dir().glob("bot-*.sqlite3"))
+    target = backups_dir() / f"bot-{stamp}{state.user_store.backend.backup_suffix()}"
+    if state.user_store.backend.kind == "postgres":
+        snapshot = state.user_store.export_logical_backup()
+        target.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        with sqlite3.connect(DB_PATH) as src, sqlite3.connect(target) as dst:
+            src.backup(dst)
+    files = sorted(backups_dir().glob("bot-*"))
     keep = max(3, BACKUP_KEEP_FILES)
     if len(files) > keep:
         for old in files[: len(files) - keep]:
@@ -3330,7 +3383,7 @@ def create_db_backup() -> Path:
 
 
 def latest_backup_file() -> Path | None:
-    files = sorted(backups_dir().glob("bot-*.sqlite3"))
+    files = sorted(backups_dir().glob("bot-*"))
     return files[-1] if files else None
 
 
@@ -3356,7 +3409,12 @@ def smoke_check_report() -> list[dict[str, str]]:
 
     add_check("MAX token", bool(MAX_TOKEN), "Настроен" if MAX_TOKEN else "Пустой MAX_TOKEN")
     add_check("OpenRouter key", bool(OPENROUTER_KEY), "Настроен" if OPENROUTER_KEY else "Пустой OPENROUTER_KEY")
-    add_check("DB file", DB_PATH.exists(), f"{DB_PATH} ({DB_PATH.stat().st_size if DB_PATH.exists() else 0} bytes)")
+    db_backend = state.user_store.backend
+    add_check(
+        "DB backend",
+        db_backend.exists(),
+        f"{db_backend.kind}: {db_backend.label} ({db_backend.size_bytes()} bytes)",
+    )
     add_check("HTTP session", state.session is not None and not state.session.closed, "aiohttp session ready" if state.session and not state.session.closed else "session closed")
     add_check("Polling task", RUN_MODE != "polling" or (state.polling_task is not None and not state.polling_task.done()), "active" if RUN_MODE != "polling" or (state.polling_task and not state.polling_task.done()) else "not running")
     add_check("Backup task", (not AUTO_BACKUP_ENABLED) or (state.backup_task is not None and not state.backup_task.done()), "active" if AUTO_BACKUP_ENABLED and state.backup_task and not state.backup_task.done() else ("disabled" if not AUTO_BACKUP_ENABLED else "not running"))
@@ -3376,8 +3434,9 @@ def smoke_check_report() -> list[dict[str, str]]:
 
 def service_status_report() -> dict[str, Any]:
     now = datetime.utcnow()
-    db_exists = DB_PATH.exists()
-    db_size = DB_PATH.stat().st_size if db_exists else 0
+    db_backend = state.user_store.backend
+    db_exists = db_backend.exists()
+    db_size = db_backend.size_bytes()
     backup_file = latest_backup_file()
     backup_mtime = datetime.utcfromtimestamp(backup_file.stat().st_mtime) if backup_file and backup_file.exists() else None
     error_cutoff = now - timedelta(minutes=max(1, ALERT_HIGH_ERRORS_WINDOW_MINUTES))
@@ -3392,7 +3451,8 @@ def service_status_report() -> dict[str, Any]:
         "run_mode": RUN_MODE,
         "uptime": format_timedelta_short(now - state.started_at),
         "db_exists": db_exists,
-        "db_path": str(DB_PATH),
+        "db_backend": db_backend.kind,
+        "db_path": db_backend.label,
         "db_size_bytes": db_size,
         "session_ready": bool(state.session and not state.session.closed),
         "polling_task": bool(state.polling_task and not state.polling_task.done()),

@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: max-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-max_ai_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-max_ai_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-max_ai_bot}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
