@@ -18,7 +18,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import sqlite3
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -33,6 +32,16 @@ from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
 from fastapi.responses import Response
 import uvicorn
+from runtime_support import (
+    RuntimeSupportDeps,
+    backups_dir as backups_dir_impl,
+    create_db_backup as create_db_backup_impl,
+    format_timedelta_short as format_timedelta_short_impl,
+    latest_backup_file as latest_backup_file_impl,
+    service_status_report as service_status_report_impl,
+    smoke_check_report as smoke_check_report_impl,
+    system_resource_snapshot as system_resource_snapshot_impl,
+)
 from storage_backend import StorageBackend, create_storage_backend
 
 load_dotenv()
@@ -3358,175 +3367,70 @@ def repair_mojibake(text: str) -> str:
     return fixed or text
 
 
+def runtime_support_deps() -> RuntimeSupportDeps:
+    return RuntimeSupportDeps(
+        data_dir=DATA_DIR,
+        db_path=DB_PATH,
+        backup_keep_files=BACKUP_KEEP_FILES,
+        max_token=MAX_TOKEN,
+        openrouter_key=OPENROUTER_KEY,
+        run_mode=RUN_MODE,
+        auto_backup_enabled=AUTO_BACKUP_ENABLED,
+        service_monitor_enabled=SERVICE_MONITOR_ENABLED,
+        config_path=CONFIG_PATH,
+        site_index_path=site_file("index.html"),
+        tbank_terminal_key=TBANK_TERMINAL_KEY,
+        tbank_password=TBANK_PASSWORD,
+        channel_gate_enabled=CHANNEL_GATE_ENABLED,
+        channel_chat_id=CHANNEL_CHAT_ID,
+        channel_membership_cache_hours=CHANNEL_MEMBERSHIP_CACHE_HOURS,
+        alert_high_errors_window_minutes=ALERT_HIGH_ERRORS_WINDOW_MINUTES,
+        alert_low_payments_lookback_hours=ALERT_LOW_PAYMENTS_LOOKBACK_HOURS,
+        alert_spend_spike_lookback_hours=ALERT_SPEND_SPIKE_LOOKBACK_HOURS,
+        channel_url_resolver=channel_url_value,
+        system_snapshot_provider=system_resource_snapshot,
+    )
+
+
 def backups_dir() -> Path:
-    path = DATA_DIR / "backups"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return backups_dir_impl(DATA_DIR)
 
 
 def create_db_backup() -> Path:
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    target = backups_dir() / f"bot-{stamp}{state.user_store.backend.backup_suffix()}"
-    if state.user_store.backend.kind == "postgres":
-        snapshot = state.user_store.export_logical_backup()
-        target.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        with sqlite3.connect(DB_PATH) as src, sqlite3.connect(target) as dst:
-            src.backup(dst)
-    files = sorted(backups_dir().glob("bot-*"))
-    keep = max(3, BACKUP_KEEP_FILES)
-    if len(files) > keep:
-        for old in files[: len(files) - keep]:
-            with suppress(Exception):
-                old.unlink()
-    return target
+    return create_db_backup_impl(
+        data_dir=DATA_DIR,
+        db_path=DB_PATH,
+        backup_keep_files=BACKUP_KEEP_FILES,
+        user_store=state.user_store,
+    )
 
 
 def latest_backup_file() -> Path | None:
-    files = sorted(backups_dir().glob("bot-*"))
-    return files[-1] if files else None
+    return latest_backup_file_impl(DATA_DIR)
 
 
 def format_timedelta_short(delta: timedelta) -> str:
-    total_seconds = max(0, int(delta.total_seconds()))
-    days, rem = divmod(total_seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, _ = divmod(rem, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}d")
-    if hours or days:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
+    return format_timedelta_short_impl(delta)
 
 
 def smoke_check_report() -> list[dict[str, str]]:
-    checks: list[dict[str, str]] = []
-
-    def add_check(name: str, ok: bool, details: str) -> None:
-        checks.append({"name": name, "ok": "ok" if ok else "fail", "details": details})
-
-    add_check("MAX token", bool(MAX_TOKEN), "Настроен" if MAX_TOKEN else "Пустой MAX_TOKEN")
-    add_check("OpenRouter key", bool(OPENROUTER_KEY), "Настроен" if OPENROUTER_KEY else "Пустой OPENROUTER_KEY")
-    db_backend = state.user_store.backend
-    add_check(
-        "DB backend",
-        db_backend.exists(),
-        f"{db_backend.kind}: {db_backend.label} ({db_backend.size_bytes()} bytes)",
+    return smoke_check_report_impl(
+        deps=runtime_support_deps(),
+        user_store=state.user_store,
+        state=state,
     )
-    add_check("HTTP session", state.session is not None and not state.session.closed, "aiohttp session ready" if state.session and not state.session.closed else "session closed")
-    add_check("Polling task", RUN_MODE != "polling" or (state.polling_task is not None and not state.polling_task.done()), "active" if RUN_MODE != "polling" or (state.polling_task and not state.polling_task.done()) else "not running")
-    add_check("Backup task", (not AUTO_BACKUP_ENABLED) or (state.backup_task is not None and not state.backup_task.done()), "active" if AUTO_BACKUP_ENABLED and state.backup_task and not state.backup_task.done() else ("disabled" if not AUTO_BACKUP_ENABLED else "not running"))
-    add_check("Monitor task", (not SERVICE_MONITOR_ENABLED) or (state.monitor_task is not None and not state.monitor_task.done()), "active" if SERVICE_MONITOR_ENABLED and state.monitor_task and not state.monitor_task.done() else ("disabled" if not SERVICE_MONITOR_ENABLED else "not running"))
-    add_check("Models config", CONFIG_PATH.exists(), str(CONFIG_PATH))
-    add_check("Site index", site_file("index.html").exists(), str(site_file("index.html")))
-    add_check("T-Bank", bool(TBANK_TERMINAL_KEY and TBANK_PASSWORD), "Терминал и пароль настроены" if TBANK_TERMINAL_KEY and TBANK_PASSWORD else "Проверь TBANK_TERMINAL_KEY / TBANK_PASSWORD")
-    channel_source = "manual" if CHANNEL_CHAT_ID else "auto"
-    channel_configured = channel_chat_id_value() if CHANNEL_CHAT_ID else channel_url_value()
-    add_check(
-        "Channel gate",
-        (not CHANNEL_GATE_ENABLED) or bool(MAX_TOKEN and channel_configured),
-        f"Включен, source={channel_source}, configured={channel_configured}" if CHANNEL_GATE_ENABLED and channel_configured else ("Выключен" if not CHANNEL_GATE_ENABLED else "Нет CHANNEL_CHAT_ID / CHANNEL_URL"),
-    )
-    return checks
 
 
 def service_status_report() -> dict[str, Any]:
-    now = datetime.utcnow()
-    db_backend = state.user_store.backend
-    db_exists = db_backend.exists()
-    db_size = db_backend.size_bytes()
-    backup_file = latest_backup_file()
-    backup_mtime = datetime.utcfromtimestamp(backup_file.stat().st_mtime) if backup_file and backup_file.exists() else None
-    error_cutoff = now - timedelta(minutes=max(1, ALERT_HIGH_ERRORS_WINDOW_MINUTES))
-    recent_errors = sum(1 for ts in state.runtime_error_events if ts >= error_cutoff)
-    monitor = state.user_store.service_monitor_report(
-        payments_hours=ALERT_LOW_PAYMENTS_LOOKBACK_HOURS,
-        spend_hours=ALERT_SPEND_SPIKE_LOOKBACK_HOURS,
-        baseline_hours=max(24, ALERT_SPEND_SPIKE_LOOKBACK_HOURS * 24),
+    return service_status_report_impl(
+        deps=runtime_support_deps(),
+        user_store=state.user_store,
+        state=state,
     )
-    return {
-        "generated_at": now.isoformat(),
-        "run_mode": RUN_MODE,
-        "uptime": format_timedelta_short(now - state.started_at),
-        "db_exists": db_exists,
-        "db_backend": db_backend.kind,
-        "db_path": db_backend.label,
-        "db_size_bytes": db_size,
-        "session_ready": bool(state.session and not state.session.closed),
-        "polling_task": bool(state.polling_task and not state.polling_task.done()),
-        "backup_task": bool(state.backup_task and not state.backup_task.done()),
-        "monitor_task": bool(state.monitor_task and not state.monitor_task.done()),
-        "latest_backup_path": str(backup_file) if backup_file else "",
-        "latest_backup_at": backup_mtime.isoformat() if backup_mtime else "",
-        "latest_backup_age_hours": (
-            round((now - backup_mtime).total_seconds() / 3600.0, 2) if backup_mtime else None
-        ),
-        "recent_runtime_errors": recent_errors,
-        "system": system_resource_snapshot(),
-        "channel_gate": {
-            "enabled": CHANNEL_GATE_ENABLED,
-            "configured_channel": channel_chat_id_value() if CHANNEL_CHAT_ID else channel_url_value(),
-            "resolved_channel_chat_id": state.channel_chat_id_cache,
-            "cache_hours": CHANNEL_MEMBERSHIP_CACHE_HOURS,
-        },
-        "monitor": monitor,
-        "smoke_checks": smoke_check_report(),
-    }
 
 
 def system_resource_snapshot() -> dict[str, Any]:
-    cpu_count = max(1, int(os.cpu_count() or 1))
-    load1 = 0.0
-    try:
-        load1 = float(os.getloadavg()[0])
-    except Exception:
-        load1 = 0.0
-    cpu_per_core = load1 / cpu_count if cpu_count > 0 else load1
-
-    mem_total_kb = 0
-    mem_available_kb = 0
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    parts = line.split()
-                    mem_total_kb = int(parts[1]) if len(parts) > 1 else 0
-                elif line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    mem_available_kb = int(parts[1]) if len(parts) > 1 else 0
-    except Exception:
-        mem_total_kb = 0
-        mem_available_kb = 0
-    mem_used_pct = 0.0
-    if mem_total_kb > 0:
-        mem_used_pct = max(0.0, min(100.0, (1.0 - (mem_available_kb / mem_total_kb)) * 100.0))
-
-    disk_total = 0
-    disk_used = 0
-    disk_used_pct = 0.0
-    try:
-        usage = shutil.disk_usage(str(DATA_DIR))
-        disk_total = int(usage.total)
-        disk_used = int(usage.used)
-        disk_used_pct = (disk_used * 100.0 / disk_total) if disk_total > 0 else 0.0
-    except Exception:
-        disk_total = 0
-        disk_used = 0
-        disk_used_pct = 0.0
-
-    return {
-        "cpu_count": cpu_count,
-        "cpu_load_1m": round(load1, 3),
-        "cpu_load_1m_per_core": round(cpu_per_core, 3),
-        "memory_total_kb": mem_total_kb,
-        "memory_available_kb": mem_available_kb,
-        "memory_used_pct": round(mem_used_pct, 2),
-        "disk_total_bytes": disk_total,
-        "disk_used_bytes": disk_used,
-        "disk_used_pct": round(disk_used_pct, 2),
-    }
+    return system_resource_snapshot_impl(DATA_DIR)
 
 
 def payment_status_label(status: str) -> str:
