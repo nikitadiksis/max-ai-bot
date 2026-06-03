@@ -70,6 +70,12 @@ MAX_ASSISTANT_OUTPUT_CHARS = int(os.getenv("MAX_ASSISTANT_OUTPUT_CHARS", "1400")
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "7000"))
 MESSAGE_COOLDOWN_SECONDS = int(os.getenv("MESSAGE_COOLDOWN_SECONDS", "1"))
 IMAGE_COOLDOWN_SECONDS = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "20"))
+MAX_API_CONCURRENCY = int(os.getenv("MAX_API_CONCURRENCY", "12"))
+OPENROUTER_TEXT_CONCURRENCY = int(os.getenv("OPENROUTER_TEXT_CONCURRENCY", "8"))
+OPENROUTER_IMAGE_CONCURRENCY = int(os.getenv("OPENROUTER_IMAGE_CONCURRENCY", "2"))
+TBANK_API_CONCURRENCY = int(os.getenv("TBANK_API_CONCURRENCY", "4"))
+HTTP_RETRY_ATTEMPTS = int(os.getenv("HTTP_RETRY_ATTEMPTS", "3"))
+HTTP_RETRY_BASE_MS = int(os.getenv("HTTP_RETRY_BASE_MS", "400"))
 LITE_PLAN_PRICE_RUB = int(os.getenv("LITE_PLAN_PRICE_RUB", "390"))
 START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "990"))
 PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "2490"))
@@ -115,6 +121,7 @@ ANALYTICS_PAYMENT_FEE_PCT = float(os.getenv("ANALYTICS_PAYMENT_FEE_PCT", "2.5"))
 ANALYTICS_RECEIPT_FEE_PCT = float(os.getenv("ANALYTICS_RECEIPT_FEE_PCT", "1.5"))
 ANALYTICS_TAX_PCT = float(os.getenv("ANALYTICS_TAX_PCT", "6.0"))
 ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB = float(os.getenv("ANALYTICS_EXPECTED_COST_PER_CREDIT_RUB", "0.03"))
+TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 PAYMENT_DETAILS_TEXT = os.getenv(
     "PAYMENT_DETAILS_TEXT",
     "Реквизиты не настроены. Напиши администратору для оплаты.",
@@ -932,10 +939,34 @@ class UserStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_max_user_id_unique ON users(max_user_id) WHERE max_user_id > 0"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_plan_updated_at ON users(plan, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_acquisition_source_campaign ON users(acquisition_source, acquisition_campaign)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_promo_bonus_grants_expiry ON promo_bonus_grants(chat_id, expires_at)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_processed_updates_created_at ON processed_updates(created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_payment_requests_chat_created_at ON payment_requests(chat_id, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_payment_requests_status_created_at ON payment_requests(status, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_payment_requests_provider_ref ON payment_requests(provider_ref)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_chat_created_at ON usage_events(chat_id, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_type_created_at ON usage_events(event_type, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_model_created_at ON usage_events(model_alias, created_at)"
             )
             conn.commit()
 
@@ -2493,6 +2524,10 @@ class BotState:
         self.admin_sessions: dict[str, datetime] = {}
         self.admin_login_attempts: dict[str, deque[datetime]] = {}
         self.admin_login_blocked_until: dict[str, datetime] = {}
+        self.max_api_semaphore = asyncio.Semaphore(max(1, MAX_API_CONCURRENCY))
+        self.openrouter_text_semaphore = asyncio.Semaphore(max(1, OPENROUTER_TEXT_CONCURRENCY))
+        self.openrouter_image_semaphore = asyncio.Semaphore(max(1, OPENROUTER_IMAGE_CONCURRENCY))
+        self.tbank_api_semaphore = asyncio.Semaphore(max(1, TBANK_API_CONCURRENCY))
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
         self.backup_task: asyncio.Task[None] | None = None
@@ -2949,7 +2984,6 @@ async def resolve_channel_chat_id() -> str:
     if not MAX_TOKEN:
         return ""
 
-    session = await get_session()
     marker = ""
     target_link = normalize_channel_link(channel_url_value())
     channel_candidates: list[dict[str, Any]] = []
@@ -2957,15 +2991,17 @@ async def resolve_channel_chat_id() -> str:
         params = {"count": "100"}
         if marker:
             params["marker"] = marker
-        async with session.get(f"{MAX_API}/chats", headers=max_headers(), params=params) as resp:
-            data: Any
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                data = await resp.text()
-            if resp.status >= 400:
-                await notify_admin_alert("channel_gate_resolve", f"MAX chats resolve failed: status={resp.status}, body={str(data)[:300]}")
-                return ""
+        status, data, _ = await http_json_request_with_retries(
+            "GET",
+            f"{MAX_API}/chats",
+            headers=max_headers(),
+            params=params,
+            semaphore=state.max_api_semaphore,
+            request_name="max_chats_resolve",
+        )
+        if status >= 400:
+            await notify_admin_alert("channel_gate_resolve", f"MAX chats resolve failed: status={status}, body={str(data)[:300]}")
+            return ""
         chats, marker = extract_chats_from_response(data)
         for item in chats:
             chat_type = str(item.get("type") or item.get("chat_type") or item.get("chatType") or "").lower()
@@ -3068,27 +3104,24 @@ async def check_channel_subscription(chat_id: int, force: bool = False) -> tuple
         )
         return False, "config_missing"
 
-    session = await get_session()
     url = f"{MAX_API}/chats/{quote(channel_id, safe='')}/members"
     try:
-        async with session.get(
+        status, data, _ = await http_json_request_with_retries(
+            "GET",
             url,
             headers=max_headers(),
             params={"user_ids": str(max_user_id)},
-        ) as resp:
-            data: Any
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                data = await resp.text()
-            if resp.status >= 400:
-                await notify_admin_alert(
-                    "channel_gate_api",
-                    f"MAX members check failed: status={resp.status}, channel_id={channel_id}, user_id={max_user_id}, body={str(data)[:300]}",
-                )
-                if resp.status == 400 and "dialogs" in str(data).lower():
-                    state.channel_chat_id_cache = ""
-                return False, f"api_error_{resp.status}"
+            semaphore=state.max_api_semaphore,
+            request_name="channel_members_check",
+        )
+        if status >= 400:
+            await notify_admin_alert(
+                "channel_gate_api",
+                f"MAX members check failed: status={status}, channel_id={channel_id}, user_id={max_user_id}, body={str(data)[:300]}",
+            )
+            if status == 400 and "dialogs" in str(data).lower():
+                state.channel_chat_id_cache = ""
+            return False, f"api_error_{status}"
     except Exception as exc:
         await notify_admin_alert(
             "channel_gate_api",
@@ -4928,8 +4961,114 @@ def recurring_terms_for_plan(plan: str) -> str:
 async def get_session() -> aiohttp.ClientSession:
     if state.session is None or state.session.closed:
         timeout = aiohttp.ClientTimeout(total=180)
-        state.session = aiohttp.ClientSession(timeout=timeout)
+        connector_limit = max(
+            16,
+            MAX_API_CONCURRENCY + OPENROUTER_TEXT_CONCURRENCY + OPENROUTER_IMAGE_CONCURRENCY + TBANK_API_CONCURRENCY + 4,
+        )
+        connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=max(4, connector_limit // 2), ttl_dns_cache=300)
+        state.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     return state.session
+
+
+def retry_backoff_seconds(attempt: int) -> float:
+    base_ms = max(100, HTTP_RETRY_BASE_MS)
+    return (base_ms / 1000.0) * max(1, 2 ** max(0, attempt - 1))
+
+
+def should_retry_http_status(status: int) -> bool:
+    return int(status) in TRANSIENT_HTTP_STATUSES
+
+
+async def http_json_request_with_retries(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    params: Any = None,
+    json_payload: dict[str, Any] | None = None,
+    data: Any = None,
+    semaphore: asyncio.Semaphore | None = None,
+    request_name: str = "http",
+) -> tuple[int, Any, str]:
+    session = await get_session()
+    attempts = max(1, HTTP_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            async def _perform() -> tuple[int, Any, str]:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json_payload,
+                    data=data,
+                ) as resp:
+                    raw_text = await resp.text()
+                    parsed: Any = raw_text
+                    if raw_text:
+                        with suppress(Exception):
+                            parsed = json.loads(raw_text)
+                    if should_retry_http_status(resp.status) and attempt < attempts:
+                        raise RuntimeError(f"retryable_http_status:{resp.status}:{raw_text[:300]}")
+                    return resp.status, parsed, raw_text
+
+            if semaphore is not None:
+                async with semaphore:
+                    return await _perform()
+            return await _perform()
+        except RuntimeError as exc:
+            if not str(exc).startswith("retryable_http_status:") or attempt >= attempts:
+                raise
+            log.warning("%s retry %s/%s after transient status: %s", request_name, attempt, attempts, exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt >= attempts:
+                raise RuntimeError(f"{request_name} transport error: {exc}") from exc
+            log.warning("%s retry %s/%s after transport error: %s", request_name, attempt, attempts, exc)
+        await asyncio.sleep(retry_backoff_seconds(attempt))
+    raise RuntimeError(f"{request_name} failed after retries")
+
+
+async def http_bytes_request_with_retries(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    params: Any = None,
+    semaphore: asyncio.Semaphore | None = None,
+    request_name: str = "http-bytes",
+) -> tuple[int, bytes, str]:
+    session = await get_session()
+    attempts = max(1, HTTP_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            async def _perform() -> tuple[int, bytes, str]:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    params=params,
+                ) as resp:
+                    body = await resp.read()
+                    mime_type = resp.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+                    if should_retry_http_status(resp.status) and attempt < attempts:
+                        preview = body[:300].decode("utf-8", errors="ignore")
+                        raise RuntimeError(f"retryable_http_status:{resp.status}:{preview}")
+                    return resp.status, body, mime_type
+
+            if semaphore is not None:
+                async with semaphore:
+                    return await _perform()
+            return await _perform()
+        except RuntimeError as exc:
+            if not str(exc).startswith("retryable_http_status:") or attempt >= attempts:
+                raise
+            log.warning("%s retry %s/%s after transient status: %s", request_name, attempt, attempts, exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt >= attempts:
+                raise RuntimeError(f"{request_name} transport error: {exc}") from exc
+            log.warning("%s retry %s/%s after transport error: %s", request_name, attempt, attempts, exc)
+        await asyncio.sleep(retry_backoff_seconds(attempt))
+    raise RuntimeError(f"{request_name} failed after retries")
 
 
 def user_profile(chat_id: int) -> dict[str, Any]:
@@ -5189,7 +5328,6 @@ async def max_send_message(
     notify: bool = True,
     text_format: str | None = None,
 ) -> str | None:
-    session = await get_session()
     attachments = normalize_channel_link_buttons(attachments)
     chunks = split_message(text)
     if not chunks and attachments:
@@ -5207,20 +5345,19 @@ async def max_send_message(
         if attachments and index == 0:
             payload["attachments"] = attachments
 
-        async with session.post(
+        status, body_json, body_text = await http_json_request_with_retries(
+            "POST",
             f"{MAX_API}/messages",
             headers=max_headers(),
             params={"chat_id": str(chat_id)},
-            json=payload,
-        ) as resp:
-            body_json: Any = None
-            with suppress(Exception):
-                body_json = await resp.json(content_type=None)
-            if resp.status >= 400:
-                body = await resp.text()
-                raise RuntimeError(f"MAX send error {resp.status}: {body[:500]}")
-            if index == 0 and isinstance(body_json, dict):
-                first_mid = extract_message_mid(body_json)
+            json_payload=payload,
+            semaphore=state.max_api_semaphore,
+            request_name="max_send_message",
+        )
+        if status >= 400:
+            raise RuntimeError(f"MAX send error {status}: {body_text[:500]}")
+        if index == 0 and isinstance(body_json, dict):
+            first_mid = extract_message_mid(body_json)
     if first_mid and attachments and any(
         isinstance(item, dict) and item.get("type") == "inline_keyboard" for item in attachments
     ):
@@ -5254,7 +5391,6 @@ async def max_edit_message(
     attachments: list[dict[str, Any]] | None = None,
     text_format: str | None = None,
 ) -> bool:
-    session = await get_session()
     attachments = normalize_channel_link_buttons(attachments)
     payload: dict[str, Any] = {
         "type": "text",
@@ -5265,16 +5401,18 @@ async def max_edit_message(
     if attachments is not None:
         payload["attachments"] = attachments
 
-    async with session.put(
+    status, _, body_text = await http_json_request_with_retries(
+        "PUT",
         f"{MAX_API}/messages",
         headers=max_headers(),
         params={"chat_id": str(chat_id), "message_id": str(message_mid)},
-        json=payload,
-    ) as resp:
-        if resp.status >= 400:
-            body = await resp.text()
-            log.warning("MAX edit error %s (chat_id=%s, mid=%s): %s", resp.status, chat_id, message_mid, body[:300])
-            return False
+        json_payload=payload,
+        semaphore=state.max_api_semaphore,
+        request_name="max_edit_message",
+    )
+    if status >= 400:
+        log.warning("MAX edit error %s (chat_id=%s, mid=%s): %s", status, chat_id, message_mid, body_text[:300])
+        return False
     return True
 
 
@@ -5312,60 +5450,65 @@ async def answer_callback(
     text: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> bool:
-    session = await get_session()
     payload: dict[str, Any] = {"notification": notification}
     if text is not None:
         message_payload: dict[str, Any] = {"text": text}
         if attachments:
             message_payload["attachments"] = attachments
         payload["message"] = message_payload
-    async with session.post(
+    status, response_json, body_text = await http_json_request_with_retries(
+        "POST",
         f"{MAX_API}/answers",
         headers=max_headers(),
         params={"callback_id": callback_id},
-        json=payload,
-    ) as resp:
-        response_json: Any = None
-        with suppress(Exception):
-            response_json = await resp.json(content_type=None)
-        if resp.status >= 400:
-            body = await resp.text()
-            log.warning("Callback answer failed %s: %s", resp.status, body[:300])
-            return False
-        if isinstance(response_json, dict) and response_json.get("success") is False:
-            log.warning("Callback answer returned success=false: %s", response_json)
-            return False
+        json_payload=payload,
+        semaphore=state.max_api_semaphore,
+        request_name="max_answer_callback",
+    )
+    if status >= 400:
+        log.warning("Callback answer failed %s: %s", status, body_text[:300])
+        return False
+    if isinstance(response_json, dict) and response_json.get("success") is False:
+        log.warning("Callback answer returned success=false: %s", response_json)
+        return False
     return True
 
 
 async def get_upload_url(upload_type: str = "image") -> str:
-    session = await get_session()
-    async with session.post(
+    status, body, _ = await http_json_request_with_retries(
+        "POST",
         f"{MAX_API}/uploads",
         headers=max_headers(),
         params={"type": upload_type},
-    ) as resp:
-        body = await resp.json(content_type=None)
-        if resp.status >= 400:
-            raise RuntimeError(f"MAX uploads error {resp.status}: {body}")
-        upload_url = body.get("url")
-        if not upload_url:
-            raise RuntimeError(f"MAX uploads response has no url: {body}")
-        return upload_url
+        semaphore=state.max_api_semaphore,
+        request_name="max_get_upload_url",
+    )
+    if status >= 400:
+        raise RuntimeError(f"MAX uploads error {status}: {body}")
+    upload_url = body.get("url") if isinstance(body, dict) else None
+    if not upload_url:
+        raise RuntimeError(f"MAX uploads response has no url: {body}")
+    return upload_url
 
 
 async def upload_image_to_max(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
-    session = await get_session()
     upload_url = await get_upload_url("image")
     ext = image_extension(mime_type)
     form = aiohttp.FormData()
     form.add_field("data", BytesIO(image_bytes), filename=f"generated.{ext}", content_type=mime_type)
 
-    async with session.post(upload_url, data=form) as resp:
-        body = await resp.json(content_type=None)
-        if resp.status >= 400:
-            raise RuntimeError(f"MAX file upload error {resp.status}: {body}")
-        return body
+    status, body, _ = await http_json_request_with_retries(
+        "POST",
+        upload_url,
+        data=form,
+        semaphore=state.max_api_semaphore,
+        request_name="max_upload_image",
+    )
+    if status >= 400:
+        raise RuntimeError(f"MAX file upload error {status}: {body}")
+    if not isinstance(body, dict):
+        raise RuntimeError(f"MAX file upload invalid response: {body}")
+    return body
 
 
 async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, display_prompt: str | None = None) -> None:
@@ -5391,14 +5534,17 @@ def friendly_image_generation_error(exc: Exception, *, is_edit: bool = False) ->
 
 
 async def fetch_image_bytes(url: str, use_max_auth: bool = False) -> ImageResult:
-    session = await get_session()
     headers = max_headers() if use_max_auth else None
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.read()
-        if resp.status >= 400:
-            raise RuntimeError(f"Image fetch error {resp.status}")
-        mime_type = resp.headers.get("Content-Type", "image/png").split(";", 1)[0]
-        return ImageResult(image_bytes=data, mime_type=mime_type)
+    status, data, mime_type = await http_bytes_request_with_retries(
+        "GET",
+        url,
+        headers=headers,
+        semaphore=state.openrouter_image_semaphore,
+        request_name="fetch_image_bytes",
+    )
+    if status >= 400:
+        raise RuntimeError(f"Image fetch error {status}")
+    return ImageResult(image_bytes=data, mime_type=mime_type)
 
 
 def remember_reference_image(chat_id: int, data_url: str) -> None:
@@ -5441,7 +5587,6 @@ def build_text_request(chat_id: int, user_text: str, selected_alias: str | None 
 
 
 async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
-    session = await get_session()
     plan_name, alias, model_info, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
 
     payload = {
@@ -5449,11 +5594,17 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
         "messages": messages,
         "max_tokens": completion_tokens_for_plan(plan_name),
     }
-    async with session.post(OPENROUTER_CHAT_API, headers=openrouter_headers(), json=payload) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            message = data.get("error", {}).get("message", "Unknown OpenRouter error")
-            raise RuntimeError(message)
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        OPENROUTER_CHAT_API,
+        headers=openrouter_headers(),
+        json_payload=payload,
+        semaphore=state.openrouter_text_semaphore,
+        request_name=f"openrouter_text:{alias}",
+    )
+    if status >= 400:
+        message = data.get("error", {}).get("message", "Unknown OpenRouter error") if isinstance(data, dict) else str(data)
+        raise RuntimeError(message)
 
     choice = data["choices"][0]["message"]
     answer = normalize_text_content(choice.get("content")) or "Не удалось получить текстовый ответ."
@@ -5476,18 +5627,23 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
 
 
 async def generate_image(prompt: str) -> ImageResult:
-    session = await get_session()
     payload = {
         "model": DEFAULT_IMAGE_MODEL.model,
         "messages": [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],
     }
 
-    async with session.post(OPENROUTER_CHAT_API, headers=openrouter_headers(), json=payload) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            message = data.get("error", {}).get("message", "Unknown OpenRouter error")
-            raise RuntimeError(message)
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        OPENROUTER_CHAT_API,
+        headers=openrouter_headers(),
+        json_payload=payload,
+        semaphore=state.openrouter_image_semaphore,
+        request_name="openrouter_image_generate",
+    )
+    if status >= 400:
+        message = data.get("error", {}).get("message", "Unknown OpenRouter error") if isinstance(data, dict) else str(data)
+        raise RuntimeError(message)
 
     message = data["choices"][0]["message"]
     images = message.get("images") or []
@@ -5505,7 +5661,6 @@ async def generate_image(prompt: str) -> ImageResult:
 
 
 async def generate_image_from_reference(prompt: str, reference_image_data_url: str) -> ImageResult:
-    session = await get_session()
     payload = {
         "model": DEFAULT_IMAGE_MODEL.model,
         "messages": [
@@ -5520,11 +5675,17 @@ async def generate_image_from_reference(prompt: str, reference_image_data_url: s
         "modalities": ["image", "text"],
     }
 
-    async with session.post(OPENROUTER_CHAT_API, headers=openrouter_headers(), json=payload) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            message = data.get("error", {}).get("message", "Unknown OpenRouter error")
-            raise RuntimeError(message)
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        OPENROUTER_CHAT_API,
+        headers=openrouter_headers(),
+        json_payload=payload,
+        semaphore=state.openrouter_image_semaphore,
+        request_name="openrouter_image_edit",
+    )
+    if status >= 400:
+        message = data.get("error", {}).get("message", "Unknown OpenRouter error") if isinstance(data, dict) else str(data)
+        raise RuntimeError(message)
 
     message = data["choices"][0]["message"]
     images = message.get("images") or []
@@ -6892,11 +7053,15 @@ async def tbank_init_payment(
         payload["FailURL"] = fail_url
 
     payload["Token"] = tbank_token_from_payload(payload, TBANK_PASSWORD)
-    session = await get_session()
-    async with session.post(TBANK_INIT_URL, json=payload) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            raise RuntimeError(f"T-Bank Init HTTP {resp.status}: {data}")
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        TBANK_INIT_URL,
+        json_payload=payload,
+        semaphore=state.tbank_api_semaphore,
+        request_name="tbank_init",
+    )
+    if status >= 400:
+        raise RuntimeError(f"T-Bank Init HTTP {status}: {data}")
     if not isinstance(data, dict):
         raise RuntimeError("Invalid T-Bank Init response.")
     if not data.get("Success"):
@@ -6926,11 +7091,15 @@ async def tbank_get_state(payment_id: str) -> dict[str, Any]:
         "PaymentId": payment_id,
     }
     payload["Token"] = tbank_token_from_payload(payload, TBANK_PASSWORD)
-    session = await get_session()
-    async with session.post(TBANK_GET_STATE_URL, json=payload) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            raise RuntimeError(f"T-Bank GetState HTTP {resp.status}: {data}")
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        TBANK_GET_STATE_URL,
+        json_payload=payload,
+        semaphore=state.tbank_api_semaphore,
+        request_name="tbank_get_state",
+    )
+    if status >= 400:
+        raise RuntimeError(f"T-Bank GetState HTTP {status}: {data}")
     if not isinstance(data, dict):
         raise RuntimeError("Invalid T-Bank GetState response.")
     return data
@@ -8806,19 +8975,20 @@ async def process_update(update: dict[str, Any]) -> None:
 
 
 async def get_updates(marker: int | None = None) -> tuple[list[dict[str, Any]], int | None]:
-    session = await get_session()
     params: list[tuple[str, str]] = [("limit", "100"), ("timeout", "25")]
     if marker is not None:
         params.append(("marker", str(marker)))
 
-    async with session.get(
+    status, data, _ = await http_json_request_with_retries(
+        "GET",
         f"{MAX_API}/updates",
         headers={"Authorization": MAX_TOKEN},
         params=params,
-    ) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 400:
-            raise RuntimeError(f"MAX updates error {resp.status}: {data}")
+        semaphore=state.max_api_semaphore,
+        request_name="max_get_updates",
+    )
+    if status >= 400:
+        raise RuntimeError(f"MAX updates error {status}: {data}")
 
     updates = data.get("updates")
     next_marker = data.get("marker")
