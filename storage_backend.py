@@ -47,6 +47,10 @@ def _translate_placeholders(sql: str) -> str:
 
 
 class CursorAdapter:
+    @property
+    def rowcount(self) -> int:
+        raise NotImplementedError
+
     def fetchone(self) -> StorageRow | None:
         raise NotImplementedError
 
@@ -58,6 +62,10 @@ class SQLiteCursorAdapter(CursorAdapter):
     def __init__(self, cursor: sqlite3.Cursor) -> None:
         self.cursor = cursor
 
+    @property
+    def rowcount(self) -> int:
+        return self.cursor.rowcount
+
     def fetchone(self) -> StorageRow | None:
         return self.cursor.fetchone()
 
@@ -68,6 +76,10 @@ class SQLiteCursorAdapter(CursorAdapter):
 class PostgresCursorAdapter(CursorAdapter):
     def __init__(self, cursor: Any) -> None:
         self.cursor = cursor
+
+    @property
+    def rowcount(self) -> int:
+        return self.cursor.rowcount
 
     def fetchone(self) -> StorageRow | None:
         return self.cursor.fetchone()

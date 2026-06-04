@@ -5362,6 +5362,14 @@ def extract_message_mid(node: Any) -> str | None:
     return None
 
 
+def is_expected_max_delivery_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return (
+        "max send error 403" in text
+        and ("chat.denied" in text or "error.dialog.suspended" in text)
+    )
+
+
 async def max_edit_message(
     chat_id: int,
     message_mid: str,
@@ -9006,7 +9014,10 @@ async def process_update(update: dict[str, Any]) -> None:
         log.exception("Failed to process update")
         capture_exception_safe(exc)
         record_runtime_error()
-        await notify_admin_alert("process_update", f"chat_id={chat_id}\nerror={exc}")
+        if is_expected_max_delivery_error(exc):
+            log.info("Skipping process_update alert for suspended/denied chat_id=%s: %s", chat_id, exc)
+        else:
+            await notify_admin_alert("process_update", f"chat_id={chat_id}\nerror={exc}")
         with suppress(Exception):
             await max_send_message(chat_id, f"Ошибка: {exc}")
 
@@ -10806,6 +10817,9 @@ async def max_webhook(request: Request) -> dict[str, bool]:
         try:
             await process_update(update)
         except Exception as exc:
+            if is_expected_max_delivery_error(exc):
+                log.info("Skipping max_webhook alert for suspended/denied dialog: %s", exc)
+                continue
             log.exception("Unhandled webhook processing error")
             capture_exception_safe(exc)
             record_runtime_error()
