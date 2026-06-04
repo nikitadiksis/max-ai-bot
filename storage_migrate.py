@@ -28,16 +28,20 @@ def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def read_table_rows(source_backend: Any, table: str) -> list[dict[str, Any]]:
     with source_backend.connect() as conn:
-        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        rows = conn.execute(f"SELECT * FROM {quote_ident(table)}").fetchall()
     return [dict(row) for row in rows]
 
 
 def truncate_target(target_backend: Any) -> None:
     with target_backend.connect() as conn:
         for table in reversed(TABLE_ORDER):
-            conn.execute(f"DELETE FROM {table}")
+            conn.execute(f"DELETE FROM {quote_ident(table)}")
 
 
 def insert_rows(target_backend: Any, table: str, rows: list[dict[str, Any]]) -> None:
@@ -46,17 +50,22 @@ def insert_rows(target_backend: Any, table: str, rows: list[dict[str, Any]]) -> 
     columns = list(rows[0].keys())
     placeholders = ", ".join("?" for _ in columns)
     column_sql = ", ".join(quote_ident(column) for column in columns)
-    sql = f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})"
+    table_sql = quote_ident(table)
+    sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders})"
     with target_backend.connect() as conn:
         for row in rows:
             conn.execute(sql, tuple(row.get(column) for column in columns))
         if target_backend.kind == "postgres":
             id_column = TABLE_ID_COLUMNS.get(table)
             if id_column:
-                seq_name = f"{table}_{id_column}_seq"
+                table_literal = quote_literal(table)
+                column_literal = quote_literal(id_column)
                 conn.execute(
-                    f"SELECT setval(?, COALESCE((SELECT MAX({quote_ident(id_column)}) FROM {table}), 1), true)",
-                    (seq_name,),
+                    f"SELECT setval("
+                    f"pg_get_serial_sequence({table_literal}, {column_literal}), "
+                    f"COALESCE((SELECT MAX({quote_ident(id_column)}) FROM {table_sql}), 1), "
+                    f"true"
+                    f")"
                 )
 
 

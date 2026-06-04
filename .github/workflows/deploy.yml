@@ -34,7 +34,10 @@ jobs:
 
             if ! command -v git >/dev/null 2>&1; then
               apt-get update -y
-              apt-get install -y git
+              apt-get install -y git curl
+            elif ! command -v curl >/dev/null 2>&1; then
+              apt-get update -y
+              apt-get install -y curl
             fi
 
             mkdir -p /root/max_ai_agent
@@ -47,6 +50,7 @@ jobs:
               ! -name '.env' \
               ! -name 'data' \
               ! -name 'logs' \
+              ! -name 'backups' \
               ! -name '.deploy_tmp' \
               -exec rm -rf {} +
 
@@ -55,3 +59,4 @@ jobs:
 
             docker compose -f /root/max_ai_agent/docker-compose.yml up -d --build bot
             docker compose -f /root/max_ai_agent/docker-compose.yml ps
+            curl -fsS http://127.0.0.1:8000/health
