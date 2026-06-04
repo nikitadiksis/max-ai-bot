@@ -6494,7 +6494,7 @@ async def finish_onboarding_to_page(
 ) -> None:
     state.user_store.set_onboarding_done(chat_id, True)
     handoff_onboarding_to_ui(chat_id, source_mid)
-    target_mid = source_mid or state.ui_message_mid.get(chat_id)
+    target_mid = state.ui_message_mid.get(chat_id) or source_mid
     await show_ui_page(
         chat_id,
         page,
