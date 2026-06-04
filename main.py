@@ -8037,6 +8037,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "image_prompt:start":
         row = user_profile(chat_id)
         plan_name = str(row.get("plan", "free")).strip().lower()
+        prompt_target_mid = state.ui_message_mid.get(chat_id) or source_mid
         if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             if callback_id:
                 await answer_callback(callback_id, "Недоступно на текущем тарифе")
@@ -8044,7 +8045,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 chat_id,
                 f"Картинки доступны с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
                 attachments=build_tariffs_keyboard_pricing(),
-                source_mid=source_mid,
+                source_mid=prompt_target_mid,
                 page=UI_PAGE_TARIFFS,
                 push_history=False,
             )
@@ -8059,7 +8060,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 reason_limit,
                 attachments=build_tariffs_keyboard_pricing(),
                 callback_id=None,
-                source_mid=source_mid,
+                source_mid=prompt_target_mid,
                 page=UI_PAGE_TARIFFS,
                 push_history=False,
                 notification="Лимит достигнут",
@@ -8084,7 +8085,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             f"{generation_cost_line}",
             attachments=build_image_prompt_keyboard(),
             callback_id=callback_id,
-            source_mid=source_mid,
+            source_mid=prompt_target_mid,
             page=UI_PAGE_IMAGE_MENU,
             notification="Жду описание",
         )
@@ -8093,6 +8094,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "image_ref:start":
         row = user_profile(chat_id)
         plan_name = str(row.get("plan", "free")).strip().lower()
+        prompt_target_mid = state.ui_message_mid.get(chat_id) or source_mid
         if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             if callback_id:
                 await answer_callback(callback_id, "Недоступно на текущем тарифе")
@@ -8100,7 +8102,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
                 chat_id,
                 f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
                 attachments=build_tariffs_keyboard_pricing(),
-                source_mid=source_mid,
+                source_mid=prompt_target_mid,
                 page=UI_PAGE_TARIFFS,
                 push_history=False,
             )
@@ -8126,7 +8128,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             ),
             attachments=build_image_prompt_keyboard(),
             callback_id=callback_id,
-            source_mid=source_mid,
+            source_mid=prompt_target_mid,
             page=UI_PAGE_IMAGE_MENU,
             notification="Жду фото",
         )
