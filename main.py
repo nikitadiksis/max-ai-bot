@@ -4245,11 +4245,11 @@ def image_availability_text(chat_id: int) -> str:
         if not free_image_is_available(row):
             next_at = free_image_next_available_at(row)
             return (
-                f"На тарифе Free: не более 1 картинки каждые 7 дней. "
+                f"На тарифе Free: не более 1 действия с картинкой каждые 7 дней. "
                 f"Осталось {format_remaining_time(next_at)}. "
                 f"Новая будет доступна с {format_msk_datetime(next_at)}."
         )
-        return "На тарифе Free: доступна 1 картинка каждые 7 дней."
+        return "На тарифе Free: доступно 1 действие с картинкой каждые 7 дней."
 
 
 def build_image_menu_text(chat_id: int) -> str:
@@ -4260,8 +4260,9 @@ def build_image_menu_text(chat_id: int) -> str:
     panel = prefs.get("panel", "root")
     availability = image_availability_text(chat_id)
     availability_block = f"{availability}\n" if availability else ""
+    edit_cost_line = "" if is_free_plan else f"Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов.\n\n"
     generation_line = (
-        "Лимит Free: 1 картинка в неделю с момента последней генерации.\n"
+        "Лимит Free: 1 генерация или редактирование фото в 7 дней с момента последнего использования.\n"
         if is_free_plan
         else f"Генерация: {request_cost_text(image_credit_cost())} запросов.\n"
     )
@@ -4270,7 +4271,7 @@ def build_image_menu_text(chat_id: int) -> str:
             "🎨 Картинки\n\n"
             f"{availability_block}"
             f"{generation_line}"
-            f"Редактирование фото: {request_cost_text(image_edit_credit_cost())} запросов.\n\n"
+            f"{edit_cost_line}"
             "Сначала выбери, что хочешь сделать:\n"
             "• сгенерировать новую картинку\n"
             "• изменить фото"
@@ -4288,7 +4289,7 @@ def build_image_menu_text(chat_id: int) -> str:
             "После этого откроется шаг со стилем и форматом.\n\n"
             f"{availability_block}"
             + (
-                "Лимит Free: 1 картинка в неделю с момента последней генерации."
+                "Лимит Free: 1 генерация или редактирование фото в 7 дней с момента последнего использования."
                 if is_free_plan
                 else f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
             )
@@ -4299,12 +4300,18 @@ def build_image_menu_text(chat_id: int) -> str:
             "Здесь можно вручную выбрать стиль результата и формат кадра.\n\n"
             f"{image_params_summary(chat_id)}"
         )
+    edit_intro_line = (
+        "Лимит Free: 1 генерация или редактирование фото в 7 дней с момента последнего использования.\n"
+        if is_free_plan
+        else f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
+    )
+    availability_line = "" if is_free_plan else f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
     return (
         "🖼 Сценарии для фото\n\n"
         "Выбери готовый сценарий для редактирования фото или не выбирай его.\n"
         "После этого откроется шаг со стилем и форматом.\n\n"
-        f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
-        f"Доступно с тарифа {DEFAULT_IMAGE_MODEL.min_plan}."
+        f"{edit_intro_line}"
+        f"{availability_line}"
     )
 
 
@@ -4906,7 +4913,7 @@ def build_tariffs_text() -> str:
     gpt54_long_requests = request_cost_text(text_credit_cost("gpt54") + MAX_VARIABLE_CREDITS_PER_TEXT)
     return (
         "💠 Тарифы:\n"
-        f"• 🆓 **Free (бесплатный)**: {free_requests} запросов/день + 1 картинка / 7 дней\n"
+        f"• 🆓 **Free (бесплатный)**: {free_requests} запросов/день + 1 генерация или редактирование фото / 7 дней\n"
         f"• 🍬 **Lite**: {LITE_PLAN_PRICE_RUB} ₽ / {LITE_PLAN_DAYS} дней, {lite_requests} запросов\n"
         f"• 👌 **Start**: {START_PLAN_PRICE_RUB} ₽ / {START_PLAN_DAYS} дней, {start_requests} запросов\n"
         f"• 🚀 **Pro**: {PRO_PLAN_PRICE_RUB} ₽ / {PRO_PLAN_DAYS} дней, {pro_requests} запросов\n\n"
@@ -5200,7 +5207,7 @@ def can_use_model(plan: str, model_alias: str) -> tuple[bool, str]:
 def check_and_consume_credits(chat_id: int, amount: int, operation_name: str) -> tuple[bool, str]:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free")).strip().lower()
-    if plan_name == "free" and operation_name.strip().lower() == "картинка":
+    if plan_name == "free" and operation_name.strip().lower() in {"картинка", "картинка по фото"}:
         return True, ""
     if amount <= 0:
         return True, ""
@@ -5249,7 +5256,7 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
                 next_at = free_image_next_available_at(row)
                 return (
                     False,
-                    f"На free доступна 1 картинка каждые 7 дней. Новая генерация будет доступна с {format_msk_datetime(next_at)}. "
+                    f"На free доступно 1 действие с картинкой каждые 7 дней. Следующая генерация или обработка фото будет доступна с {format_msk_datetime(next_at)}. "
                     "Хочешь больше — выбери тариф ниже или пакет запросов.",
                 )
             return True, ""
@@ -5903,7 +5910,7 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
 
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free")).strip().lower()
-    if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+    if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
         await show_managed_content(
             chat_id,
             f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
@@ -5931,7 +5938,8 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
         )
         return True
 
-    edit_cost = image_edit_credit_cost()
+    is_free_plan = plan_name == "free"
+    edit_cost = 0 if is_free_plan else image_edit_credit_cost()
     ok_credit, reason_credit = check_and_consume_credits(chat_id, edit_cost, "картинка по фото")
     if not ok_credit:
         await show_managed_content(
@@ -6156,11 +6164,11 @@ def add_ui_nav_buttons(chat_id: int, attachments: list[dict[str, Any]] | None) -
 def resolve_edit_target_mid(chat_id: int, source_mid: str | None, force_new: bool = False) -> str | None:
     if force_new:
         return None
+    if source_mid:
+        return source_mid
     managed_mid = state.ui_message_mid.get(chat_id)
     if managed_mid:
         return managed_mid
-    if source_mid:
-        return source_mid
     return None
 
 
@@ -6832,9 +6840,9 @@ def usage_text(row: dict[str, Any]) -> str:
         lines.append(f"Free-бонус в день: {request_balance_text(FREE_DAILY_CREDITS)} запросов")
         next_at = free_image_next_available_at(row)
         if free_image_is_available(row):
-            lines.append("Картинка на Free: доступна сейчас")
+            lines.append("Действие с картинкой на Free: доступно сейчас")
         else:
-            lines.append(f"Картинка на Free: через {format_remaining_time(next_at)}")
+            lines.append(f"Действие с картинкой на Free: через {format_remaining_time(next_at)}")
             lines.append(f"Точное время: {format_msk_datetime(next_at)}")
     if cfg.daily_gpt54_limit > 0:
         lines.append(f"GPT-5.4 сегодня: {gpt54_used}/{cfg.daily_gpt54_limit} (осталось {gpt54_left})")
@@ -8064,7 +8072,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             chosen = IMAGE_PRESET_OPTIONS[prefs["preset"]]
             preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
         generation_cost_line = (
-            "Лимит Free: 1 картинка в неделю с момента последней генерации."
+            "Лимит Free: 1 генерация или редактирование фото в 7 дней с момента последнего использования."
             if str(row.get("plan", "free")).strip().lower() == "free"
             else f"Стоимость: {request_cost_text(image_credit_cost())} запросов."
         )
@@ -8085,7 +8093,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload == "image_ref:start":
         row = user_profile(chat_id)
         plan_name = str(row.get("plan", "free")).strip().lower()
-        if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             if callback_id:
                 await answer_callback(callback_id, "Недоступно на текущем тарифе")
             await show_managed_content(
@@ -8103,12 +8111,17 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         if prefs.get("edit_preset", "") in IMAGE_EDIT_PRESET_OPTIONS:
             chosen = IMAGE_EDIT_PRESET_OPTIONS[prefs["edit_preset"]]
             preset_hint = f"Сценарий: {chosen['label']}\nПодсказка: {chosen['hint']}\n"
+        edit_prompt_cost_line = (
+            "Лимит Free: 1 генерация или редактирование фото в 7 дней с момента последнего использования.\n"
+            if plan_name == "free"
+            else f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
+        )
         await show_managed_content(
             chat_id,
             (
                 "Пришли фото и коротко опиши, что сделать.\n"
                 f"{preset_hint}"
-                f"Стоимость: {request_cost_text(image_edit_credit_cost())} запросов.\n"
+                f"{edit_prompt_cost_line}"
                 "Если фото уже отправлено — просто напиши описание (например: «нарисуй её в стиле аниме»)."
             ),
             attachments=build_image_prompt_keyboard(),
@@ -8676,7 +8689,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
     if command == "/image_ref":
         row = user_profile(chat_id)
         plan_name = str(row.get("plan", "free")).strip().lower()
-        if plan_name == "free" or not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
+        if plan_name != "free" and not plan_allowed(plan_name, DEFAULT_IMAGE_MODEL.min_plan):
             await max_send_message(
                 chat_id,
                 f"Режим «по фото» доступен с тарифа {DEFAULT_IMAGE_MODEL.min_plan}. Открой «Тарифы».",
@@ -8688,7 +8701,14 @@ async def handle_command(chat_id: int, text: str) -> bool:
             state.pending_image_ref_prompt.add(chat_id)
             await max_send_message(
                 chat_id,
-                f"Сначала отправь фото. Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов.",
+                (
+                    "Сначала отправь фото. "
+                    + (
+                        "На Free доступно 1 действие с картинкой каждые 7 дней."
+                        if plan_name == "free"
+                        else f"Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов."
+                    )
+                ),
                 attachments=build_image_prompt_keyboard(),
             )
             return True
@@ -8886,12 +8906,18 @@ async def process_update(update: dict[str, Any]) -> None:
 
         if not text:
             state.pending_image_ref_prompt.add(chat_id)
+            row = user_profile(chat_id)
+            plan_name = str(row.get("plan", "free")).strip().lower()
             await max_send_message(
                 chat_id,
                 (
                     "Фото получил ✅\n"
                     "Теперь напиши, что с ним сделать (например: «нарисуй её в стиле аниме»).\n"
-                    f"Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов."
+                    + (
+                        "На Free доступно 1 действие с картинкой каждые 7 дней."
+                        if plan_name == "free"
+                        else f"Стоимость редактирования фото: {request_cost_text(image_edit_credit_cost())} запросов."
+                    )
                 ),
                 attachments=build_image_prompt_keyboard(),
             )
