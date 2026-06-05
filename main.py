@@ -57,10 +57,13 @@ DATA_DIR.mkdir(exist_ok=True)
 
 MAX_API = "https://platform-api.max.ru"
 OPENROUTER_CHAT_API = "https://openrouter.ai/api/v1/chat/completions"
+KIE_GEMINI_CHAT_API_DEFAULT = "https://api.kie.ai/gemini-2.5-flash/v1/chat/completions"
+KIE_GPT54_API_DEFAULT = "https://api.kie.ai/codex/v1/responses"
 DEFAULT_MAX_MESSAGE_LEN = 3900
 
 MAX_TOKEN = os.getenv("MAX_TOKEN", "").strip()
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", "").strip()
+KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
 RUN_MODE = os.getenv("RUN_MODE", "polling").strip().lower()
 HOST = os.getenv("HOST", "0.0.0.0").strip()
 PORT = int(os.getenv("PORT", "8000"))
@@ -85,9 +88,18 @@ IMAGE_COOLDOWN_SECONDS = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "20"))
 MAX_API_CONCURRENCY = int(os.getenv("MAX_API_CONCURRENCY", "12"))
 OPENROUTER_TEXT_CONCURRENCY = int(os.getenv("OPENROUTER_TEXT_CONCURRENCY", "8"))
 OPENROUTER_IMAGE_CONCURRENCY = int(os.getenv("OPENROUTER_IMAGE_CONCURRENCY", "2"))
+KIE_TEXT_CONCURRENCY = int(os.getenv("KIE_TEXT_CONCURRENCY", "6"))
 TBANK_API_CONCURRENCY = int(os.getenv("TBANK_API_CONCURRENCY", "4"))
 HTTP_RETRY_ATTEMPTS = int(os.getenv("HTTP_RETRY_ATTEMPTS", "3"))
 HTTP_RETRY_BASE_MS = int(os.getenv("HTTP_RETRY_BASE_MS", "400"))
+KIE_TEXT_ALIASES = {
+    alias.strip().lower()
+    for alias in os.getenv("KIE_TEXT_ALIASES", "gemini,gpt54").split(",")
+    if alias.strip()
+}
+KIE_GEMINI_CHAT_API = os.getenv("KIE_GEMINI_CHAT_API", KIE_GEMINI_CHAT_API_DEFAULT).strip() or KIE_GEMINI_CHAT_API_DEFAULT
+KIE_GPT54_API = os.getenv("KIE_GPT54_API", KIE_GPT54_API_DEFAULT).strip() or KIE_GPT54_API_DEFAULT
+KIE_GPT54_MODEL = os.getenv("KIE_GPT54_MODEL", "gpt-5.4").strip() or "gpt-5.4"
 LITE_PLAN_PRICE_RUB = int(os.getenv("LITE_PLAN_PRICE_RUB", "390"))
 START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "990"))
 PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "2490"))
@@ -2598,6 +2610,7 @@ class BotState:
         self.max_api_semaphore = asyncio.Semaphore(max(1, MAX_API_CONCURRENCY))
         self.openrouter_text_semaphore = asyncio.Semaphore(max(1, OPENROUTER_TEXT_CONCURRENCY))
         self.openrouter_image_semaphore = asyncio.Semaphore(max(1, OPENROUTER_IMAGE_CONCURRENCY))
+        self.kie_text_semaphore = asyncio.Semaphore(max(1, KIE_TEXT_CONCURRENCY))
         self.tbank_api_semaphore = asyncio.Semaphore(max(1, TBANK_API_CONCURRENCY))
         self.session: aiohttp.ClientSession | None = None
         self.polling_task: asyncio.Task[None] | None = None
@@ -2829,6 +2842,30 @@ def openrouter_headers() -> dict[str, str]:
         "HTTP-Referer": "https://max.ru",
         "X-Title": "MAX Multi AI Bot",
     }
+
+
+def kie_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {KIE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def kie_enabled_for_alias(alias: str) -> bool:
+    return bool(KIE_API_KEY and alias.strip().lower() in KIE_TEXT_ALIASES)
+
+
+def kie_error_message(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    code = data.get("code")
+    if isinstance(code, int) and code >= 400:
+        message = data.get("msg") or data.get("message") or data.get("error")
+        return str(message or f"Kie API error code {code}")
+    if isinstance(code, str) and code.isdigit() and int(code) >= 400:
+        message = data.get("msg") or data.get("message") or data.get("error")
+        return str(message or f"Kie API error code {code}")
+    return ""
 
 
 def tbank_enabled() -> bool:
@@ -3661,7 +3698,39 @@ def normalize_text_content(content: Any) -> str:
                 text = item.get("text")
                 if isinstance(text, str):
                     parts.append(text)
+            elif isinstance(item, dict) and item.get("type") == "output_text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
         return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
+def normalize_response_output_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if isinstance(message, dict):
+            text = normalize_text_content(message.get("content"))
+            if text:
+                return text
+
+    output = data.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            text = normalize_text_content(content)
+            if text:
+                parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
     return ""
 
 
@@ -3837,8 +3906,8 @@ def parse_usage_tokens(data: dict[str, Any]) -> tuple[int, int, int]:
     usage = data.get("usage")
     if not isinstance(usage, dict):
         return 0, 0, 0
-    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
     total_tokens = int(usage.get("total_tokens", 0) or 0)
     if total_tokens <= 0:
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -4959,7 +5028,7 @@ async def get_session() -> aiohttp.ClientSession:
         timeout = aiohttp.ClientTimeout(total=180)
         connector_limit = max(
             16,
-            MAX_API_CONCURRENCY + OPENROUTER_TEXT_CONCURRENCY + OPENROUTER_IMAGE_CONCURRENCY + TBANK_API_CONCURRENCY + 4,
+            MAX_API_CONCURRENCY + OPENROUTER_TEXT_CONCURRENCY + OPENROUTER_IMAGE_CONCURRENCY + KIE_TEXT_CONCURRENCY + TBANK_API_CONCURRENCY + 4,
         )
         connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=max(4, connector_limit // 2), ttl_dns_cache=300)
         state.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
@@ -5664,7 +5733,115 @@ def build_text_request(chat_id: int, user_text: str, selected_alias: str | None 
     return plan_name, alias, model_info, messages
 
 
-async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
+async def ask_openrouter_text_model(
+    *,
+    alias: str,
+    model_info: ModelInfo,
+    plan_name: str,
+    messages: list[dict[str, Any]],
+) -> tuple[str, int, int, int]:
+    payload = {
+        "model": model_info.model,
+        "messages": messages,
+        "max_tokens": completion_tokens_for_plan(plan_name),
+    }
+    status, data, _ = await http_json_request_with_retries(
+        "POST",
+        OPENROUTER_CHAT_API,
+        headers=openrouter_headers(),
+        json_payload=payload,
+        semaphore=state.openrouter_text_semaphore,
+        request_name=f"openrouter_text:{alias}",
+    )
+    if status >= 400:
+        message = data.get("error", {}).get("message", "Unknown OpenRouter error") if isinstance(data, dict) else str(data)
+        raise RuntimeError(message)
+
+    answer = normalize_response_output_text(data) or "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ С‚РµРєСЃС‚РѕРІС‹Р№ РѕС‚РІРµС‚."
+    prompt_tokens, completion_tokens, total_tokens = parse_usage_tokens(data)
+    return truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS), prompt_tokens, completion_tokens, total_tokens
+
+
+async def ask_kie_gemini_text_model(
+    *,
+    alias: str,
+    plan_name: str,
+    messages: list[dict[str, Any]],
+) -> tuple[str, int, int, int]:
+    payload = {
+        "messages": messages,
+        "max_tokens": completion_tokens_for_plan(plan_name),
+    }
+    status, data, body_text = await http_json_request_with_retries(
+        "POST",
+        KIE_GEMINI_CHAT_API,
+        headers=kie_headers(),
+        json_payload=payload,
+        semaphore=state.kie_text_semaphore,
+        request_name=f"kie_text:{alias}",
+    )
+    message = kie_error_message(data)
+    if status >= 400 or message:
+        message = message or (data.get("msg") if isinstance(data, dict) else body_text)
+        raise RuntimeError(message or "Unknown Kie Gemini error")
+
+    answer = normalize_response_output_text(data) or "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ С‚РµРєСЃС‚РѕРІС‹Р№ РѕС‚РІРµС‚."
+    prompt_tokens, completion_tokens, total_tokens = parse_usage_tokens(data)
+    return truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS), prompt_tokens, completion_tokens, total_tokens
+
+
+async def ask_kie_gpt54_text_model(
+    *,
+    alias: str,
+    plan_name: str,
+    messages: list[dict[str, Any]],
+) -> tuple[str, int, int, int]:
+    user_parts: list[str] = []
+    system_parts: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = normalize_text_content(item.get("content"))
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+        elif role == "user":
+            user_parts.append(content)
+        else:
+            user_parts.append(f"{role}: {content}")
+
+    input_parts: list[str] = []
+    if system_parts:
+        input_parts.append("System instructions:\n" + "\n\n".join(system_parts))
+    if user_parts:
+        input_parts.append("\n\n".join(user_parts))
+
+    payload = {
+        "model": KIE_GPT54_MODEL,
+        "input": "\n\n".join(part for part in input_parts if part).strip(),
+        "max_output_tokens": completion_tokens_for_plan(plan_name),
+    }
+    status, data, body_text = await http_json_request_with_retries(
+        "POST",
+        KIE_GPT54_API,
+        headers=kie_headers(),
+        json_payload=payload,
+        semaphore=state.kie_text_semaphore,
+        request_name=f"kie_text:{alias}",
+    )
+    message = kie_error_message(data)
+    if status >= 400 or message:
+        message = message or (data.get("msg") if isinstance(data, dict) else body_text)
+        raise RuntimeError(message or "Unknown Kie GPT-5.4 error")
+
+    answer = normalize_response_output_text(data) or "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ С‚РµРєСЃС‚РѕРІС‹Р№ РѕС‚РІРµС‚."
+    prompt_tokens, completion_tokens, total_tokens = parse_usage_tokens(data)
+    return truncate_text(answer, MAX_ASSISTANT_OUTPUT_CHARS), prompt_tokens, completion_tokens, total_tokens
+
+
+async def _ask_text_model_openrouter_legacy(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
     plan_name, alias, model_info, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
 
     payload = {
@@ -5691,6 +5868,67 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
     state.history(chat_id).append({"role": "assistant", "content": answer})
 
     prompt_tokens, completion_tokens, total_tokens = parse_usage_tokens(data)
+    if total_tokens <= 0:
+        estimated_prompt = estimate_tokens_from_messages(messages)
+        total_tokens = estimated_prompt + max(0, completion_tokens)
+        prompt_tokens = max(prompt_tokens, estimated_prompt)
+
+    return TextAnswerResult(
+        text=answer,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
+    plan_name, alias, model_info, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
+    provider_name = "openrouter"
+    try:
+        if kie_enabled_for_alias(alias):
+            if alias == "gemini":
+                provider_name = "kie"
+                answer, prompt_tokens, completion_tokens, total_tokens = await ask_kie_gemini_text_model(
+                    alias=alias,
+                    plan_name=plan_name,
+                    messages=messages,
+                )
+            elif alias == "gpt54":
+                provider_name = "kie"
+                answer, prompt_tokens, completion_tokens, total_tokens = await ask_kie_gpt54_text_model(
+                    alias=alias,
+                    plan_name=plan_name,
+                    messages=messages,
+                )
+            else:
+                answer, prompt_tokens, completion_tokens, total_tokens = await ask_openrouter_text_model(
+                    alias=alias,
+                    model_info=model_info,
+                    plan_name=plan_name,
+                    messages=messages,
+                )
+        else:
+            answer, prompt_tokens, completion_tokens, total_tokens = await ask_openrouter_text_model(
+                alias=alias,
+                model_info=model_info,
+                plan_name=plan_name,
+                messages=messages,
+            )
+    except Exception as exc:
+        if provider_name == "kie":
+            log.warning("Kie text fallback for %s: %s", alias, exc)
+            answer, prompt_tokens, completion_tokens, total_tokens = await ask_openrouter_text_model(
+                alias=alias,
+                model_info=model_info,
+                plan_name=plan_name,
+                messages=messages,
+            )
+        else:
+            raise
+
+    state.history(chat_id).append({"role": "user", "content": user_text})
+    state.history(chat_id).append({"role": "assistant", "content": answer})
+
     if total_tokens <= 0:
         estimated_prompt = estimate_tokens_from_messages(messages)
         total_tokens = estimated_prompt + max(0, completion_tokens)
