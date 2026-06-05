@@ -4342,6 +4342,17 @@ def build_image_prompt(user_text: str, chat_id: int) -> str:
     return f"{user_text}\n\nStyle constraints: {', '.join(instructions)}."
 
 
+def should_intercept_image_flow_text(chat_id: int, text: str) -> bool:
+    if not text or text.strip().startswith("/"):
+        return False
+    if chat_id in state.pending_image_prompt or chat_id in state.pending_image_ref_prompt:
+        return False
+    if state.ui_current_page.get(chat_id) != UI_PAGE_IMAGE_MENU:
+        return False
+    prefs = get_image_prefs(chat_id)
+    return prefs.get("panel") == "style" and prefs.get("mode") in {"generate", "edit"}
+
+
 def build_quick_topup_keyboard(code: str) -> list[dict[str, Any]]:
     pack = topup_spec(code) or topup_spec("medium")
     payload_code = code if topup_spec(code) else "medium"
@@ -5889,6 +5900,7 @@ async def _process_image_generation_queued(chat_id: int, user_prompt: str, model
             details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
         )
     )
+    set_image_mode(chat_id, "")
     if queue_before > 0:
         await max_send_message(chat_id, f"Поставил картинку в очередь. Перед тобой задач: {queue_before}. Пришлю результат отдельным сообщением.", attachments=build_image_menu_keyboard(chat_id))
     else:
@@ -5977,6 +5989,7 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
             reference_image_data_url=reference_image_data_url,
         )
     )
+    set_image_mode(chat_id, "")
     if queue_before > 0:
         await max_send_message(chat_id, f"Поставил обработку фото в очередь. Перед тобой задач: {queue_before}. Пришлю результат отдельным сообщением.", attachments=build_image_menu_keyboard(chat_id))
     else:
@@ -8949,6 +8962,15 @@ async def process_update(update: dict[str, Any]) -> None:
             return
         if await handle_pending_image_prompt_input(chat_id, text):
             return
+        if should_intercept_image_flow_text(chat_id, text):
+            if get_image_prefs(chat_id).get("mode") == "edit":
+                state.pending_image_ref_prompt.add(chat_id)
+                if await handle_pending_image_ref_prompt_input(chat_id, text):
+                    return
+            else:
+                state.pending_image_prompt.add(chat_id)
+                if await handle_pending_image_prompt_input(chat_id, text):
+                    return
         recent_reference = get_recent_reference_image(chat_id)
         if recent_reference and looks_like_image_ref_request(text) and not text.strip().startswith("/"):
             await process_image_edit_generation(chat_id, text, recent_reference)
