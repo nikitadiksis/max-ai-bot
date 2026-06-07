@@ -31,6 +31,12 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
 from fastapi.responses import Response
+from docx import Document
+from docx.shared import Pt
+from pptx import Presentation
+from pptx.util import Inches, Pt as PptPt
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 import uvicorn
 from runtime_support import (
     RuntimeSupportDeps,
@@ -123,6 +129,9 @@ CREDIT_COST_GEMINI = int(os.getenv("CREDIT_COST_GEMINI", "5"))
 CREDIT_COST_GPT54 = int(os.getenv("CREDIT_COST_GPT54", "20"))
 CREDIT_COST_IMAGE = int(os.getenv("CREDIT_COST_IMAGE", "35"))
 CREDIT_COST_IMAGE_EDIT = int(os.getenv("CREDIT_COST_IMAGE_EDIT", "55"))
+FILE_DOC_REQUEST_COST = max(1, int(os.getenv("FILE_DOC_REQUEST_COST", "10")))
+FILE_PPT_REQUEST_COST = max(1, int(os.getenv("FILE_PPT_REQUEST_COST", "20")))
+FILE_SHEET_REQUEST_COST = max(1, int(os.getenv("FILE_SHEET_REQUEST_COST", "12")))
 PUBLIC_REQUEST_UNIT_CREDITS = max(1, int(os.getenv("PUBLIC_REQUEST_UNIT_CREDITS", "5")))
 VAR_CREDITS_PER_1K_DEEPSEEK = int(os.getenv("VAR_CREDITS_PER_1K_DEEPSEEK", "0"))
 VAR_CREDITS_PER_1K_GPT = int(os.getenv("VAR_CREDITS_PER_1K_GPT", "1"))
@@ -218,6 +227,21 @@ REENGAGE_BATCH_LIMIT = int(os.getenv("REENGAGE_BATCH_LIMIT", "30"))
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", "production").strip() or "production"
 REFERENCE_IMAGE_TTL_MINUTES = int(os.getenv("REFERENCE_IMAGE_TTL_MINUTES", "180"))
+FILE_KIND_LABELS = {
+    "doc": "документ",
+    "ppt": "презентация",
+    "sheet": "таблица",
+}
+FILE_KIND_EXTENSIONS = {
+    "doc": "docx",
+    "ppt": "pptx",
+    "sheet": "xlsx",
+}
+FILE_KIND_MIME_TYPES = {
+    "doc": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "ppt": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "sheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 ADMIN_IDS = {
     int(value.strip())
     for value in os.getenv("ADMIN_IDS", "").split(",")
@@ -381,6 +405,8 @@ HELP_TEXT = (
     "/support — помощь по оплате и работе бота\n"
     "/clear — очистить контекст"
 )
+
+HELP_TEXT += "\n/files — меню файлов: документ, презентация, таблица"
 
 ADMIN_HELP_TEXT = (
     "\n\nАдмин:\n"
@@ -2586,6 +2612,7 @@ class BotState:
         self.pending_image_ref_prompt: set[int] = set()
         self.pending_promo_code_input: set[int] = set()
         self.pending_referral_code_input: set[int] = set()
+        self.pending_file_kind: dict[int, str] = {}
         self.image_request_prefs: dict[int, dict[str, str]] = {}
         self.pending_image_jobs: set[int] = set()
         self.image_job_queue: asyncio.Queue[ImageJob] = asyncio.Queue()
@@ -2633,6 +2660,10 @@ def clear_growth_pending_inputs(chat_id: int) -> None:
     state.pending_promo_code_input.discard(chat_id)
 
 
+def clear_file_pending_input(chat_id: int) -> None:
+    state.pending_file_kind.pop(chat_id, None)
+
+
 def migrate_runtime_chat_state(old_chat_id: int, new_chat_id: int) -> None:
     if old_chat_id == new_chat_id:
         return
@@ -2648,6 +2679,7 @@ def migrate_runtime_chat_state(old_chat_id: int, new_chat_id: int) -> None:
 
     dict_attrs = (
         "pending_receipt_plan",
+        "pending_file_kind",
         "image_request_prefs",
         "last_reference_image_data_url",
         "last_reference_image_at",
@@ -3869,6 +3901,15 @@ def image_credit_cost() -> int:
 
 def image_edit_credit_cost() -> int:
     return normalize_public_request_credit_cost(CREDIT_COST_IMAGE_EDIT)
+
+
+def file_request_cost(kind: str) -> int:
+    requests_map = {
+        "doc": FILE_DOC_REQUEST_COST,
+        "ppt": FILE_PPT_REQUEST_COST,
+        "sheet": FILE_SHEET_REQUEST_COST,
+    }
+    return credits_for_public_requests(requests_map.get(kind, FILE_DOC_REQUEST_COST))
 
 
 def text_var_credits_per_1k(alias: str) -> int:
@@ -5565,10 +5606,24 @@ async def get_upload_url(upload_type: str = "image") -> str:
 
 
 async def upload_image_to_max(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
-    upload_url = await get_upload_url("image")
-    ext = image_extension(mime_type)
+    return await upload_binary_to_max(
+        data_bytes=image_bytes,
+        mime_type=mime_type,
+        filename=f"generated.{image_extension(mime_type)}",
+        upload_type="image",
+    )
+
+
+async def upload_binary_to_max(
+    *,
+    data_bytes: bytes,
+    mime_type: str,
+    filename: str,
+    upload_type: str = "file",
+) -> dict[str, Any]:
+    upload_url = await get_upload_url(upload_type)
     form = aiohttp.FormData()
-    form.add_field("data", BytesIO(image_bytes), filename=f"generated.{ext}", content_type=mime_type)
+    form.add_field("data", BytesIO(data_bytes), filename=filename, content_type=mime_type)
 
     status, body, _ = await http_json_request_with_retries(
         "POST",
@@ -5592,6 +5647,29 @@ async def send_generated_image(chat_id: int, prompt: str, image: ImageResult, di
         chat_id,
         f"Готово. Вот картинка по запросу:\n{shown_prompt}",
         attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id, include_share=True)],
+    )
+
+
+async def send_generated_file(
+    chat_id: int,
+    *,
+    kind: str,
+    title: str,
+    file_bytes: bytes,
+    filename: str,
+) -> None:
+    attachment_payload = await upload_binary_to_max(
+        data_bytes=file_bytes,
+        mime_type=FILE_KIND_MIME_TYPES.get(kind, "application/octet-stream"),
+        filename=filename,
+        upload_type="file",
+    )
+    attachment = {"type": "file", "payload": attachment_payload}
+    kind_label = FILE_KIND_LABELS.get(kind, "файл")
+    await max_send_message(
+        chat_id,
+        f"Готово. Собрал {kind_label}: {title}",
+        attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id)],
     )
 
 
@@ -5731,6 +5809,67 @@ def build_text_request(chat_id: int, user_text: str, selected_alias: str | None 
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     return plan_name, alias, model_info, messages
+
+
+def detect_file_kind_from_text(text: str) -> str:
+    value = (text or "").strip().lower()
+    if not value:
+        return ""
+    if any(token in value for token in ("презентац", "слайды", "pptx", "ppt ")):
+        return "ppt"
+    if any(token in value for token in ("таблиц", "xlsx", "excel", "эксель", "смет", "бюджет", "медиаплан", "контент-план")):
+        return "sheet"
+    if any(token in value for token in ("документ", "docx", "word", "резюме", "коммерческ", "кп ", "инструкц", "бриф", "тз ")):
+        return "doc"
+    return ""
+
+
+def looks_like_file_request(text: str) -> str:
+    value = (text or "").strip().lower()
+    if not value or value.startswith("/"):
+        return ""
+    kind = detect_file_kind_from_text(value)
+    if not kind:
+        return ""
+    if re.search(r"\b(сделай|создай|подготовь|собери|оформи|сгенерируй|сформируй)\b", value):
+        return kind
+    return ""
+
+
+def file_prompt_has_enough_detail(text: str) -> bool:
+    words = [part for part in re.split(r"\s+", (text or "").strip()) if part]
+    return len(words) >= 4 or len((text or "").strip()) >= 28
+
+
+def sanitize_filename_part(value: str, fallback: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9а-яА-ЯёЁ_-]+", "-", (value or "").strip(), flags=re.UNICODE)
+    normalized = normalized.strip("-_")
+    return normalized[:60] or fallback
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            loaded = json.loads(raw[start : end + 1])
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            return None
+    return None
 
 
 async def ask_openrouter_text_model(
@@ -5881,8 +6020,13 @@ async def _ask_text_model_openrouter_legacy(chat_id: int, user_text: str, select
     )
 
 
-async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
-    plan_name, alias, model_info, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
+async def complete_text_messages(
+    *,
+    alias: str,
+    plan_name: str,
+    messages: list[dict[str, Any]],
+) -> TextAnswerResult:
+    model_info = TEXT_MODELS.get(alias, DEFAULT_TEXT_MODEL)
     provider_name = "openrouter"
     try:
         if kie_enabled_for_alias(alias):
@@ -5940,6 +6084,274 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
     )
+
+
+async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | None = None) -> TextAnswerResult:
+    plan_name, alias, _, messages = build_text_request(chat_id, user_text, selected_alias=selected_alias)
+    result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
+
+    state.history(chat_id).append({"role": "user", "content": user_text})
+    state.history(chat_id).append({"role": "assistant", "content": result.text})
+    return result
+
+
+def build_file_generation_messages(kind: str, user_prompt: str) -> list[dict[str, Any]]:
+    format_rules = {
+        "doc": (
+            "Верни только JSON объект вида "
+            '{"title":"...", "subtitle":"...", "sections":[{"heading":"...", "paragraphs":["..."], "bullets":["..."]}], '
+            '"table":{"title":"...", "columns":["..."], "rows":[["..."]]}}. '
+            "sections обязателен. table добавляй только если она реально нужна."
+        ),
+        "ppt": (
+            "Верни только JSON объект вида "
+            '{"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
+            "Сделай 6-8 содержательных слайдов, если пользователь не указал другое."
+        ),
+        "sheet": (
+            "Верни только JSON объект вида "
+            '{"title":"...", "sheet_name":"...", "columns":["..."], "rows":[["..."]], "summary":"..."}. '
+            "columns и rows обязательны. Данные делай практичными и пригодными для работы."
+        ),
+    }
+    system_text = (
+        "Ты помогаешь собрать готовый офисный файл для пользователя. "
+        "Отвечай только валидным JSON без markdown, пояснений и code fences. "
+        "Пиши на русском, если пользователь пишет по-русски. "
+        "Делай структуру компактной, практичной и пригодной для реального использования. "
+        + format_rules.get(kind, "")
+    )
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_prompt.strip()},
+    ]
+
+
+def fallback_file_spec(kind: str, user_prompt: str) -> dict[str, Any]:
+    topic = user_prompt.strip() or "Новый файл"
+    if kind == "ppt":
+        return {
+            "title": "Презентация",
+            "subtitle": topic,
+            "slides": [
+                {"title": "Тема и цель", "bullets": [topic, "Цель и ожидаемый результат"]},
+                {"title": "Ключевые тезисы", "bullets": ["Главная идея", "Что важно учесть", "Следующий шаг"]},
+                {"title": "Рекомендации", "bullets": ["Приоритет 1", "Приоритет 2", "Приоритет 3"]},
+            ],
+        }
+    if kind == "sheet":
+        return {
+            "title": "Таблица",
+            "sheet_name": "Данные",
+            "columns": ["Параметр", "Значение", "Комментарий"],
+            "rows": [
+                ["Запрос", topic, "Исходная задача пользователя"],
+                ["Статус", "Черновик", "Можно доработать"],
+            ],
+            "summary": "Черновая таблица по запросу пользователя.",
+        }
+    return {
+        "title": "Документ",
+        "subtitle": topic,
+        "sections": [
+            {
+                "heading": "Задача",
+                "paragraphs": [topic],
+                "bullets": ["Ключевая цель", "Основной результат", "Следующий шаг"],
+            }
+        ],
+    }
+
+
+async def generate_file_spec(chat_id: int, kind: str, user_prompt: str) -> tuple[dict[str, Any], TextAnswerResult]:
+    row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free"))
+    alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
+    messages = build_file_generation_messages(kind, user_prompt)
+    result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
+    spec = extract_json_object(result.text) or fallback_file_spec(kind, user_prompt)
+    return spec, result
+
+
+def build_docx_bytes(spec: dict[str, Any]) -> bytes:
+    document = Document()
+    title = str(spec.get("title") or "Документ").strip()
+    subtitle = str(spec.get("subtitle") or "").strip()
+    title_par = document.add_paragraph()
+    title_run = title_par.add_run(title)
+    title_run.bold = True
+    title_run.font.size = Pt(20)
+    if subtitle:
+        subtitle_par = document.add_paragraph()
+        subtitle_run = subtitle_par.add_run(subtitle)
+        subtitle_run.italic = True
+        subtitle_run.font.size = Pt(11)
+    sections = spec.get("sections")
+    if not isinstance(sections, list) or not sections:
+        sections = fallback_file_spec("doc", title).get("sections", [])
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        heading = str(section.get("heading") or "").strip()
+        if heading:
+            document.add_heading(heading, level=1)
+        for paragraph in section.get("paragraphs", []) or []:
+            text = str(paragraph).strip()
+            if text:
+                document.add_paragraph(text)
+        for bullet in section.get("bullets", []) or []:
+            text = str(bullet).strip()
+            if text:
+                document.add_paragraph(text, style="List Bullet")
+    table_spec = spec.get("table")
+    if isinstance(table_spec, dict):
+        columns = [str(col).strip() for col in table_spec.get("columns", []) if str(col).strip()]
+        rows = table_spec.get("rows", []) or []
+        if columns and rows:
+            table_title = str(table_spec.get("title") or "").strip()
+            if table_title:
+                document.add_heading(table_title, level=2)
+            table = document.add_table(rows=1, cols=len(columns))
+            table.style = "Table Grid"
+            for idx, col in enumerate(columns):
+                table.rows[0].cells[idx].text = col
+            for row in rows[:20]:
+                values = row if isinstance(row, list) else [row]
+                cells = table.add_row().cells
+                for idx in range(len(columns)):
+                    cells[idx].text = str(values[idx]).strip() if idx < len(values) else ""
+    out = BytesIO()
+    document.save(out)
+    return out.getvalue()
+
+
+def build_pptx_bytes(spec: dict[str, Any]) -> bytes:
+    prs = Presentation()
+    title = str(spec.get("title") or "Презентация").strip()
+    subtitle = str(spec.get("subtitle") or "").strip()
+    first_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    first_slide.shapes.title.text = title
+    if len(first_slide.placeholders) > 1:
+        first_slide.placeholders[1].text = subtitle
+    slides = spec.get("slides")
+    if not isinstance(slides, list) or not slides:
+        slides = fallback_file_spec("ppt", title).get("slides", [])
+    for slide_spec in slides[:12]:
+        if not isinstance(slide_spec, dict):
+            continue
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = str(slide_spec.get("title") or "Слайд").strip()
+        body = slide.placeholders[1].text_frame
+        body.clear()
+        bullets = slide_spec.get("bullets", []) or []
+        if bullets:
+            for idx, bullet in enumerate(bullets[:6]):
+                paragraph = body.paragraphs[0] if idx == 0 else body.add_paragraph()
+                paragraph.text = str(bullet).strip()
+                paragraph.level = 0
+                for run in paragraph.runs:
+                    run.font.size = PptPt(20)
+        note = str(slide_spec.get("note") or "").strip()
+        if note:
+            box = slide.shapes.add_textbox(Inches(0.7), Inches(6.3), Inches(8.5), Inches(0.5))
+            paragraph = box.text_frame.paragraphs[0]
+            paragraph.text = note
+            for run in paragraph.runs:
+                run.font.size = PptPt(10)
+    out = BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+
+def build_xlsx_bytes(spec: dict[str, Any]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = sanitize_filename_part(str(spec.get("sheet_name") or "Данные"), "Данные")[:31]
+    summary = str(spec.get("summary") or "").strip()
+    row_offset = 1
+    if summary:
+        sheet["A1"] = summary
+        sheet["A1"].font = Font(bold=True, size=12)
+        row_offset = 3
+    columns = [str(col).strip() for col in spec.get("columns", []) if str(col).strip()]
+    rows = spec.get("rows", []) or []
+    if not columns:
+        fallback = fallback_file_spec("sheet", str(spec.get("title") or "Таблица"))
+        columns = fallback["columns"]
+        rows = fallback["rows"]
+    for col_idx, column in enumerate(columns, start=1):
+        cell = sheet.cell(row=row_offset, column=col_idx, value=column)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row_idx, row_values in enumerate(rows[:200], start=row_offset + 1):
+        values = row_values if isinstance(row_values, list) else [row_values]
+        for col_idx in range(1, len(columns) + 1):
+            value = values[col_idx - 1] if col_idx - 1 < len(values) else ""
+            cell = sheet.cell(row=row_idx, column=col_idx, value=str(value))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    sheet.freeze_panes = f"A{row_offset + 1}"
+    for idx, column in enumerate(columns, start=1):
+        max_len = len(column)
+        for row_idx in range(row_offset + 1, min(sheet.max_row, row_offset + 25) + 1):
+            max_len = max(max_len, len(str(sheet.cell(row=row_idx, column=idx).value or "")))
+        sheet.column_dimensions[chr(64 + idx)].width = min(max(max_len + 3, 14), 36)
+    out = BytesIO()
+    workbook.save(out)
+    return out.getvalue()
+
+
+async def process_file_request(chat_id: int, kind: str, prompt: str) -> bool:
+    clean_prompt = prompt.strip()
+    if not clean_prompt:
+        return False
+    if len(clean_prompt) > MAX_TEXT_INPUT_CHARS:
+        await max_send_message(chat_id, f"Слишком длинное описание. Максимум {MAX_TEXT_INPUT_CHARS} символов.", attachments=build_keyboard())
+        return True
+    ok_cd, reason_cd = check_cooldown(chat_id, "message")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+    ok, reason = check_limit_only(chat_id, "messages")
+    if not ok:
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+    cost = file_request_cost(kind)
+    ok_credit, reason_credit = check_and_consume_credits(chat_id, cost, f"{FILE_KIND_LABELS.get(kind, 'файл')}")
+    if not ok_credit:
+        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(user_profile(chat_id)))
+        return True
+    ok, reason = check_and_consume_limit(chat_id, "messages")
+    if not ok:
+        state.user_store.refund_credits(chat_id, cost)
+        await max_send_message(chat_id, reason, attachments=build_keyboard())
+        return True
+    await max_send_message(chat_id, f"Собираю {FILE_KIND_LABELS.get(kind, 'файл')}, это может занять немного времени...", notify=False)
+    try:
+        spec, result = await generate_file_spec(chat_id, kind, clean_prompt)
+        title = str(spec.get("title") or clean_prompt[:60] or FILE_KIND_LABELS.get(kind, "Файл")).strip()
+        if kind == "ppt":
+            file_bytes = build_pptx_bytes(spec)
+        elif kind == "sheet":
+            file_bytes = build_xlsx_bytes(spec)
+        else:
+            file_bytes = build_docx_bytes(spec)
+        filename = f"{sanitize_filename_part(title, FILE_KIND_LABELS.get(kind, 'file'))}.{FILE_KIND_EXTENSIONS.get(kind, 'bin')}"
+        await send_generated_file(chat_id, kind=kind, title=title, file_bytes=file_bytes, filename=filename)
+        final_row = user_profile(chat_id)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="file_request",
+            plan=str(final_row.get("plan", "")),
+            model_alias=str(final_row.get("selected_model_alias") or ""),
+            credits_spent=cost,
+            tokens_total=int(result.total_tokens),
+            details=f"kind={kind};title={title}",
+        )
+        return True
+    except Exception:
+        state.user_store.refund_credits(chat_id, cost)
+        raise
 
 
 async def generate_image(prompt: str) -> ImageResult:
@@ -6038,6 +6450,130 @@ def current_model_display(chat_id: int) -> str:
     return model.label
 
 
+def build_files_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "📄 Документ", "payload": "files:doc"},
+                        {"type": "callback", "text": "📊 Презентация", "payload": "files:ppt"},
+                    ],
+                    [
+                        {"type": "callback", "text": "📈 Таблица", "payload": "files:sheet"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
+    plan_buttons = [
+        {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
+        {"type": "callback", "text": "Мой план", "payload": "action:plan"},
+    ]
+    if chat_id is not None and can_pick_models_for_current_preset(chat_id):
+        plan_buttons.append({"type": "callback", "text": "⚙ Модели", "payload": "action:preset_models"})
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "⚡ Быстро", "payload": "set_preset:fast"},
+                        {"type": "callback", "text": "⚖ Баланс", "payload": "set_preset:balanced"},
+                    ],
+                    [
+                        {"type": "callback", "text": "🧠 Качество", "payload": "set_preset:quality"},
+                        {"type": "callback", "text": "🚀 Эксперт", "payload": "set_preset:expert"},
+                    ],
+                    [*plan_buttons],
+                    [
+                        {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
+                        {"type": "callback", "text": "📄 Файлы", "payload": "action:files_menu"},
+                        {"type": "callback", "text": "🎁 Бонусы", "payload": "action:growth"},
+                    ],
+                    [
+                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
+                        {"type": "callback", "text": "Сброс", "payload": "action:clear"},
+                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
+                    ],
+                    [
+                        {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
+                    ],
+                ]
+            },
+        }
+    ]
+
+
+def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) -> list[dict[str, Any]]:
+    row = user_profile(chat_id)
+    buttons: list[list[dict[str, Any]]] = [
+        [
+            {"type": "callback", "text": "Меню", "payload": "reply_action:menu"},
+            {"type": "callback", "text": "🎨 Картинка", "payload": "reply_action:image_menu"},
+            {"type": "callback", "text": "📄 Файлы", "payload": "reply_action:files_menu"},
+        ]
+    ]
+    if str(row.get("plan", "free")) == "free":
+        buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
+    buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
+    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
+def build_files_prompt_keyboard() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {"buttons": [[{"type": "callback", "text": "Отмена", "payload": "files:cancel"}]]},
+        }
+    ]
+
+
+def build_files_menu_text(chat_id: int) -> str:
+    return (
+        "📄 Файлы\n\n"
+        "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
+        "Что доступно:\n"
+        "• Документ (.docx)\n"
+        "• Презентация (.pptx)\n"
+        "• Таблица (.xlsx)\n\n"
+        "Стоимость:\n"
+        f"• Документ — {FILE_DOC_REQUEST_COST} запросов\n"
+        f"• Презентация — {FILE_PPT_REQUEST_COST} запросов\n"
+        f"• Таблица — {FILE_SHEET_REQUEST_COST} запросов\n\n"
+        "Можно нажать кнопку ниже или просто написать:\n"
+        "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
+    )
+
+
+def build_file_prompt_text(kind: str) -> str:
+    if kind == "ppt":
+        return (
+            "Напиши, какую презентацию собрать одним сообщением.\n\n"
+            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
+            f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
+        )
+    if kind == "sheet":
+        return (
+            "Напиши, какую таблицу собрать одним сообщением.\n\n"
+            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
+            f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
+        )
+    return (
+        "Напиши, какой документ собрать одним сообщением.\n\n"
+        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
+        f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
+    )
+
+
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     set_image_mode(chat_id, "")
     await show_managed_content(
@@ -6045,6 +6581,18 @@ async def send_image_menu(chat_id: int, notify: bool = False) -> None:
         build_image_menu_text(chat_id),
         attachments=build_image_menu_keyboard(chat_id),
         page=UI_PAGE_IMAGE_MENU,
+        push_history=False,
+        force_new=False,
+    )
+
+
+async def send_files_menu(chat_id: int, notify: bool = False) -> None:
+    clear_file_pending_input(chat_id)
+    await show_managed_content(
+        chat_id,
+        build_files_menu_text(chat_id),
+        attachments=build_files_menu_keyboard(chat_id),
+        page=UI_PAGE_FILES_MENU,
         push_history=False,
         force_new=False,
     )
@@ -6283,6 +6831,25 @@ async def handle_pending_image_ref_prompt_input(chat_id: int, text: str) -> bool
     return True
 
 
+async def handle_pending_file_input(chat_id: int, text: str) -> bool:
+    kind = state.pending_file_kind.get(chat_id, "")
+    if kind not in FILE_KIND_LABELS:
+        return False
+
+    lowered = text.strip().lower()
+    if lowered in {"отмена", "cancel", "/cancel", "стоп", "/stop"}:
+        clear_file_pending_input(chat_id)
+        await show_ui_page(chat_id, UI_PAGE_FILES_MENU, push_history=False)
+        return True
+
+    if text.strip().startswith("/"):
+        clear_file_pending_input(chat_id)
+        return False
+
+    clear_file_pending_input(chat_id)
+    return await process_file_request(chat_id, kind, text.strip())
+
+
 async def send_help(chat_id: int) -> None:
     help_base = HELP_TEXT
     admin_part = ADMIN_HELP_TEXT if is_admin(chat_id) else ""
@@ -6316,6 +6883,7 @@ UI_PAGE_PAYMENTS = "payments"
 UI_PAGE_GROWTH = "growth"
 UI_PAGE_SUPPORT = "support"
 UI_PAGE_IMAGE_MENU = "image_menu"
+UI_PAGE_FILES_MENU = "files_menu"
 
 UI_PAGE_KEYS = {
     UI_PAGE_MENU,
@@ -6327,6 +6895,7 @@ UI_PAGE_KEYS = {
     UI_PAGE_GROWTH,
     UI_PAGE_SUPPORT,
     UI_PAGE_IMAGE_MENU,
+    UI_PAGE_FILES_MENU,
 }
 
 UI_HISTORY_LIMIT = 20
@@ -6562,6 +7131,48 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
         return support_help_text(), build_keyboard(chat_id)
     if page == UI_PAGE_IMAGE_MENU:
         return build_image_menu_text(chat_id), build_image_menu_keyboard(chat_id)
+    return "Открой меню и выбери раздел.", build_keyboard(chat_id)
+
+
+def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, Any]]]:
+    row = user_profile(chat_id)
+    if page == UI_PAGE_MENU:
+        preset_block = build_preset_block(str(row.get("plan", "free")))
+        capabilities = (
+            "Что умею:\n"
+            "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
+            f"• 🎨 {image_capability_line().replace('• ', '')}\n"
+            "• 📄 документы, презентации и таблицы\n"
+            "• 🧠 сохранение контекста диалога"
+        )
+        text = (
+            "Главное меню\n\n"
+            "Выбери режим кнопками или просто напиши вопрос.\n\n"
+            f"{capabilities}\n\n"
+            f"{preset_block}\n\n"
+            f"{current_model_focus_block(chat_id)}\n"
+            f"{usage_text(row)}\n\n"
+            f"{MENU_TEXT}"
+        )
+        return text, build_keyboard(chat_id)
+    if page == UI_PAGE_MODELS:
+        return build_models_text(row["plan"], include_prices=False), build_keyboard(chat_id)
+    if page == UI_PAGE_PLAN:
+        return f"{usage_text(row)}{recurring_status_text(row)}", build_plan_keyboard(row)
+    if page == UI_PAGE_TARIFFS:
+        return build_tariffs_text(), build_tariffs_keyboard_pricing()
+    if page == UI_PAGE_TOPUPS:
+        return build_topups_text(), build_topups_keyboard()
+    if page == UI_PAGE_PAYMENTS:
+        return build_payments_text(chat_id)
+    if page == UI_PAGE_GROWTH:
+        return build_growth_text(chat_id, row), build_growth_keyboard(chat_id)
+    if page == UI_PAGE_SUPPORT:
+        return support_help_text(), build_keyboard(chat_id)
+    if page == UI_PAGE_IMAGE_MENU:
+        return build_image_menu_text(chat_id), build_image_menu_keyboard(chat_id)
+    if page == UI_PAGE_FILES_MENU:
+        return build_files_menu_text(chat_id), build_files_menu_keyboard(chat_id)
     return "Открой меню и выбери раздел.", build_keyboard(chat_id)
 
 
@@ -7837,6 +8448,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         reply_page_map = {
             "menu": UI_PAGE_MENU,
             "image_menu": UI_PAGE_IMAGE_MENU,
+            "files_menu": UI_PAGE_FILES_MENU,
             "tariffs": UI_PAGE_TARIFFS,
         }
         if reply_action == "clear":
@@ -7870,6 +8482,8 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload not in {"growth:ref_enter", "growth:promo_enter", "growth:input_cancel"}:
         clear_growth_pending_inputs(chat_id)
+    if payload not in {"files:doc", "files:ppt", "files:sheet", "files:cancel"}:
+        clear_file_pending_input(chat_id)
 
     if payload == "ui_nav:back":
         target = ui_nav_back(chat_id)
@@ -7897,6 +8511,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         "action:growth": UI_PAGE_GROWTH,
         "action:support": UI_PAGE_SUPPORT,
         "action:image_menu": UI_PAGE_IMAGE_MENU,
+        "action:files_menu": UI_PAGE_FILES_MENU,
     }
     if payload in action_page_map:
         await show_ui_page(chat_id, action_page_map[payload], callback_id=callback_id, source_mid=source_mid, push_history=True)
@@ -8198,6 +8813,29 @@ async def handle_callback(update: dict[str, Any]) -> bool:
 
     if payload == "action:image_menu":
         await send_image_menu(chat_id)
+        return True
+
+    if payload == "action:files_menu":
+        await send_files_menu(chat_id)
+        return True
+
+    if payload in {"files:doc", "files:ppt", "files:sheet"}:
+        kind = payload.split(":", 1)[1]
+        state.pending_file_kind[chat_id] = kind
+        await show_managed_content(
+            chat_id,
+            build_file_prompt_text(kind),
+            attachments=build_files_prompt_keyboard(),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_FILES_MENU,
+            notification="Жду описание",
+        )
+        return True
+
+    if payload == "files:cancel":
+        clear_file_pending_input(chat_id)
+        await show_ui_page(chat_id, UI_PAGE_FILES_MENU, callback_id=callback_id, source_mid=source_mid, push_history=False)
         return True
 
     if payload == "image_mode:generate":
@@ -8784,6 +9422,10 @@ async def handle_command(chat_id: int, text: str) -> bool:
         await send_managed_message(chat_id, support_help_text(), attachments=build_keyboard(), page=UI_PAGE_SUPPORT)
         return True
 
+    if command == "/files":
+        await send_files_menu(chat_id)
+        return True
+
     if command == "/channel":
         await send_channel(chat_id)
         return True
@@ -9196,6 +9838,8 @@ async def process_update(update: dict[str, Any]) -> None:
             return
         if await handle_pending_receipt_input(chat_id, text):
             return
+        if await handle_pending_file_input(chat_id, text):
+            return
         if await handle_pending_image_ref_prompt_input(chat_id, text):
             return
         if await handle_pending_image_prompt_input(chat_id, text):
@@ -9213,6 +9857,21 @@ async def process_update(update: dict[str, Any]) -> None:
         if recent_reference and looks_like_image_ref_request(text) and not text.strip().startswith("/"):
             await process_image_edit_generation(chat_id, text, recent_reference)
             return
+        if not text.strip().startswith("/"):
+            file_kind = looks_like_file_request(text)
+            if file_kind:
+                if file_prompt_has_enough_detail(text):
+                    await process_file_request(chat_id, file_kind, text)
+                else:
+                    state.pending_file_kind[chat_id] = file_kind
+                    await show_managed_content(
+                        chat_id,
+                        build_file_prompt_text(file_kind),
+                        attachments=build_files_prompt_keyboard(),
+                        page=UI_PAGE_FILES_MENU,
+                        push_history=False,
+                    )
+                return
         if await handle_command(chat_id, text):
             return
 
