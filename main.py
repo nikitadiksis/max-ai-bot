@@ -115,6 +115,7 @@ PRO_PLAN_DAYS = int(os.getenv("PRO_PLAN_DAYS", "30"))
 START_DAILY_GPT54_LIMIT = int(os.getenv("START_DAILY_GPT54_LIMIT", "3"))
 PRO_DAILY_GPT54_LIMIT = int(os.getenv("PRO_DAILY_GPT54_LIMIT", "0"))
 FREE_DAILY_CREDITS = int(os.getenv("FREE_DAILY_CREDITS", "40"))
+FREE_FILE_COOLDOWN_DAYS = int(os.getenv("FREE_FILE_COOLDOWN_DAYS", "14"))
 MAX_COMPLETION_TOKENS_FREE = int(os.getenv("MAX_COMPLETION_TOKENS_FREE", "500"))
 MAX_COMPLETION_TOKENS_LITE = int(os.getenv("MAX_COMPLETION_TOKENS_LITE", "550"))
 MAX_COMPLETION_TOKENS_START = int(os.getenv("MAX_COMPLETION_TOKENS_START", "650"))
@@ -888,6 +889,7 @@ class UserStore:
                     free_image_week_key TEXT NOT NULL DEFAULT '',
                     free_image_week_used INTEGER NOT NULL DEFAULT 0,
                     free_image_last_used_at TEXT NOT NULL DEFAULT '',
+                    free_file_last_used_at TEXT NOT NULL DEFAULT '',
                     credits_balance INTEGER NOT NULL DEFAULT 0,
                     credits_spent_total INTEGER NOT NULL DEFAULT 0,
                     last_active_at TEXT NOT NULL DEFAULT '',
@@ -991,6 +993,7 @@ class UserStore:
             self._ensure_column(conn, "users", "free_image_week_key", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "free_image_week_used", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "free_image_last_used_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "free_file_last_used_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "users", "credits_balance", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "users", "credits_spent_total", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "payment_requests", "recurring_consent", "INTEGER NOT NULL DEFAULT 0")
@@ -1128,10 +1131,11 @@ class UserStore:
                 selected_model_alias, selected_preset, usage_date,
                 daily_messages_used, daily_images_used, daily_gpt54_used,
                 free_image_week_key, free_image_week_used, free_image_last_used_at,
+                free_file_last_used_at,
                 credits_balance, credits_spent_total,
                 last_active_at,
                 created_at, updated_at
-            ) VALUES (?, ?, 'free', 0, 0, ?, 0, 0, '', '', '', ?, '', ?, 0, 0, 0, '', 0, '', ?, 0, ?, ?, ?)
+            ) VALUES (?, ?, 'free', 0, 0, ?, 0, 0, '', '', '', ?, '', ?, 0, 0, 0, '', 0, '', '', ?, 0, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -1232,6 +1236,7 @@ class UserStore:
         merged["free_image_last_used_at"] = later_iso(merged.get("free_image_last_used_at", ""), current_dict.get("free_image_last_used_at", ""))
         merged["free_image_week_key"] = later_iso(merged.get("free_image_week_key", ""), current_dict.get("free_image_week_key", ""))
         merged["free_image_week_used"] = max(int(merged.get("free_image_week_used", 0) or 0), int(current_dict.get("free_image_week_used", 0) or 0))
+        merged["free_file_last_used_at"] = later_iso(merged.get("free_file_last_used_at", ""), current_dict.get("free_file_last_used_at", ""))
 
         existing_usage_date = str(merged.get("usage_date", "") or "")
         current_usage_date = str(current_dict.get("usage_date", "") or "")
@@ -1296,7 +1301,7 @@ class UserStore:
                     selected_model_alias = ?, selected_preset = ?, subscription_expires_at = ?,
                     recurring_enabled = ?, recurring_cancel_from = ?, recurring_canceled_at = ?,
                     usage_date = ?, daily_messages_used = ?, daily_images_used = ?, daily_gpt54_used = ?,
-                    free_image_week_key = ?, free_image_week_used = ?, free_image_last_used_at = ?,
+                    free_image_week_key = ?, free_image_week_used = ?, free_image_last_used_at = ?, free_file_last_used_at = ?,
                     credits_balance = ?, credits_spent_total = ?, last_active_at = ?, created_at = ?, updated_at = ?
                 WHERE chat_id = ?
                 """,
@@ -1328,6 +1333,7 @@ class UserStore:
                     str(merged.get("free_image_week_key", "") or ""),
                     int(merged.get("free_image_week_used", 0) or 0),
                     str(merged.get("free_image_last_used_at", "") or ""),
+                    str(merged.get("free_file_last_used_at", "") or ""),
                     int(merged.get("credits_balance", 0) or 0),
                     int(merged.get("credits_spent_total", 0) or 0),
                     str(merged.get("last_active_at", "") or ""),
@@ -2026,6 +2032,14 @@ class UserStore:
                 SET free_image_week_used = 1, free_image_last_used_at = ?, updated_at = ?
                 WHERE chat_id = ?
                 """,
+                (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def increment_free_file_usage(self, chat_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET free_file_last_used_at = ?, updated_at = ? WHERE chat_id = ?",
                 (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
@@ -5019,6 +5033,18 @@ def free_image_is_available(row: dict[str, Any]) -> bool:
     return next_at is None or datetime.utcnow() >= next_at
 
 
+def free_file_next_available_at(row: dict[str, Any]) -> datetime | None:
+    last_used = parse_iso_datetime(str(row.get("free_file_last_used_at", "") or ""))
+    if not last_used:
+        return None
+    return last_used + timedelta(days=FREE_FILE_COOLDOWN_DAYS)
+
+
+def free_file_is_available(row: dict[str, Any]) -> bool:
+    next_at = free_file_next_available_at(row)
+    return next_at is None or datetime.utcnow() >= next_at
+
+
 def plan_price_and_days(plan: str) -> tuple[int, int]:
     if plan == "lite":
         return LITE_PLAN_PRICE_RUB, LITE_PLAN_DAYS
@@ -5392,6 +5418,19 @@ def check_limit_only(chat_id: int, limit_type: str) -> tuple[bool, str]:
 
         return True, ""
 
+    if limit_type == "files":
+        if plan_name == "free":
+            if not free_file_is_available(row):
+                next_at = free_file_next_available_at(row)
+                return (
+                    False,
+                    f"На Free доступен 1 короткий файл каждые {FREE_FILE_COOLDOWN_DAYS} дней. "
+                    f"Следующий документ, презентация или таблица будут доступны с {format_msk_datetime(next_at)}. "
+                    "Хочешь больше — открой «Тарифы».",
+                )
+            return True, ""
+        return True, ""
+
     return True, ""
 
 
@@ -5408,6 +5447,11 @@ def consume_limit(chat_id: int, limit_type: str) -> None:
             state.user_store.increment_free_week_image_usage(chat_id)
             return
         state.user_store.increment_image_usage(chat_id)
+        return
+
+    if limit_type == "files":
+        if str(row.get("plan", "free")) == "free":
+            state.user_store.increment_free_file_usage(chat_id)
         return
 
 
@@ -5849,15 +5893,21 @@ def file_prompt_has_enough_detail(text: str) -> bool:
     return len(words) >= 4 or len((text or "").strip()) >= 28
 
 
-def detect_file_profile_from_text(text: str) -> str:
+def default_file_profile_for_plan(plan_name: str) -> str:
+    return "short" if str(plan_name or "").strip().lower() == "free" else "medium"
+
+
+def detect_file_profile_from_text(text: str, default_profile: str = "medium") -> str:
     value = (text or "").strip().lower()
     if not value:
-        return "medium"
+        return default_profile
     if any(token in value for token in ("кратк", "коротк", "быстро", "на 3 слайда", "на 4 слайда", "на 5 слайдов", "до 5 слайдов")):
         return "short"
+    if any(token in value for token in ("средн", "обычн", "стандарт")):
+        return "medium"
     if any(token in value for token in ("подроб", "полный", "развернут", "на 10 слайдов", "на 12 слайдов", "до 12 слайдов", "расширен")):
         return "full"
-    return "medium"
+    return default_profile
 
 
 def sanitize_filename_part(value: str, fallback: str) -> str:
@@ -6459,6 +6509,208 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
         raise
 
 
+async def process_file_request(chat_id: int, kind: str, prompt: str, profile: str = "medium") -> bool:
+    clean_prompt = prompt.strip()
+    if not clean_prompt:
+        return False
+    if len(clean_prompt) > MAX_TEXT_INPUT_CHARS:
+        await max_send_message(chat_id, f"Слишком длинное описание. Максимум {MAX_TEXT_INPUT_CHARS} символов.", attachments=build_keyboard())
+        return True
+
+    row = user_profile(chat_id)
+    plan_name = str(row.get("plan", "free")).strip().lower()
+    is_free_plan = plan_name == "free"
+
+    ok_cd, reason_cd = check_cooldown(chat_id, "message")
+    if not ok_cd:
+        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
+        return True
+
+    if is_free_plan:
+        if profile != "short":
+            await max_send_message(
+                chat_id,
+                "На Free доступен только короткий файл. Средняя и полная версии открываются на платных тарифах.",
+                attachments=purchase_help_keyboard_for_row(row),
+            )
+            return True
+        ok_limit, reason_limit = check_limit_only(chat_id, "files")
+        if not ok_limit:
+            await max_send_message(chat_id, reason_limit, attachments=purchase_help_keyboard_for_row(row))
+            return True
+        cost = 0
+    else:
+        ok_limit, reason_limit = check_limit_only(chat_id, "messages")
+        if not ok_limit:
+            await max_send_message(chat_id, reason_limit, attachments=build_keyboard())
+            return True
+        cost = file_request_cost(kind)
+        ok_credit, reason_credit = check_and_consume_credits(chat_id, cost, f"{FILE_KIND_LABELS.get(kind, 'файл')}")
+        if not ok_credit:
+            await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(row))
+            return True
+        ok_limit, reason_limit = check_and_consume_limit(chat_id, "messages")
+        if not ok_limit:
+            state.user_store.refund_credits(chat_id, cost)
+            await max_send_message(chat_id, reason_limit, attachments=build_keyboard())
+            return True
+
+    await max_send_message(chat_id, f"Собираю {FILE_KIND_LABELS.get(kind, 'файл')}, это может занять немного времени...", notify=False)
+    try:
+        spec, result = await generate_file_spec(chat_id, kind, profile, clean_prompt)
+        title = str(spec.get("title") or clean_prompt[:60] or FILE_KIND_LABELS.get(kind, "Файл")).strip()
+        if kind == "ppt":
+            file_bytes = build_pptx_bytes(spec)
+        elif kind == "sheet":
+            file_bytes = build_xlsx_bytes(spec)
+        else:
+            file_bytes = build_docx_bytes(spec)
+        filename = f"{sanitize_filename_part(title, FILE_KIND_LABELS.get(kind, 'file'))}.{FILE_KIND_EXTENSIONS.get(kind, 'bin')}"
+        await send_generated_file(chat_id, kind=kind, title=title, file_bytes=file_bytes, filename=filename)
+        if is_free_plan:
+            consume_limit(chat_id, "files")
+        final_row = user_profile(chat_id)
+        state.user_store.record_usage_event(
+            chat_id=chat_id,
+            event_type="file_request",
+            plan=str(final_row.get("plan", "")),
+            model_alias=str(final_row.get("selected_model_alias") or ""),
+            credits_spent=cost,
+            tokens_total=int(result.total_tokens),
+            details=f"kind={kind};profile={profile};title={title}",
+        )
+        return True
+    except Exception:
+        if cost > 0:
+            state.user_store.refund_credits(chat_id, cost)
+        raise
+
+
+def build_files_menu_text(chat_id: int) -> str:
+    row = user_profile(chat_id)
+    if str(row.get("plan", "free")).strip().lower() == "free":
+        return (
+            "📄 Файлы\n\n"
+            "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
+            "Что доступно:\n"
+            "• Документ (.docx)\n"
+            "• Презентация (.pptx)\n"
+            "• Таблица (.xlsx)\n\n"
+            "На Free:\n"
+            "• 1 короткий файл каждые 14 дней\n"
+            "• средняя и полная версии доступны на платных тарифах\n\n"
+            "Можно нажать кнопку ниже или просто написать:\n"
+            "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
+        )
+    return (
+        "📄 Файлы\n\n"
+        "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
+        "Что доступно:\n"
+        "• Документ (.docx)\n"
+        "• Презентация (.pptx)\n"
+        "• Таблица (.xlsx)\n\n"
+        "Стоимость:\n"
+        f"• Документ — {FILE_DOC_REQUEST_COST} запросов\n"
+        f"• Презентация — {FILE_PPT_REQUEST_COST} запросов\n"
+        f"• Таблица — {FILE_SHEET_REQUEST_COST} запросов\n\n"
+        "Можно нажать кнопку ниже или просто написать:\n"
+        "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
+    )
+
+
+def build_file_size_text(kind: str) -> str:
+    kind_label = FILE_KIND_LABELS.get(kind, "файл").capitalize()
+    row = user_profile(0) if False else None
+    current_row = None
+    hint = ""
+    if kind == "ppt":
+        hint = "Короткая: до 5 слайдов\nСредняя: 6-8 слайдов\nПолная: 9-12 слайдов"
+    elif kind == "sheet":
+        hint = "Короткая: простая рабочая таблица\nСредняя: нормальная рабочая версия\nПолная: расширенная таблица"
+    else:
+        hint = "Короткая: краткий документ\nСредняя: стандартный рабочий документ\nПолная: подробная версия"
+    return (
+        f"{kind_label}\n\n"
+        "Выбери объем перед генерацией.\n\n"
+        f"{hint}\n\n"
+        "После этого я попрошу описать задачу одним сообщением."
+    )
+
+
+def build_file_prompt_text(kind: str, profile: str = "medium", chat_id: int | None = None) -> str:
+    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
+    is_free_plan = False
+    if chat_id is not None:
+        is_free_plan = str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free"
+    row = user_profile(0) if False else None
+    if kind == "ppt":
+        free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
+        return (
+            f"Режим: Презентация — {profile_label}\n\n"
+            "Напиши, какую презентацию собрать одним сообщением.\n\n"
+            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
+            f"{free_line}"
+        )
+    if kind == "sheet":
+        free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
+        return (
+            f"Режим: Таблица — {profile_label}\n\n"
+            "Напиши, какую таблицу собрать одним сообщением.\n\n"
+            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
+            f"{free_line}"
+        )
+    free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
+    return (
+        f"Режим: Документ — {profile_label}\n\n"
+        "Напиши, какой документ собрать одним сообщением.\n\n"
+        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
+        f"{free_line}"
+    )
+
+
+def build_file_prompt_text(kind: str, profile: str = "medium", chat_id: int | None = None) -> str:
+    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
+    is_free_plan = False
+    if chat_id is not None:
+        is_free_plan = str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free"
+
+    if kind == "ppt":
+        footer = (
+            "Лимит Free: 1 короткий файл каждые 14 дней."
+            if is_free_plan
+            else f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
+        )
+        return (
+            f"Режим: Презентация — {profile_label}\n\n"
+            "Напиши, какую презентацию собрать одним сообщением.\n\n"
+            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
+            f"{footer}"
+        )
+    if kind == "sheet":
+        footer = (
+            "Лимит Free: 1 короткий файл каждые 14 дней."
+            if is_free_plan
+            else f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
+        )
+        return (
+            f"Режим: Таблица — {profile_label}\n\n"
+            "Напиши, какую таблицу собрать одним сообщением.\n\n"
+            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
+            f"{footer}"
+        )
+    footer = (
+        "Лимит Free: 1 короткий файл каждые 14 дней."
+        if is_free_plan
+        else f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
+    )
+    return (
+        f"Режим: Документ — {profile_label}\n\n"
+        "Напиши, какой документ собрать одним сообщением.\n\n"
+        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
+        f"{footer}"
+    )
+
+
 async def generate_image(prompt: str) -> ImageResult:
     payload = {
         "model": DEFAULT_IMAGE_MODEL.model,
@@ -6782,6 +7034,37 @@ def build_files_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
             },
         }
     ]
+
+
+def build_file_prompt_text(kind: str, profile: str = "medium", chat_id: int | None = None) -> str:
+    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
+    is_free_plan = False
+    if chat_id is not None:
+        is_free_plan = str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free"
+
+    if kind == "ppt":
+        footer = "Лимит Free: 1 короткий файл каждые 14 дней." if is_free_plan else f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
+        return (
+            f"Режим: Презентация — {profile_label}\n\n"
+            "Напиши, какую презентацию собрать одним сообщением.\n\n"
+            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
+            f"{footer}"
+        )
+    if kind == "sheet":
+        footer = "Лимит Free: 1 короткий файл каждые 14 дней." if is_free_plan else f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
+        return (
+            f"Режим: Таблица — {profile_label}\n\n"
+            "Напиши, какую таблицу собрать одним сообщением.\n\n"
+            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
+            f"{footer}"
+        )
+    footer = "Лимит Free: 1 короткий файл каждые 14 дней." if is_free_plan else f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
+    return (
+        f"Режим: Документ — {profile_label}\n\n"
+        "Напиши, какой документ собрать одним сообщением.\n\n"
+        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
+        f"{footer}"
+    )
 
 
 async def send_files_menu(chat_id: int, notify: bool = False) -> None:
@@ -9028,8 +9311,9 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             if callback_id:
                 await answer_callback(callback_id, "Неизвестный тип файла")
             return True
+        plan_name = str(user_profile(chat_id).get("plan", "free")).strip().lower()
         state.pending_file_kind[chat_id] = kind
-        state.pending_file_profile[chat_id] = "medium"
+        state.pending_file_profile[chat_id] = default_file_profile_for_plan(plan_name)
         await show_managed_content(
             chat_id,
             build_file_size_text(kind),
@@ -9047,11 +9331,22 @@ async def handle_callback(update: dict[str, Any]) -> bool:
             if callback_id:
                 await answer_callback(callback_id, "Неизвестный режим")
             return True
+        if str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free" and profile != "short":
+            await show_managed_content(
+                chat_id,
+                "На Free доступен только короткий файл раз в 14 дней. Средняя и полная версии открываются на платных тарифах.",
+                attachments=purchase_help_keyboard_for_row(user_profile(chat_id)),
+                callback_id=callback_id,
+                source_mid=source_mid,
+                page=UI_PAGE_FILES_MENU,
+                notification="Только короткий файл",
+            )
+            return True
         state.pending_file_kind[chat_id] = kind
         state.pending_file_profile[chat_id] = profile
         await show_managed_content(
             chat_id,
-            build_file_prompt_text(kind, profile),
+            build_file_prompt_text(kind, profile, chat_id),
             attachments=build_files_prompt_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
@@ -9063,10 +9358,10 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if payload in {"files:doc", "files:ppt", "files:sheet"}:
         kind = payload.split(":", 1)[1]
         state.pending_file_kind[chat_id] = kind
-        state.pending_file_profile[chat_id] = "medium"
+        state.pending_file_profile[chat_id] = default_file_profile_for_plan(str(user_profile(chat_id).get("plan", "free")))
         await show_managed_content(
             chat_id,
-            build_file_prompt_text(kind, "medium"),
+            build_file_prompt_text(kind, state.pending_file_profile[chat_id], chat_id),
             attachments=build_files_prompt_keyboard(),
             callback_id=callback_id,
             source_mid=source_mid,
@@ -10102,7 +10397,14 @@ async def process_update(update: dict[str, Any]) -> None:
         if not text.strip().startswith("/"):
             file_kind = looks_like_file_request(text)
             if file_kind:
-                file_profile = detect_file_profile_from_text(text)
+                file_profile = detect_file_profile_from_text(text, default_file_profile_for_plan(str(row.get("plan", "free"))))
+                if str(row.get("plan", "free")).strip().lower() == "free" and file_profile != "short":
+                    await max_send_message(
+                        chat_id,
+                        "На Free доступен только короткий файл раз в 14 дней. Средняя и полная версии открываются на платных тарифах.",
+                        attachments=purchase_help_keyboard_for_row(row),
+                    )
+                    return
                 if file_prompt_has_enough_detail(text):
                     await process_file_request(chat_id, file_kind, text, profile=file_profile)
                 else:
@@ -10110,7 +10412,7 @@ async def process_update(update: dict[str, Any]) -> None:
                     state.pending_file_profile[chat_id] = file_profile
                     await show_managed_content(
                         chat_id,
-                        build_file_prompt_text(file_kind, file_profile),
+                        build_file_prompt_text(file_kind, file_profile, chat_id),
                         attachments=build_files_prompt_keyboard(),
                         page=UI_PAGE_FILES_MENU,
                         push_history=False,
