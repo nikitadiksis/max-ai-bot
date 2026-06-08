@@ -12685,15 +12685,23 @@ async def admin_panel(
     session_id = resolve_admin_session(request, token)
     if not session_id:
         raise HTTPException(status_code=403, detail="forbidden")
-    response = HTMLResponse(
-        render_admin_panel_html_v2(
-            csrf_token=admin_csrf_token(session_id),
-            chat_id=chat_id,
-            request_id=request_id,
-            q=q,
-            payment_status=payment_status,
+
+    try:
+        response = HTMLResponse(
+            render_admin_panel_html_v2(
+                csrf_token=admin_csrf_token(session_id),
+                chat_id=chat_id,
+                request_id=request_id,
+                q=q,
+                payment_status=payment_status,
+            )
         )
-    )
+    except Exception as exc:
+        log.exception("admin_panel failed")
+        response = HTMLResponse(
+            render_admin_runtime_error_html("Ошибка админки", f"{type(exc).__name__}: {exc}"),
+            status_code=500,
+        )
     set_admin_cookie(response, session_id)
     return response
 
