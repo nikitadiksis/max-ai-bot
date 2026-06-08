@@ -1579,7 +1579,7 @@ class UserStore:
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (admin_panel_source, admin_panel_source, limit),
+                (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1674,7 +1674,7 @@ class UserStore:
                 ORDER BY u.updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (admin_panel_source, admin_panel_source, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
