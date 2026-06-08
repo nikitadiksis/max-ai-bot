@@ -6526,6 +6526,94 @@ async def build_web_research_context(user_prompt: str) -> str:
     return "\n".join(lines).strip()
 
 
+async def collect_web_research(user_prompt: str) -> tuple[list[dict[str, str]], str]:
+    query = normalized_file_topic(user_prompt)
+    results = await search_web_sources(query)
+    if not results:
+        return [], ""
+    lines = ["Ниже собраны внешние источники по теме. Используй их как фактическую основу и опирайся на них в выводах:"]
+    compact_results: list[dict[str, str]] = []
+    for idx, item in enumerate(results[:WEB_RESEARCH_MAX_RESULTS], start=1):
+        excerpt = ""
+        if idx <= WEB_RESEARCH_MAX_PAGES:
+            excerpt = await fetch_source_excerpt(item["url"])
+        compact_results.append(
+            {
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": item.get("snippet", ""),
+                "excerpt": excerpt,
+            }
+        )
+        lines.append(f"[Источник {idx}] {item['title']}")
+        lines.append(f"URL: {item['url']}")
+        if item.get("snippet"):
+            lines.append(f"Сниппет: {item['snippet']}")
+        if excerpt:
+            lines.append(f"Фрагмент страницы: {excerpt}")
+        lines.append("")
+    return compact_results, "\n".join(lines).strip()
+
+
+def build_research_doc_messages(profile: str, user_prompt: str, research_context: str) -> list[dict[str, Any]]:
+    headings = ", ".join(analysis_doc_headings(profile))
+    system_text = (
+        "Ты готовишь содержательный аналитический документ на русском языке по найденным источникам. "
+        "Нужен не план анализа и не методичка, а уже готовый результат с выводами. "
+        "Пиши обычным текстом, без JSON и без markdown code fences. "
+        "Используй явные заголовки разделов, короткие абзацы и списки. "
+        "Не начинай документ словами вроде 'ниже приведен анализ' или 'нужно дополнительно изучить'. "
+        "Если точных цифр в источниках нет, делай аккуратные оценочные выводы, но формулируй именно выводы по теме. "
+        f"Ориентировочная структура: {headings}."
+    )
+    user_text = (
+        f"Тема документа: {normalized_file_topic(user_prompt)}\n\n"
+        "Сделай документ как итоговый аналитический материал с выводами, а не как описание процесса анализа.\n\n"
+        f"{research_context}"
+    )
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def append_sources_section(spec: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
+    if not sources:
+        return spec
+    sections = spec.get("sections")
+    if not isinstance(sections, list):
+        sections = []
+        spec["sections"] = sections
+    bullets = []
+    for item in sources[: min(5, len(sources))]:
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if title and url:
+            bullets.append(f"{title} — {url}")
+        elif url:
+            bullets.append(url)
+    if bullets:
+        sections.append(
+            {
+                "heading": "Источники",
+                "paragraphs": ["Документ опирается на внешние материалы, собранные на момент генерации."],
+                "bullets": bullets,
+            }
+        )
+    return spec
+
+
+def best_file_generation_alias(row: dict[str, Any], kind: str, user_prompt: str) -> str:
+    plan_name = str(row.get("plan", "free"))
+    selected_alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
+    if kind == "doc" and file_request_needs_research(kind, user_prompt):
+        if text_model_allowed_for_plan(plan_name, "gemini"):
+            return "gemini"
+        if text_model_allowed_for_plan(plan_name, "gpt54"):
+            return "gpt54"
+    return selected_alias
+
+
 async def ask_openrouter_text_model(
     *,
     alias: str,
@@ -6897,10 +6985,22 @@ def fallback_file_spec(kind: str, user_prompt: str, profile: str = "medium") -> 
 async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt: str) -> tuple[dict[str, Any], TextAnswerResult]:
     row = user_profile(chat_id)
     plan_name = str(row.get("plan", "free"))
-    alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
+    alias = best_file_generation_alias(row, kind, user_prompt)
+    research_sources: list[dict[str, str]] = []
+    research_context = ""
+    if kind == "doc" and file_request_needs_research(kind, user_prompt):
+        research_sources, research_context = await collect_web_research(user_prompt)
+        if research_context:
+            research_messages = build_research_doc_messages(profile, user_prompt, research_context)
+            research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
+            research_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
+            if research_spec:
+                research_spec = append_sources_section(research_spec, research_sources)
+                return research_spec, research_result
     messages = build_file_generation_messages(kind, profile, user_prompt)
     if file_request_needs_research(kind, user_prompt):
-        research_context = await build_web_research_context(user_prompt)
+        if not research_context:
+            _, research_context = await collect_web_research(user_prompt)
         if research_context:
             messages.insert(
                 1,
