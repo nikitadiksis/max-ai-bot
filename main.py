@@ -6139,9 +6139,6 @@ async def complete_text_messages(
         else:
             raise
 
-    state.history(chat_id).append({"role": "user", "content": user_text})
-    state.history(chat_id).append({"role": "assistant", "content": answer})
-
     if total_tokens <= 0:
         estimated_prompt = estimate_tokens_from_messages(messages)
         total_tokens = estimated_prompt + max(0, completion_tokens)
