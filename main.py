@@ -20,7 +20,7 @@ import re
 import secrets
 import sqlite3
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiohttp
 from dotenv import load_dotenv
@@ -49,6 +49,21 @@ from runtime_support import (
     system_resource_snapshot as system_resource_snapshot_impl,
 )
 from storage_backend import StorageBackend, create_storage_backend
+
+
+def parse_bool_env(value: str | None, default: bool = False) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    with suppress(Exception):
+        return int(raw)
+    return default
+
 
 load_dotenv()
 
@@ -147,6 +162,10 @@ TOPUP_MEDIUM_CREDITS = int(os.getenv("TOPUP_MEDIUM_CREDITS", "3200"))
 TOPUP_LARGE_PRICE_RUB = int(os.getenv("TOPUP_LARGE_PRICE_RUB", "990"))
 TOPUP_LARGE_CREDITS = int(os.getenv("TOPUP_LARGE_CREDITS", "7000"))
 TOPUP_QUICK_CODE = os.getenv("TOPUP_QUICK_CODE", "medium").strip().lower() or "medium"
+WEB_RESEARCH_ENABLED = parse_bool_env(os.getenv("WEB_RESEARCH_ENABLED"), True)
+WEB_RESEARCH_MAX_RESULTS = max(2, int_env("WEB_RESEARCH_MAX_RESULTS", 5))
+WEB_RESEARCH_MAX_PAGES = max(1, int_env("WEB_RESEARCH_MAX_PAGES", 3))
+WEB_RESEARCH_PAGE_CHAR_LIMIT = max(800, int_env("WEB_RESEARCH_PAGE_CHAR_LIMIT", 2000))
 LOW_CREDITS_NUDGE_THRESHOLD_FREE = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_FREE", "10"))
 LOW_CREDITS_NUDGE_THRESHOLD_PAID = int(os.getenv("LOW_CREDITS_NUDGE_THRESHOLD_PAID", "120"))
 LOW_CREDITS_NUDGE_COOLDOWN_HOURS = int(os.getenv("LOW_CREDITS_NUDGE_COOLDOWN_HOURS", "18"))
@@ -6340,6 +6359,173 @@ def doc_spec_needs_enrichment(spec: dict[str, Any], user_prompt: str) -> bool:
     )
 
 
+def file_request_needs_research(kind: str, user_prompt: str) -> bool:
+    if not WEB_RESEARCH_ENABLED:
+        return False
+    topic_lc = normalized_file_topic(user_prompt).lower()
+    explicit_markers = (
+        "анализ",
+        "обзор",
+        "исслед",
+        "рын",
+        "конкурент",
+        "спрос",
+        "сравн",
+        "тенден",
+        "перспектив",
+        "оценк",
+        "факты",
+        "статист",
+    )
+    geographic_markers = (
+        "краснодар",
+        "москва",
+        "спб",
+        "санкт-петербург",
+        "росси",
+        "регион",
+        "город",
+        "край",
+        "область",
+    )
+    factual_subject_markers = (
+        "птиц",
+        "птицы",
+        "животн",
+        "отрасл",
+        "ниша",
+        "склад",
+        "контейнер",
+        "рынок",
+        "цены",
+    )
+    if any(marker in topic_lc for marker in explicit_markers):
+        return True
+    if kind in {"doc", "ppt"} and any(marker in topic_lc for marker in geographic_markers) and any(
+        marker in topic_lc for marker in factual_subject_markers
+    ):
+        return True
+    return False
+
+
+def clean_search_snippet(text: str) -> str:
+    value = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or ""))).strip()
+    return value[:400]
+
+
+def clean_page_text(text: str) -> str:
+    value = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text or "")
+    value = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", value)
+    value = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", value)
+    value = re.sub(r"(?is)<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def extract_duckduckgo_results(raw_html: str) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    patterns = [
+        re.compile(
+            r'(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?(?:<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>)(?P<snippet>.*?)(?:</a>|</div>)'
+        ),
+        re.compile(
+            r'(?is)<a[^>]+rel="nofollow"[^>]+class="[^"]*result-link[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?<td[^>]+class="result-snippet"[^>]*>(?P<snippet>.*?)</td>'
+        ),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(raw_html or ""):
+            href = html.unescape(match.group("href") or "").strip()
+            title = clean_search_snippet(match.group("title") or "")
+            snippet = clean_search_snippet(match.group("snippet") or "")
+            if not href or not title:
+                continue
+            if href.startswith("/"):
+                href = urljoin("https://duckduckgo.com", href)
+            parsed = urlparse(href)
+            if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+                qs = parse_qs(parsed.query)
+                href = qs.get("uddg", [href])[0]
+            href = html.unescape(href)
+            if not href.startswith("http"):
+                continue
+            if any(item.get("url") == href for item in results):
+                continue
+            results.append({"title": title, "url": href, "snippet": snippet})
+            if len(results) >= WEB_RESEARCH_MAX_RESULTS:
+                return results
+        if results:
+            return results
+    return results
+
+
+async def search_web_sources(query: str) -> list[dict[str, str]]:
+    session = await get_session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    search_variants = [
+        ("https://html.duckduckgo.com/html/", {"q": query}),
+        ("https://duckduckgo.com/html/", {"q": query}),
+    ]
+    for url, form in search_variants:
+        try:
+            async with state.max_api_semaphore:
+                async with session.post(url, headers=headers, data=form) as resp:
+                    raw_html = await resp.text()
+            if resp.status >= 400:
+                continue
+            results = extract_duckduckgo_results(raw_html)
+            if results:
+                return results
+        except Exception as exc:
+            log.warning("web search failed for %s: %s", url, exc)
+    return []
+
+
+async def fetch_source_excerpt(url: str) -> str:
+    try:
+        status, body, mime_type = await http_bytes_request_with_retries(
+            "GET",
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            semaphore=state.max_api_semaphore,
+            request_name="research_page",
+        )
+        if status >= 400:
+            return ""
+        if "html" not in (mime_type or "") and "text" not in (mime_type or ""):
+            return ""
+        text = clean_page_text(body.decode("utf-8", errors="ignore"))
+        if not text:
+            return ""
+        return text[:WEB_RESEARCH_PAGE_CHAR_LIMIT]
+    except Exception as exc:
+        log.warning("research fetch failed for %s: %s", url, exc)
+        return ""
+
+
+async def build_web_research_context(user_prompt: str) -> str:
+    query = normalized_file_topic(user_prompt)
+    results = await search_web_sources(query)
+    if not results:
+        return ""
+    lines = ["Ниже собраны внешние источники по теме. Используй их как фактическую основу и опирайся на них в выводах:"]
+    for idx, item in enumerate(results[:WEB_RESEARCH_MAX_RESULTS], start=1):
+        excerpt = ""
+        if idx <= WEB_RESEARCH_MAX_PAGES:
+            excerpt = await fetch_source_excerpt(item["url"])
+        lines.append(f"[Источник {idx}] {item['title']}")
+        lines.append(f"URL: {item['url']}")
+        if item.get("snippet"):
+            lines.append(f"Сниппет: {item['snippet']}")
+        if excerpt:
+            lines.append(f"Фрагмент страницы: {excerpt}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 async def ask_openrouter_text_model(
     *,
     alias: str,
@@ -6713,6 +6899,22 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     plan_name = str(row.get("plan", "free"))
     alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
     messages = build_file_generation_messages(kind, profile, user_prompt)
+    if file_request_needs_research(kind, user_prompt):
+        research_context = await build_web_research_context(user_prompt)
+        if research_context:
+            messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": (
+                        "Ниже будет фактическая база из внешних источников. "
+                        "Опирайся на нее при подготовке документа или презентации. "
+                        "Если источники не дают точных цифр, формулируй осторожные выводы, "
+                        "но не игнорируй найденные факты."
+                    ),
+                },
+            )
+            messages.append({"role": "user", "content": research_context})
     result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
     spec = extract_json_object(result.text)
     if kind == "doc":
