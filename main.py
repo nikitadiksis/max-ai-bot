@@ -6505,24 +6505,74 @@ def extract_duckduckgo_results(raw_html: str) -> list[dict[str, str]]:
     return results
 
 
+def extract_bing_results(raw_html: str) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    patterns = [
+        re.compile(
+            r'(?is)<li[^>]+class="[^"]*\bb_algo\b[^"]*"[^>]*>.*?<h2[^>]*>\s*<a[^>]+href="(?P<href>https?://[^"]+)"[^>]*>(?P<title>.*?)</a>\s*</h2>.*?(?:<p>|<div[^>]+class="[^"]*\bb_caption\b[^"]*"[^>]*>.*?<p>)(?P<snippet>.*?)(?:</p>|</div>)'
+        ),
+        re.compile(
+            r'(?is)<a[^>]+href="(?P<href>https?://[^"]+)"[^>]*h="ID=SERP,[^"]+"[^>]*>(?P<title>.*?)</a>.*?<p>(?P<snippet>.*?)</p>'
+        ),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(raw_html or ""):
+            href = html.unescape(match.group("href") or "").strip()
+            title = clean_search_snippet(match.group("title") or "")
+            snippet = clean_search_snippet(match.group("snippet") or "")
+            if not href or not title:
+                continue
+            if not href.startswith("http"):
+                continue
+            parsed = urlparse(href)
+            if any(bad in parsed.netloc for bad in ("bing.com", "microsoft.com")):
+                continue
+            if any(item.get("url") == href for item in results):
+                continue
+            results.append({"title": title, "url": href, "snippet": snippet})
+            if len(results) >= WEB_RESEARCH_MAX_RESULTS:
+                return results
+        if results:
+            return results
+    return results
+
+
 async def search_web_sources(query: str) -> list[dict[str, str]]:
     session = await get_session()
-    headers = {
+    base_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        "Content-Type": "application/x-www-form-urlencoded",
     }
-    search_variants = [
-        ("https://html.duckduckgo.com/html/", {"q": query}),
-        ("https://duckduckgo.com/html/", {"q": query}),
+    post_variants = [
+        ("https://html.duckduckgo.com/html/", {"q": query}, extract_duckduckgo_results),
+        ("https://duckduckgo.com/html/", {"q": query}, extract_duckduckgo_results),
     ]
-    for url, form in search_variants:
+    for url, form, extractor in post_variants:
         try:
+            headers = dict(base_headers)
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
             async with state.max_api_semaphore:
-                async with session.post(url, headers=headers, data=form) as resp:
+                async with session.post(url, headers=headers, data=form, allow_redirects=True) as resp:
                     raw_html = await resp.text()
             if resp.status >= 400:
                 continue
-            results = extract_duckduckgo_results(raw_html)
+            results = extractor(raw_html)
+            if results:
+                return results
+        except Exception as exc:
+            log.warning("web search failed for %s: %s", url, exc)
+
+    get_variants = [
+        (f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ru-RU", extract_bing_results),
+        (f"https://www.bing.com/search?q={quote_plus(query)}&cc=ru", extract_bing_results),
+    ]
+    for url, extractor in get_variants:
+        try:
+            async with state.max_api_semaphore:
+                async with session.get(url, headers=base_headers, allow_redirects=True) as resp:
+                    raw_html = await resp.text()
+            if resp.status >= 400:
+                continue
+            results = extractor(raw_html)
             if results:
                 return results
         except Exception as exc:
