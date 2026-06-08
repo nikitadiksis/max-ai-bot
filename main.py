@@ -11808,6 +11808,34 @@ def render_admin_login_html(error: str = "") -> str:
 </html>"""
 
 
+def render_admin_runtime_error_html(title: str, message: str) -> str:
+    esc = html.escape
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{esc(title)}</title>
+  <link rel="stylesheet" href="/assets/style.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <span class="badge">Закрытая админка</span>
+      </div>
+      <h1>{esc(title)}</h1>
+      <p>Страница не собрана. Ниже точная причина ошибки.</p>
+      <pre style="white-space:pre-wrap;word-break:break-word;background:#f7f9fc;border:1px solid var(--line);border-radius:12px;padding:16px;">{esc(message)}</pre>
+      <div class="actions">
+        <a class="btn" href="/analytics">Назад</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
     report = state.user_store.kpi_report(days=days)
     esc = html.escape
@@ -12560,7 +12588,14 @@ async def analytics_page(request: Request, token: str = "", days: int = 30) -> H
     if not session_id:
         return HTMLResponse(render_admin_login_html())
 
-    response = HTMLResponse(render_admin_analytics_html_v2(token="", days=days))
+    try:
+        response = HTMLResponse(render_admin_analytics_html_v2(token="", days=days))
+    except Exception as exc:
+        log.exception("analytics_page failed")
+        response = HTMLResponse(
+            render_admin_runtime_error_html("Ошибка аналитики", f"{type(exc).__name__}: {exc}"),
+            status_code=500,
+        )
     set_admin_cookie(response, session_id)
     return response
 
