@@ -20,7 +20,7 @@ import re
 import secrets
 import sqlite3
 from typing import Any
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, quote, quote_plus, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiohttp
 from dotenv import load_dotenv
