@@ -6272,85 +6272,64 @@ def doc_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium
     }
 
 
-def ppt_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium") -> dict[str, Any] | None:
-    raw = (text or "").strip()
-    if not raw:
+def ppt_spec_from_doc_spec(doc_spec: dict[str, Any], profile: str = "medium") -> dict[str, Any] | None:
+    if not isinstance(doc_spec, dict):
         return None
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-    if not raw:
+    sections = doc_spec.get("sections")
+    if not isinstance(sections, list) or not sections:
         return None
 
-    topic = normalized_file_topic(user_prompt)
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", raw) if block.strip()]
+    topic = str(doc_spec.get("subtitle") or doc_spec.get("title") or "").strip()
     slides: list[dict[str, Any]] = []
-    heading_hints = (
-        "введение",
-        "обзор",
-        "резюме",
-        "вывод",
-        "рекоменда",
-        "риски",
-        "спрос",
-        "предлож",
-        "цены",
-        "эконом",
-        "конкур",
-        "рын",
-        "сегмент",
-        "клиент",
-        "контекст",
-    )
+    slide_limit = {"short": 5, "medium": 7, "full": 9}.get(profile, 7)
 
-    for index, block in enumerate(blocks[:10], start=1):
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if not lines:
+    for section in sections:
+        if not isinstance(section, dict):
             continue
-        heading = ""
-        content_lines = lines
-        first_line = re.sub(r"^[#>\-\*\d\.\)\s]+", "", lines[0]).strip()
-        if first_line and (
-            lines[0].startswith("#")
-            or lines[0].endswith(":")
-            or (len(first_line) <= 80 and any(first_line.lower().startswith(hint) for hint in heading_hints))
-        ):
-            heading = first_line.rstrip(":")
-            content_lines = lines[1:]
+        heading = str(section.get("heading") or "").strip()
+        if not heading:
+            continue
 
         bullets: list[str] = []
-        note = ""
-        for line in content_lines:
-            cleaned = line.strip()
+        for paragraph in section.get("paragraphs", []) or []:
+            cleaned = re.sub(r"\s+", " ", str(paragraph).strip())
             if not cleaned:
                 continue
-            if re.match(r"^[-*•]\s+", cleaned):
-                bullets.append(re.sub(r"^[-*•]\s+", "", cleaned).strip())
-                continue
-            if re.match(r"^\d+[\.\)]\s+", cleaned):
-                bullets.append(re.sub(r"^\d+[\.\)]\s+", "", cleaned).strip())
-                continue
             sentences = [item.strip(" -•") for item in re.split(r"(?<=[.!?])\s+", cleaned) if item.strip(" -•")]
-            if sentences:
-                bullets.extend(sentences[:2])
-            elif not note:
-                note = cleaned
+            bullets.extend(sentences[:2] if sentences else [cleaned])
+        for bullet in section.get("bullets", []) or []:
+            cleaned = re.sub(r"\s+", " ", str(bullet).strip())
+            if cleaned:
+                bullets.append(cleaned)
 
-        bullets = [bullet for bullet in bullets if bullet][:4]
-        if not heading:
-            heading = "Ключевой вывод" if index == 1 else f"Слайд {index}"
-        if bullets:
-            slides.append({"title": heading, "bullets": bullets, "note": note})
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for bullet in bullets:
+            key = bullet.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(bullet)
+        deduped = deduped[:5]
+        if deduped:
+            slides.append({"title": heading, "bullets": deduped, "note": ""})
 
     if len(slides) < 2:
         return None
 
-    slide_limit = {"short": 5, "medium": 7, "full": 9}.get(profile, 7)
+    source_slide = None
+    for slide in slides:
+        if str(slide.get("title") or "").strip().lower() == "источники":
+            source_slide = slide
+            break
+    visible_slides = [slide for slide in slides if slide is not source_slide][:slide_limit]
+    if source_slide and all(slide is not source_slide for slide in visible_slides):
+        visible_slides.append(source_slide)
+
     return {
-        "title": "Презентация",
+        "title": default_file_title("ppt", topic or "Презентация"),
         "subtitle": topic,
-        "slides": slides[:slide_limit],
+        "slides": visible_slides,
     }
 
 
@@ -6569,26 +6548,6 @@ async def fetch_source_excerpt(url: str) -> str:
         return ""
 
 
-async def build_web_research_context(user_prompt: str) -> str:
-    query = normalized_file_topic(user_prompt)
-    results = await search_web_sources(query)
-    if not results:
-        return ""
-    lines = ["Ниже собраны внешние источники по теме. Используй их как фактическую основу и опирайся на них в выводах:"]
-    for idx, item in enumerate(results[:WEB_RESEARCH_MAX_RESULTS], start=1):
-        excerpt = ""
-        if idx <= WEB_RESEARCH_MAX_PAGES:
-            excerpt = await fetch_source_excerpt(item["url"])
-        lines.append(f"[Источник {idx}] {item['title']}")
-        lines.append(f"URL: {item['url']}")
-        if item.get("snippet"):
-            lines.append(f"Сниппет: {item['snippet']}")
-        if excerpt:
-            lines.append(f"Фрагмент страницы: {excerpt}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
 async def collect_web_research(user_prompt: str) -> tuple[list[dict[str, str]], str]:
     aggregated: list[dict[str, str]] = []
     for query in build_research_queries(user_prompt):
@@ -6640,31 +6599,6 @@ def build_research_doc_messages(profile: str, user_prompt: str, research_context
     user_text = (
         f"Тема документа: {normalized_file_topic(user_prompt)}\n\n"
         "Сделай документ как итоговый аналитический материал с выводами, а не как описание процесса анализа.\n\n"
-        f"{research_context}"
-    )
-    return [
-        {"role": "system", "content": system_text},
-        {"role": "user", "content": user_text},
-    ]
-
-
-def build_research_ppt_messages(profile: str, user_prompt: str, research_context: str) -> list[dict[str, Any]]:
-    slide_targets = {"short": "4-5", "medium": "6-8", "full": "8-10"}.get(profile, "6-8")
-    system_text = (
-        "Ты готовишь содержательную презентацию по внешним источникам. "
-        "Верни обычный аналитический текст с явными заголовками будущих слайдов, короткими абзацами и списками. "
-        "Не возвращай JSON, markdown-таблицы и code fences. "
-        "Нужен не план выступления и не общие фразы, а слайды с реальными выводами и фактами из найденных источников. "
-        "Каждый слайд должен содержать конкретные тезисы, а не заглушки вроде 'Главная идея' или 'Что важно учесть'. "
-        "Если запрос про рынок или нишу, строй презентацию как рыночный разбор: контекст рынка, спрос и сегменты клиентов, конкуренты и альтернативы, "
-        "ценовые сигналы и экономика, риски запуска, итоговый вывод и рекомендация по запуску. "
-        "В каждом буллете формулируй именно результат или наблюдение. Избегай фраз 'источники говорят', 'логично тестировать', 'важно учесть'. "
-        f"Сделай материал на {slide_targets} содержательных слайдов плюс финальный слайд с выводом."
-    )
-    user_text = (
-        f"Тема презентации: {normalized_file_topic(user_prompt)}\n\n"
-        "Сделай презентацию именно с результатами анализа и выводами по теме. "
-        "Для market-analysis покажи отдельными слайдами: где спрос, кто клиент, с кем конкурировать, какие ценовые ориентиры и в чем риск запуска.\n\n"
         f"{research_context}"
     )
     return [
@@ -6750,6 +6684,11 @@ def fallback_research_doc_spec(user_prompt: str, sources: list[dict[str, str]], 
 
 
 def fallback_research_ppt_spec(user_prompt: str, sources: list[dict[str, str]], profile: str = "medium") -> dict[str, Any]:
+    doc_fallback = fallback_research_doc_spec(user_prompt, sources, profile)
+    converted = ppt_spec_from_doc_spec(doc_fallback, profile)
+    if converted:
+        return converted
+
     topic = normalized_file_topic(user_prompt)
     facts = source_fact_bullets(sources, limit=8)
     slide_limit = {"short": 4, "medium": 6, "full": 8}.get(profile, 6)
@@ -6895,6 +6834,20 @@ def append_sources_section(spec: dict[str, Any], sources: list[dict[str, str]]) 
                 "bullets": bullets,
             }
         )
+    return spec
+
+
+def mark_file_spec_metadata(
+    spec: dict[str, Any],
+    *,
+    research_used: bool,
+    research_sources_count: int,
+    research_path: str = "",
+) -> dict[str, Any]:
+    spec["_research_used"] = bool(research_used)
+    spec["_research_sources_count"] = int(research_sources_count)
+    if research_path:
+        spec["_research_path"] = research_path
     return spec
 
 
@@ -7225,35 +7178,54 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
                 research_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
                 if research_spec and len(research_spec.get("sections", []) or []) >= 3:
                     research_spec = append_sources_section(research_spec, research_sources)
-                    return research_spec, research_result
-                return fallback_research_doc_spec(user_prompt, research_sources, profile), research_result
+                    return mark_file_spec_metadata(
+                        research_spec,
+                        research_used=True,
+                        research_sources_count=len(research_sources),
+                        research_path="doc_research_model",
+                    ), research_result
+                return mark_file_spec_metadata(
+                    fallback_research_doc_spec(user_prompt, research_sources, profile),
+                    research_used=True,
+                    research_sources_count=len(research_sources),
+                    research_path="doc_research_fallback",
+                ), research_result
             if kind == "ppt":
-                research_messages = build_research_ppt_messages(profile, user_prompt, research_context)
+                research_messages = build_research_doc_messages(profile, user_prompt, research_context)
                 research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
-                research_spec = ppt_spec_from_plain_text(user_prompt, research_result.text, profile)
-                if isinstance(research_spec, dict) and isinstance(research_spec.get("slides"), list) and len(research_spec.get("slides") or []) >= 4:
-                    source_slide = {
-                        "title": "Источники",
-                        "bullets": [
-                            f"{str(item.get('title') or '').strip()} — {str(item.get('url') or '').strip()}"
-                            for item in research_sources[:5]
-                            if str(item.get("url") or "").strip()
-                        ],
-                        "note": "",
-                    }
-                    if source_slide["bullets"]:
-                        slides = research_spec.get("slides") or []
-                        if not any(str(slide.get("title") or "").strip().lower() == "источники" for slide in slides if isinstance(slide, dict)):
-                            slides.append(source_slide)
-                            research_spec["slides"] = slides
-                    return research_spec, research_result
-                return fallback_research_ppt_spec(user_prompt, research_sources, profile), research_result
+                research_doc_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
+                if research_doc_spec and len(research_doc_spec.get("sections", []) or []) >= 3:
+                    research_doc_spec = append_sources_section(research_doc_spec, research_sources)
+                    research_spec = ppt_spec_from_doc_spec(research_doc_spec, profile)
+                    if isinstance(research_spec, dict) and isinstance(research_spec.get("slides"), list) and len(research_spec.get("slides") or []) >= 4:
+                        return mark_file_spec_metadata(
+                            research_spec,
+                            research_used=True,
+                            research_sources_count=len(research_sources),
+                            research_path="ppt_from_doc_research_model",
+                        ), research_result
+                return mark_file_spec_metadata(
+                    fallback_research_ppt_spec(user_prompt, research_sources, profile),
+                    research_used=True,
+                    research_sources_count=len(research_sources),
+                    research_path="ppt_from_doc_research_fallback",
+                ), research_result
         if kind == "doc":
             empty_result = TextAnswerResult(text="", prompt_tokens=0, completion_tokens=0, total_tokens=0)
-            return fallback_research_doc_spec(user_prompt, research_sources, profile), empty_result
+            return mark_file_spec_metadata(
+                fallback_research_doc_spec(user_prompt, research_sources, profile),
+                research_used=True,
+                research_sources_count=len(research_sources),
+                research_path="doc_research_empty",
+            ), empty_result
         if kind == "ppt":
             empty_result = TextAnswerResult(text="", prompt_tokens=0, completion_tokens=0, total_tokens=0)
-            return fallback_research_ppt_spec(user_prompt, research_sources, profile), empty_result
+            return mark_file_spec_metadata(
+                fallback_research_ppt_spec(user_prompt, research_sources, profile),
+                research_used=True,
+                research_sources_count=len(research_sources),
+                research_path="ppt_research_empty",
+            ), empty_result
     messages = build_file_generation_messages(kind, profile, user_prompt)
     if research_needed:
         if not research_context:
@@ -7282,8 +7254,12 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     if not isinstance(spec, dict):
         spec = fallback_file_spec(kind, user_prompt, profile)
     if isinstance(spec, dict):
-        spec["_research_used"] = bool(research_needed)
-        spec["_research_sources_count"] = len(research_sources)
+        spec = mark_file_spec_metadata(
+            spec,
+            research_used=bool(research_needed),
+            research_sources_count=len(research_sources),
+            research_path="generic_generation",
+        )
     return spec, result
 
 
@@ -7480,6 +7456,7 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
         final_row = user_profile(chat_id)
         research_flag = int(bool(spec.get("_research_used")))
         research_sources_count = int(spec.get("_research_sources_count", 0) or 0)
+        research_path = str(spec.get("_research_path") or "").strip()
         state.user_store.record_usage_event(
             chat_id=chat_id,
             event_type="file_request",
@@ -7487,7 +7464,7 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
             model_alias=str(final_row.get("selected_model_alias") or ""),
             credits_spent=cost,
             tokens_total=int(result.total_tokens),
-            details=f"kind={kind};profile={profile};title={title};research={research_flag};sources={research_sources_count}",
+            details=f"kind={kind};profile={profile};title={title};research={research_flag};sources={research_sources_count};path={research_path}",
         )
         return True
     except Exception:
