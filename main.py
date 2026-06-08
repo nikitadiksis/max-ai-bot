@@ -6426,6 +6426,8 @@ def build_research_queries(user_prompt: str) -> list[str]:
     if "краснодар" in topic_lc:
         queries.append(f"{topic} Краснодар цена аренда")
         queries.append(f"{topic} Краснодар конкуренты")
+        queries.append(f"{topic} Краснодар объявления")
+        queries.append(f"{topic} Краснодар Авито")
     if "контейнер" in topic_lc and "склад" in topic_lc:
         queries.extend(
             [
@@ -6433,6 +6435,8 @@ def build_research_queries(user_prompt: str) -> list[str]:
                 "морской контейнер склад краснодар купить аренда",
                 "мини склад краснодар цена аренда",
                 "складской контейнер краснодар",
+                "self storage краснодар аренда мини склад",
+                "авито краснодар контейнер склад аренда",
             ]
         )
 
@@ -6593,7 +6597,9 @@ def build_research_doc_messages(profile: str, user_prompt: str, research_context
         "Пиши обычным текстом, без JSON и без markdown code fences. "
         "Используй явные заголовки разделов, короткие абзацы и списки. "
         "Не начинай документ словами вроде 'ниже приведен анализ' или 'нужно дополнительно изучить'. "
+        "Если в источниках есть названия площадок, объявлений, районов, ценовые сигналы, типы объектов или конкурентов — обязательно встраивай их в текст. "
         "Если точных цифр в источниках нет, делай аккуратные оценочные выводы, но формулируй именно выводы по теме. "
+        "Избегай воды и общих фраз вроде 'важно учесть', 'логично протестировать', 'источники говорят'. "
         f"Ориентировочная структура: {headings}."
     )
     user_text = (
@@ -6607,69 +6613,194 @@ def build_research_doc_messages(profile: str, user_prompt: str, research_context
     ]
 
 
-def source_fact_bullets(sources: list[dict[str, str]], limit: int = 6) -> list[str]:
-    bullets: list[str] = []
+def split_research_sentences(text: str) -> list[str]:
+    raw = re.sub(r"\s+", " ", text or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"(?<=[.!?;])\s+|(?<=\))\s+", raw)
+    return [part.strip(" -•\t\r\n") for part in parts if part.strip(" -•\t\r\n")]
+
+
+def score_research_fact(sentence: str, topic: str = "") -> int:
+    value = (sentence or "").strip()
+    if not value:
+        return -10
+    lc = value.lower()
+    score = 0
+    if len(value) >= 45:
+        score += 1
+    if any(ch.isdigit() for ch in value):
+        score += 3
+    if re.search(r"\b\d+[.,]?\d*\s*(руб|₽|р/мес|мес|м2|м²|кв\.?\s*м)\b", lc):
+        score += 4
+    if any(marker in lc for marker in ("краснодар", "район", "улиц", "локац", "промзон", "выезд")):
+        score += 2
+    if any(marker in lc for marker in ("аренда", "цена", "стоимость", "тариф", "купить", "продажа")):
+        score += 2
+    if any(marker in lc for marker in ("склад", "мини-склад", "бокс", "контейнер", "self storage", "хранен")):
+        score += 2
+    if any(marker in lc for marker in ("авито", "cian", "циан", "2гис", "яндекс", "объявлен")):
+        score += 1
+    if topic:
+        topic_lc = topic.lower()
+        overlap = [word for word in re.findall(r"[а-яa-z0-9-]{4,}", topic_lc) if word in lc]
+        score += min(len(overlap), 3)
+    generic_penalties = (
+        "источники говорят",
+        "логично",
+        "важно учесть",
+        "следующий шаг",
+        "ключевой вопрос",
+        "поисковая выдача",
+        "тема выглядит",
+        "нишу стоит",
+    )
+    if any(marker in lc for marker in generic_penalties):
+        score -= 3
+    if len(value) <= 28:
+        score -= 1
+    return score
+
+
+def source_fact_bullets(sources: list[dict[str, str]], limit: int = 6, topic: str = "") -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
     for item in sources:
-        snippet = str(item.get("snippet") or "").strip()
-        excerpt = str(item.get("excerpt") or "").strip()
         title = str(item.get("title") or "").strip()
-        fact = snippet or excerpt or title
-        fact = re.sub(r"\s+", " ", fact).strip()
-        if not fact:
+        for raw_text in (item.get("snippet") or "", item.get("excerpt") or ""):
+            for sentence in split_research_sentences(str(raw_text)):
+                cleaned = re.sub(r"\s+", " ", sentence).strip()
+                if not cleaned:
+                    continue
+                if title and title.lower() not in cleaned.lower():
+                    cleaned = f"{title}: {cleaned}"
+                cleaned = cleaned[:260]
+                key = cleaned.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                score = score_research_fact(cleaned, topic)
+                if score < 1:
+                    continue
+                candidates.append((score, cleaned))
+        if title:
+            title_fact = title[:180]
+            key = title_fact.lower()
+            if key not in seen:
+                seen.add(key)
+                score = score_research_fact(title_fact, topic)
+                if score >= 2:
+                    candidates.append((score, title_fact))
+
+    candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    bullets: list[str] = []
+    used_keys: set[str] = set()
+    for _, fact in candidates:
+        key = fact.lower()
+        if key in used_keys:
             continue
-        if title and snippet and title.lower() not in fact.lower():
-            fact = f"{title}: {fact}"
-        fact = fact[:220]
-        if fact and fact not in bullets:
-            bullets.append(fact)
+        used_keys.add(key)
+        bullets.append(fact)
         if len(bullets) >= limit:
             break
     return bullets
 
 
+def research_doc_spec_is_generic(spec: dict[str, Any], user_prompt: str) -> bool:
+    sections = spec.get("sections")
+    if not isinstance(sections, list) or len(sections) < 3:
+        return True
+    all_text_parts: list[str] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        all_text_parts.append(str(section.get("heading") or ""))
+        all_text_parts.extend(str(item) for item in (section.get("paragraphs") or []))
+        all_text_parts.extend(str(item) for item in (section.get("bullets") or []))
+    combined = " ".join(all_text_parts).lower()
+    if not combined.strip():
+        return True
+    strong_signals = 0
+    if any(ch.isdigit() for ch in combined):
+        strong_signals += 1
+    if "краснодар" in combined:
+        strong_signals += 1
+    if any(marker in combined for marker in ("аренда", "цена", "стоимость", "авито", "мини-склад", "бокс", "контейнер")):
+        strong_signals += 1
+    generic_markers = (
+        "поисковая выдача",
+        "источники говорят",
+        "логично",
+        "важно учесть",
+        "следующий шаг",
+        "тема выглядит",
+        "нишу стоит",
+        "стоит рассматривать",
+    )
+    generic_hits = sum(1 for marker in generic_markers if marker in combined)
+    topic_lc = normalized_file_topic(user_prompt).lower()
+    analytical_topic = any(marker in topic_lc for marker in ("анализ", "рын", "конкур", "спрос", "обзор", "исслед"))
+    if analytical_topic and strong_signals < 2:
+        return True
+    return generic_hits >= 2 and strong_signals < 3
+
+
 def fallback_research_doc_spec(user_prompt: str, sources: list[dict[str, str]], profile: str = "medium") -> dict[str, Any]:
     topic = normalized_file_topic(user_prompt)
-    facts = source_fact_bullets(sources, limit=8)
-    market_facts = facts[:3] or ["По найденным источникам тема связана с реальным локальным спросом и складской инфраструктурой."]
-    competition_facts = facts[3:6] or ["В результатах поиска встречаются как складская недвижимость, так и альтернативные форматы хранения."]
+    facts = source_fact_bullets(sources, limit=10, topic=topic)
+    demand_facts = [fact for fact in facts if any(marker in fact.lower() for marker in ("спрос", "хранен", "клиент", "склад", "контейнер"))]
+    competitor_facts = [fact for fact in facts if any(marker in fact.lower() for marker in ("конкур", "авито", "циан", "cian", "мини-склад", "бокс", "объявлен"))]
+    price_facts = [fact for fact in facts if any(ch.isdigit() for ch in fact) or any(marker in fact.lower() for marker in ("цена", "аренда", "стоимость", "руб", "₽"))]
+    market_facts = demand_facts[:3] or facts[:3] or ["По найденным источникам тема связана с реальным локальным спросом и складской инфраструктурой."]
+    competition_facts = competitor_facts[:3] or facts[3:6] or ["В результатах поиска встречаются как складская недвижимость, так и альтернативные форматы хранения."]
+    economy_facts = price_facts[:3] or facts[6:9] or ["Для вывода по запуску нужны локальные ценовые сигналы: аренда площадки, цена альтернатив и стоимость доработки формата."]
     source_titles = [str(item.get("title") or "").strip() for item in sources[:3] if str(item.get("title") or "").strip()]
     sections = [
         {
-            "heading": "Резюме",
+            "heading": "Рынок и локальный контекст",
             "paragraphs": [
-                f"Документ подготовлен по теме: {topic}. Ниже собраны выводы на основе найденных внешних материалов."
+                f"Документ подготовлен по теме: {topic}. Ниже собраны выводы на основе найденных внешних материалов и локальных рыночных сигналов."
             ],
             "bullets": market_facts[:3],
         },
         {
-            "heading": "Факты из найденных источников",
+            "heading": "Конкуренты и альтернативы",
             "paragraphs": [
-                "Внешние материалы указывают на состояние рынка, спрос и смежную складскую инфраструктуру в регионе."
+                "Для оценки ниши важно сравнивать контейнерный формат не абстрактно, а с ближайшими заменителями в том же городе и ценовом диапазоне."
             ],
-            "bullets": facts[:6],
+            "bullets": competition_facts[:4],
         },
         {
-            "heading": "Интерпретация и вывод",
+            "heading": "Ценовые сигналы и экономика",
             "paragraphs": [
-                "По совокупности найденных сигналов нишу стоит рассматривать как локальный формат хранения с потенциалом там, "
-                "где клиенту важны доступность, гибкость и быстрый запуск. Однако окончательное решение стоит принимать после проверки "
-                "ставок, конкретной локации и силы прямых альтернатив."
+                "Экономика в такой нише обычно упирается в три вещи: стоимость площадки, ценовой уровень альтернатив и фактическую загрузку."
             ],
-            "bullets": competition_facts[:3] + (["Ключевые источники: " + "; ".join(source_titles)] if source_titles else []),
+            "bullets": economy_facts[:4],
+        },
+        {
+            "heading": "Вывод по запуску",
+            "paragraphs": [
+                "Если локальные сигналы показывают, что у контейнерного формата есть ценовое или логистическое преимущество перед мини-складами и обычной арендой, нишу можно тестировать как пилот."
+            ],
+            "bullets": [
+                "Сильный сценарий — запуск не на весь город, а через 1–2 конкретные точки с понятным спросом и доступом.",
+                "Слабый сценарий — когда контейнер не дает заметной экономии или удобства относительно мини-складов, боксов и обычной аренды.",
+                *(["Ключевые источники: " + "; ".join(source_titles)] if source_titles else []),
+            ],
         },
     ]
     if profile != "short":
         sections.insert(
-            2,
+            3,
             {
                 "heading": "Риски и ограничения",
                 "paragraphs": [
-                    "Поисковая выдача показывает смежный, а не идеально точечный рынок, поэтому часть выводов остается оценочной и требует полевой проверки."
+                    "Даже хорошая поисковая выдача не заменяет ручную проверку цен, локаций и прямых конкурентов, поэтому часть выводов остается оценочной."
                 ],
                 "bullets": [
-                    "Часть источников относится к складской недвижимости шире, а не только к контейнерам",
-                    "Реальные цены и загрузку лучше дополнительно сверять по локальным площадкам и прямым предложениям",
-                    "Финальная экономика сильно зависит от конкретной площадки и условий доступа",
+                    "Часть найденных материалов относится к складской недвижимости шире, а не только к контейнерному формату.",
+                    "Реальные ставки и загрузку лучше дополнительно сверять по локальным площадкам, объявлениям и прямым предложениям.",
+                    "Финальная экономика сильно зависит от конкретной площадки, доступа для транспорта и сценария использования.",
                 ],
             },
         )
@@ -7176,7 +7307,7 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
                 research_messages = build_research_doc_messages(profile, user_prompt, research_context)
                 research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
                 research_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
-                if research_spec and len(research_spec.get("sections", []) or []) >= 3:
+                if research_spec and len(research_spec.get("sections", []) or []) >= 3 and not research_doc_spec_is_generic(research_spec, user_prompt):
                     research_spec = append_sources_section(research_spec, research_sources)
                     return mark_file_spec_metadata(
                         research_spec,
@@ -7194,7 +7325,7 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
                 research_messages = build_research_doc_messages(profile, user_prompt, research_context)
                 research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
                 research_doc_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
-                if research_doc_spec and len(research_doc_spec.get("sections", []) or []) >= 3:
+                if research_doc_spec and len(research_doc_spec.get("sections", []) or []) >= 3 and not research_doc_spec_is_generic(research_doc_spec, user_prompt):
                     research_doc_spec = append_sources_section(research_doc_spec, research_sources)
                     research_spec = ppt_spec_from_doc_spec(research_doc_spec, profile)
                     if isinstance(research_spec, dict) and isinstance(research_spec.get("slides"), list) and len(research_spec.get("slides") or []) >= 4:
