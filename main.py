@@ -7155,7 +7155,8 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     alias = best_file_generation_alias(row, kind, user_prompt)
     research_sources: list[dict[str, str]] = []
     research_context = ""
-    if kind in {"doc", "ppt"} and file_request_needs_research(kind, user_prompt):
+    research_needed = kind in {"doc", "ppt"} and file_request_needs_research(kind, user_prompt)
+    if research_needed:
         research_sources, research_context = await collect_web_research(user_prompt)
         if research_context:
             if kind == "doc":
@@ -7187,8 +7188,14 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
                             research_spec["slides"] = slides
                     return research_spec, research_result
                 return fallback_research_ppt_spec(user_prompt, research_sources, profile), research_result
+        if kind == "doc":
+            empty_result = TextAnswerResult(text="", prompt_tokens=0, completion_tokens=0, total_tokens=0)
+            return fallback_research_doc_spec(user_prompt, research_sources, profile), empty_result
+        if kind == "ppt":
+            empty_result = TextAnswerResult(text="", prompt_tokens=0, completion_tokens=0, total_tokens=0)
+            return fallback_research_ppt_spec(user_prompt, research_sources, profile), empty_result
     messages = build_file_generation_messages(kind, profile, user_prompt)
-    if file_request_needs_research(kind, user_prompt):
+    if research_needed:
         if not research_context:
             _, research_context = await collect_web_research(user_prompt)
         if research_context:
@@ -7214,6 +7221,9 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
             spec = fallback_file_spec(kind, user_prompt, profile)
     if not isinstance(spec, dict):
         spec = fallback_file_spec(kind, user_prompt, profile)
+    if isinstance(spec, dict):
+        spec["_research_used"] = bool(research_needed)
+        spec["_research_sources_count"] = len(research_sources)
     return spec, result
 
 
@@ -7383,6 +7393,8 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
         filename = f"{sanitize_filename_part(title, FILE_KIND_LABELS.get(kind, 'file'))}.{FILE_KIND_EXTENSIONS.get(kind, 'bin')}"
         await send_generated_file(chat_id, kind=kind, title=title, file_bytes=file_bytes, filename=filename)
         final_row = user_profile(chat_id)
+        research_flag = int(bool(spec.get("_research_used")))
+        research_sources_count = int(spec.get("_research_sources_count", 0) or 0)
         state.user_store.record_usage_event(
             chat_id=chat_id,
             event_type="file_request",
@@ -7390,7 +7402,7 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
             model_alias=str(final_row.get("selected_model_alias") or ""),
             credits_spent=cost,
             tokens_total=int(result.total_tokens),
-            details=f"kind={kind};profile={profile};title={title}",
+            details=f"kind={kind};profile={profile};title={title};research={research_flag};sources={research_sources_count}",
         )
         return True
     except Exception:
@@ -7459,6 +7471,8 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
         if is_free_plan:
             consume_limit(chat_id, "files")
         final_row = user_profile(chat_id)
+        research_flag = int(bool(spec.get("_research_used")))
+        research_sources_count = int(spec.get("_research_sources_count", 0) or 0)
         state.user_store.record_usage_event(
             chat_id=chat_id,
             event_type="file_request",
@@ -7466,7 +7480,7 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
             model_alias=str(final_row.get("selected_model_alias") or ""),
             credits_spent=cost,
             tokens_total=int(result.total_tokens),
-            details=f"kind={kind};profile={profile};title={title}",
+            details=f"kind={kind};profile={profile};title={title};research={research_flag};sources={research_sources_count}",
         )
         return True
     except Exception:
