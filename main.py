@@ -5981,6 +5981,293 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def normalized_file_topic(user_prompt: str) -> str:
+    topic = (user_prompt or "").strip()
+    if not topic:
+        return "Новый файл"
+    topic = re.sub(
+        r"^(подготовь|сделай|собери|оформи|создай|напиши)\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+    topic = re.sub(
+        r"^(документ|презентацию|презентация|таблицу|таблица|файл)\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+    return topic.strip(" .:-") or (user_prompt or "").strip() or "Новый файл"
+
+
+def default_file_title(kind: str, topic: str) -> str:
+    topic_lc = topic.lower()
+    if kind == "doc":
+        if "анализ" in topic_lc and "рын" in topic_lc:
+            return "Анализ рынка"
+        if "коммерческ" in topic_lc or topic_lc.startswith("кп"):
+            return "Коммерческое предложение"
+        return "Документ"
+    if kind == "ppt":
+        return "Презентация"
+    if kind == "sheet":
+        return "Таблица"
+    return "Файл"
+
+
+def placeholder_doc_sections(user_prompt: str, profile: str = "medium") -> list[dict[str, Any]]:
+    topic = normalized_file_topic(user_prompt)
+    topic_lc = topic.lower()
+    is_market = any(token in topic_lc for token in ("анализ", "рын", "конкурент", "спрос", "ниша", "обзор"))
+    is_warehouse = any(token in topic_lc for token in ("склад", "контейнер", "storage", "логист"))
+
+    if is_market:
+        sections = [
+            {
+                "heading": "Резюме",
+                "paragraphs": [
+                    f"Документ содержит предварительный анализ по теме: {topic}. "
+                    "Это рабочая версия без вымышленных цифр: акцент сделан на структуре рынка, "
+                    "факторах спроса и логике дальнейшей проверки гипотез."
+                ],
+                "bullets": [
+                    "Фокус: спрос, предложение, цены и ограничения рынка",
+                    "География анализа: выбранный город и ближайшая зона притяжения клиентов",
+                    "Итоговая цель: понять, есть ли устойчивая ниша и как в нее заходить",
+                ],
+            },
+            {
+                "heading": "Что именно нужно оценить",
+                "paragraphs": [
+                    "Для такого рынка важно отдельно проверить типы клиентов, сценарии использования, "
+                    "реальный спрос по районам, стоимость входа и срок окупаемости."
+                ],
+                "bullets": [
+                    "Кто арендует или покупает такие решения",
+                    "Какие форматы и площади востребованы",
+                    "Какие требования к локации, доступу и безопасности влияют на сделку",
+                ],
+            },
+            {
+                "heading": "Спрос и сегменты клиентов",
+                "paragraphs": [
+                    "Спрос стоит оценивать по сегментам, а не в среднем по рынку. "
+                    "Для складских контейнеров чаще всего имеют значение микро-бизнес, стройка, e-commerce, "
+                    "сезонное хранение и временные складские задачи."
+                ],
+                "bullets": [
+                    "Малый бизнес и торговля",
+                    "Строительные и подрядные компании",
+                    "Локальные склады для интернет-продаж и сезонного хранения",
+                ],
+            },
+            {
+                "heading": "Предложение и конкуренты",
+                "paragraphs": [
+                    "Конкурентами будут не только аналогичные контейнеры, но и классические склады, "
+                    "гаражные боксы, складские ячейки и временные модульные решения. "
+                    "Сравнивать нужно цену, доступность, срок запуска и удобство использования."
+                ],
+                "bullets": [
+                    "Прямые конкуренты: контейнеры и модульные склады",
+                    "Косвенные конкуренты: склады, боксы, ячейки, гаражи",
+                    "Ключевые метрики: цена, доступ, охрана, состояние, транспортная доступность",
+                ],
+            },
+            {
+                "heading": "Ценообразование и экономика",
+                "paragraphs": [
+                    "Экономику стоит считать через несколько сценариев: минимальный, рабочий и оптимистичный. "
+                    "Без этого сложно понять реальную точку входа и допустимую ставку аренды."
+                ],
+                "bullets": [
+                    "Капзатраты на контейнер, переоборудование и запуск",
+                    "Операционные расходы: площадка, охрана, логистика, обслуживание",
+                    "Пороговая ставка, при которой модель начинает окупаться",
+                ],
+            },
+            {
+                "heading": "Риски и ограничения",
+                "paragraphs": [
+                    "Основные риски в таких проектах обычно связаны с локацией, юридическими ограничениями, "
+                    "загрузкой площадки и тем, насколько рынок готов платить за удобный, но не капитальный формат."
+                ],
+                "bullets": [
+                    "Недостаточный спрос в конкретной локации",
+                    "Проблемы с землей, размещением или подключениями",
+                    "Давление со стороны более дешевых или привычных альтернатив",
+                ],
+            },
+            {
+                "heading": "Выводы и следующие шаги",
+                "paragraphs": [
+                    "Перед запуском проекта стоит добрать фактические данные по конкурентам, ставкам, "
+                    "загруженности похожих объектов и реальному спросу у целевой аудитории. "
+                    "После этого уже можно собирать короткую финансовую модель и тестировать пилот."
+                ],
+                "bullets": [
+                    "Собрать список прямых конкурентов по городу",
+                    "Снять ориентиры по ставкам и условиям аренды",
+                    "Проверить 2-3 наиболее перспективные локации под пилот",
+                ],
+            },
+        ]
+        if profile == "short":
+            return sections[:4] + [sections[-1]]
+        if profile == "full":
+            if is_warehouse:
+                sections.insert(
+                    4,
+                    {
+                        "heading": "Требования к объекту и площадке",
+                        "paragraphs": [
+                            "Для контейнеров под склад особенно важны подъезд, покрытие площадки, "
+                            "возможность разгрузки, безопасность и понятный режим доступа для клиентов."
+                        ],
+                        "bullets": [
+                            "Подъезд грузового транспорта",
+                            "Охрана, освещение и контроль доступа",
+                            "Условия хранения и пригодность контейнера под конкретные задачи",
+                        ],
+                    },
+                )
+            return sections
+        return sections
+
+    sections = [
+        {
+            "heading": "Контекст",
+            "paragraphs": [
+                f"Документ подготовлен по теме: {topic}. Ниже собрана рабочая структура, "
+                "которую можно использовать как черновик и доработать под конкретную цель."
+            ],
+            "bullets": [],
+        },
+        {
+            "heading": "Основные тезисы",
+            "paragraphs": ["Ниже перечислены ключевые вопросы и направления, которые стоит раскрыть по теме."],
+            "bullets": [
+                "Что именно нужно получить на выходе",
+                "Какие ограничения и вводные влияют на результат",
+                "Какие данные или решения важны в первую очередь",
+            ],
+        },
+        {
+            "heading": "Практические выводы",
+            "paragraphs": [
+                "После уточнения деталей этот документ можно быстро превратить в полноценную рабочую версию."
+            ],
+            "bullets": ["Уточнить цель", "Добавить фактуру", "Согласовать следующий шаг"],
+        },
+    ]
+    if profile == "full":
+        sections.insert(
+            2,
+            {
+                "heading": "Риски и вопросы для проверки",
+                "paragraphs": ["Перед финализацией важно проверить допущения и закрыть недостающие данные."],
+                "bullets": ["Проверить факты", "Согласовать критерии успеха", "Уточнить формат использования документа"],
+            },
+        )
+    return sections
+
+
+def doc_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium") -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    topic = normalized_file_topic(user_prompt)
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", raw) if block.strip()]
+    sections: list[dict[str, Any]] = []
+    heading_hints = (
+        "введение",
+        "обзор",
+        "резюме",
+        "вывод",
+        "рекоменда",
+        "риски",
+        "спрос",
+        "предлож",
+        "цены",
+        "эконом",
+        "конкур",
+        "рын",
+        "сегмент",
+    )
+
+    for index, block in enumerate(blocks[:8], start=1):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        heading = ""
+        content_lines = lines
+        first_line = re.sub(r"^[#>\-\*\d\.\)\s]+", "", lines[0]).strip()
+        if first_line and (
+            lines[0].startswith("#")
+            or lines[0].endswith(":")
+            or (len(first_line) <= 70 and any(first_line.lower().startswith(hint) for hint in heading_hints))
+        ):
+            heading = first_line.rstrip(":")
+            content_lines = lines[1:]
+        paragraphs: list[str] = []
+        bullets: list[str] = []
+        for line in content_lines:
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if re.match(r"^[-*•]\s+", cleaned):
+                bullets.append(re.sub(r"^[-*•]\s+", "", cleaned).strip())
+            elif re.match(r"^\d+[\.\)]\s+", cleaned):
+                bullets.append(re.sub(r"^\d+[\.\)]\s+", "", cleaned).strip())
+            else:
+                paragraphs.append(cleaned)
+        if not heading:
+            heading = "Краткий вывод" if index == 1 else f"Раздел {index}"
+        if paragraphs or bullets:
+            sections.append(
+                {
+                    "heading": heading,
+                    "paragraphs": paragraphs[:4],
+                    "bullets": bullets[:6],
+                }
+            )
+
+    if not sections:
+        return None
+
+    return {
+        "title": default_file_title("doc", topic),
+        "subtitle": topic,
+        "sections": sections,
+    }
+
+
+def doc_spec_needs_enrichment(spec: dict[str, Any], user_prompt: str) -> bool:
+    sections = spec.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return True
+    if len(sections) != 1:
+        return False
+    section = sections[0] if isinstance(sections[0], dict) else {}
+    heading = str(section.get("heading") or "").strip().lower()
+    paragraphs = [str(item).strip().lower() for item in (section.get("paragraphs", []) or []) if str(item).strip()]
+    bullets = [str(item).strip().lower() for item in (section.get("bullets", []) or []) if str(item).strip()]
+    placeholder_bullets = {"ключевая цель", "основной результат", "следующий шаг"}
+    prompt_lc = (user_prompt or "").strip().lower()
+    return (
+        heading in {"задача", "документ", "описание"}
+        and set(bullets).issubset(placeholder_bullets)
+        and (not paragraphs or paragraphs == [prompt_lc])
+    )
+
+
 async def ask_openrouter_text_model(
     *,
     alias: str,
@@ -6293,7 +6580,9 @@ def build_file_generation_messages(kind: str, profile: str, user_prompt: str) ->
     format_rules = {
         "doc": (
             'Верни только JSON объект вида {"title":"...", "subtitle":"...", "sections":[{"heading":"...", "paragraphs":["..."], "bullets":["..."]}], "table":{"title":"...", "columns":["..."], "rows":[["..."]]}}. '
-            "sections обязателен. table добавляй только если она реально нужна."
+            "sections обязателен. table добавляй только если она реально нужна. "
+            "Для документа пиши содержательные абзацы и конкретные пункты, а не шаблонные заглушки вроде "
+            '"Ключевая цель", "Основной результат" или "Следующий шаг". Не дублируй запрос пользователя как единственное содержание документа.'
         ),
         "ppt": (
             'Верни только JSON объект вида {"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
@@ -6319,7 +6608,7 @@ def build_file_generation_messages(kind: str, profile: str, user_prompt: str) ->
 
 
 def fallback_file_spec(kind: str, user_prompt: str, profile: str = "medium") -> dict[str, Any]:
-    topic = user_prompt.strip() or "Новый файл"
+    topic = normalized_file_topic(user_prompt)
     if kind == "ppt":
         slide_count = {"short": 3, "medium": 5, "full": 7}.get(profile, 5)
         base_slides = [
@@ -6345,13 +6634,10 @@ def fallback_file_spec(kind: str, user_prompt: str, profile: str = "medium") -> 
             "rows": [["Запрос", topic, "Исходная задача пользователя"], ["Статус", "Черновик", "Можно доработать"], *extra_rows],
             "summary": "Черновая таблица по запросу пользователя.",
         }
-    base_bullets = ["Ключевая цель", "Основной результат", "Следующий шаг"]
-    if profile == "full":
-        base_bullets.extend(["Риски и ограничения", "Рекомендации"])
     return {
-        "title": "Документ",
+        "title": default_file_title("doc", topic),
         "subtitle": topic,
-        "sections": [{"heading": "Задача", "paragraphs": [topic], "bullets": base_bullets}],
+        "sections": placeholder_doc_sections(topic, profile),
     }
 
 
@@ -6361,7 +6647,12 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
     messages = build_file_generation_messages(kind, profile, user_prompt)
     result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
-    spec = extract_json_object(result.text) or fallback_file_spec(kind, user_prompt, profile)
+    spec = extract_json_object(result.text)
+    if kind == "doc":
+        if not isinstance(spec, dict) or doc_spec_needs_enrichment(spec, user_prompt):
+            spec = doc_spec_from_plain_text(user_prompt, result.text, profile)
+    if not isinstance(spec, dict):
+        spec = fallback_file_spec(kind, user_prompt, profile)
     return spec, result
 
 
