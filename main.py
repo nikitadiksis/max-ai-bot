@@ -6356,6 +6356,39 @@ def file_request_needs_research(kind: str, user_prompt: str) -> bool:
     return False
 
 
+def build_research_queries(user_prompt: str) -> list[str]:
+    topic = normalized_file_topic(user_prompt)
+    topic_lc = topic.lower()
+    queries: list[str] = [topic]
+    if any(marker in topic_lc for marker in ("анализ", "обзор", "исслед", "рын")):
+        queries.append(f"{topic} цены конкуренты спрос")
+    if "краснодар" in topic_lc:
+        queries.append(f"{topic} Краснодар цена аренда")
+        queries.append(f"{topic} Краснодар конкуренты")
+    if "контейнер" in topic_lc and "склад" in topic_lc:
+        queries.extend(
+            [
+                "контейнер под склад краснодар цена аренда",
+                "морской контейнер склад краснодар купить аренда",
+                "мини склад краснодар цена аренда",
+                "складской контейнер краснодар",
+            ]
+        )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        normalized = re.sub(r"\s+", " ", query).strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
 def clean_search_snippet(text: str) -> str:
     value = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or ""))).strip()
     return value[:400]
@@ -6475,13 +6508,21 @@ async def build_web_research_context(user_prompt: str) -> str:
 
 
 async def collect_web_research(user_prompt: str) -> tuple[list[dict[str, str]], str]:
-    query = normalized_file_topic(user_prompt)
-    results = await search_web_sources(query)
-    if not results:
+    aggregated: list[dict[str, str]] = []
+    for query in build_research_queries(user_prompt):
+        results = await search_web_sources(query)
+        for item in results:
+            if any(existing.get("url") == item.get("url") for existing in aggregated):
+                continue
+            aggregated.append(item)
+        if len(aggregated) >= max(WEB_RESEARCH_MAX_RESULTS, WEB_RESEARCH_MAX_PAGES) * 2:
+            break
+    if not aggregated:
         return [], ""
     lines = ["Ниже собраны внешние источники по теме. Используй их как фактическую основу и опирайся на них в выводах:"]
     compact_results: list[dict[str, str]] = []
-    for idx, item in enumerate(results[:WEB_RESEARCH_MAX_RESULTS], start=1):
+    result_limit = max(WEB_RESEARCH_MAX_RESULTS, WEB_RESEARCH_MAX_PAGES * 2)
+    for idx, item in enumerate(aggregated[:result_limit], start=1):
         excerpt = ""
         if idx <= WEB_RESEARCH_MAX_PAGES:
             excerpt = await fetch_source_excerpt(item["url"])
@@ -6533,11 +6574,15 @@ def build_research_ppt_messages(profile: str, user_prompt: str, research_context
         '{"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
         "Нужен не план выступления и не общие фразы, а слайды с реальными выводами и фактами из найденных источников. "
         "Каждый слайд должен содержать конкретные тезисы, а не заглушки вроде 'Главная идея' или 'Что важно учесть'. "
+        "Если запрос про рынок или нишу, строй презентацию как рыночный разбор: контекст рынка, спрос и сегменты клиентов, конкуренты и альтернативы, "
+        "ценовые сигналы и экономика, риски запуска, итоговый вывод и рекомендация по запуску. "
+        "В каждом буллете формулируй именно результат или наблюдение. Избегай фраз 'источники говорят', 'логично тестировать', 'важно учесть'. "
         f"Сделай {slide_targets} содержательных слайдов плюс финальный слайд с выводом."
     )
     user_text = (
         f"Тема презентации: {normalized_file_topic(user_prompt)}\n\n"
-        "Сделай презентацию именно с результатами анализа и выводами по теме.\n\n"
+        "Сделай презентацию именно с результатами анализа и выводами по теме. "
+        "Для market-analysis покажи отдельными слайдами: где спрос, кто клиент, с кем конкурировать, какие ценовые ориентиры и в чем риск запуска.\n\n"
         f"{research_context}"
     )
     return [
@@ -6626,49 +6671,111 @@ def fallback_research_ppt_spec(user_prompt: str, sources: list[dict[str, str]], 
     topic = normalized_file_topic(user_prompt)
     facts = source_fact_bullets(sources, limit=8)
     slide_limit = {"short": 4, "medium": 6, "full": 8}.get(profile, 6)
-    slides = [
-        {
-            "title": "О чем говорят источники",
-            "bullets": facts[:3] or ["Поисковая выдача подтверждает наличие релевантной складской и контейнерной тематики по региону."],
-            "note": "",
-        },
-        {
-            "title": "Спрос и рынок",
-            "bullets": facts[3:6] or ["Смежные материалы указывают на активный рынок складской недвижимости и локальный спрос на хранение."],
-            "note": "",
-        },
-        {
-            "title": "Что это значит для ниши",
-            "bullets": [
-                "Контейнерный формат логично тестировать как быстрый и более гибкий вариант локального хранения",
-                "Проверять нужно не город в целом, а конкретные точки с понятным клиентским потоком",
-                "Ключевой вопрос — сравнение ставок и удобства с альтернативами",
-            ],
-            "note": "",
-        },
-        {
-            "title": "Итоговый вывод",
-            "bullets": [
-                "Ниша выглядит рабочей как пилотный локальный формат хранения",
-                "Для решения о запуске нужны проверка локации, ставок и прямых альтернатив",
-                "Источники дают направление, но финальную экономику надо добирать по рынку вручную",
-            ],
-            "note": "",
-        },
-    ]
-    if profile != "short":
-        slides.insert(
-            2,
+    topic_lc = topic.lower()
+    is_storage_container = "контейнер" in topic_lc and "склад" in topic_lc
+
+    if is_storage_container:
+        market_bullets = facts[:2] or [
+            "В выдаче есть локальные предложения по складам и смежным форматам хранения в Краснодаре.",
+            "Спрос на хранение в регионе есть, но контейнерный формат нужно сравнивать с мини-складами и обычной арендой.",
+        ]
+        competitor_bullets = facts[2:4] or [
+            "Главные альтернативы: мини-склады, боксы, гаражи и небольшие склады в аренду.",
+            "Контейнер выигрывает скоростью запуска и гибкостью, но не всегда выигрывает по комфорту и инфраструктуре.",
+        ]
+        economy_bullets = facts[4:6] or [
+            "Экономика проекта зависит от ставки аренды площадки, стоимости доработки контейнера и фактической загрузки.",
+            "Ключевой вопрос для проверки — можно ли удержать цену ниже альтернатив и при этом сохранить удобный доступ.",
+        ]
+        risk_bullets = facts[6:8] or [
+            "Нужно проверять не весь Краснодар, а конкретные точки: промзоны, выезды, районы с малым складским предложением.",
+            "Без локальной проверки ставок и конкурентов есть риск ошибиться в спросе и окупаемости.",
+        ]
+        slides = [
             {
-                "title": "Риски и ограничения",
+                "title": "Контекст рынка в Краснодаре",
+                "bullets": market_bullets[:3],
+                "note": "",
+            },
+            {
+                "title": "Кто может быть клиентом",
                 "bullets": [
-                    "Не все найденные материалы относятся строго к контейнерам под склад",
-                    "Часть выводов опирается на смежный рынок складской недвижимости",
-                    "Нужна дополнительная сверка локальных предложений и ставок",
+                    "Потенциальные клиенты: малый бизнес, стройка, подрядчики, e-commerce и сезонное хранение.",
+                    "Формат особенно релевантен тем, кому нужен быстрый запуск без длинного договора и капитального помещения.",
+                    "Наибольшая ценность — локальность, простой доступ и низкий порог входа.",
                 ],
                 "note": "",
             },
-        )
+            {
+                "title": "Конкуренты и альтернативы",
+                "bullets": competitor_bullets[:3],
+                "note": "",
+            },
+            {
+                "title": "Экономика и ценовые сигналы",
+                "bullets": economy_bullets[:3],
+                "note": "",
+            },
+            {
+                "title": "Риски запуска",
+                "bullets": risk_bullets[:3],
+                "note": "",
+            },
+            {
+                "title": "Вывод по запуску",
+                "bullets": [
+                    "Нишу стоит проверять как локальный пилот, а не как масштабный запуск на весь город.",
+                    "Решение о входе зависит от трех вещей: конкретная локация, сравнение ставок с альтернативами и реальная загрузка.",
+                    "Если контейнерное хранение дает цену ниже мини-складов при удобном доступе, у формата есть рабочий шанс.",
+                ],
+                "note": "",
+            },
+        ]
+    else:
+        slides = [
+            {
+                "title": "Что видно по найденным материалам",
+                "bullets": facts[:3] or ["По теме есть релевантные внешние материалы и сигналы спроса."],
+                "note": "",
+            },
+            {
+                "title": "Спрос и рыночный контекст",
+                "bullets": facts[3:6] or ["Материалы показывают наличие рынка и смежного спроса по теме."],
+                "note": "",
+            },
+            {
+                "title": "Что это означает на практике",
+                "bullets": [
+                    "Тему стоит оценивать не абстрактно, а через конкретные сегменты спроса и варианты применения.",
+                    "Для решения о запуске важны конкуренты, ценовые ориентиры и ограничения по месту/каналу.",
+                    "Следующий шаг — проверить локальную экономику и альтернативы.",
+                ],
+                "note": "",
+            },
+            {
+                "title": "Итоговый вывод",
+                "bullets": [
+                    "По найденным сигналам тема выглядит рабочей, но требует локальной проверки цифр.",
+                    "Решение о запуске лучше принимать через пилот, а не через общий теоретический вывод.",
+                    "Ключевые риски — неверная оценка спроса, цены и силы альтернатив.",
+                ],
+                "note": "",
+            },
+        ]
+    if profile != "short":
+        if not is_storage_container:
+            slides.insert(
+                2,
+                {
+                    "title": "Риски и ограничения",
+                    "bullets": [
+                        "Не все найденные материалы относятся строго к теме запроса и часть выводов остается оценочной.",
+                        "Для точного решения все равно нужна сверка локальных цен, предложений и альтернатив.",
+                        "Общий research годится как основа для пилота, но не заменяет финальную проверку рынка.",
+                    ],
+                    "note": "",
+                },
+            )
     source_slide = {
         "title": "Источники",
         "bullets": [f"{str(item.get('title') or '').strip()} — {str(item.get('url') or '').strip()}" for item in sources[:5] if str(item.get("url") or "").strip()],
