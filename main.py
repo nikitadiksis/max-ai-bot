@@ -121,6 +121,7 @@ KIE_TEXT_ALIASES = {
 KIE_GEMINI_CHAT_API = os.getenv("KIE_GEMINI_CHAT_API", KIE_GEMINI_CHAT_API_DEFAULT).strip() or KIE_GEMINI_CHAT_API_DEFAULT
 KIE_GPT54_API = os.getenv("KIE_GPT54_API", KIE_GPT54_API_DEFAULT).strip() or KIE_GPT54_API_DEFAULT
 KIE_GPT54_MODEL = os.getenv("KIE_GPT54_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+FILE_RESEARCH_MODEL_ALIAS = os.getenv("FILE_RESEARCH_MODEL_ALIAS", "gemini").strip().lower() or "gemini"
 LITE_PLAN_PRICE_RUB = int(os.getenv("LITE_PLAN_PRICE_RUB", "390"))
 START_PLAN_PRICE_RUB = int(os.getenv("START_PLAN_PRICE_RUB", "990"))
 PRO_PLAN_PRICE_RUB = int(os.getenv("PRO_PLAN_PRICE_RUB", "2490"))
@@ -6577,6 +6578,164 @@ def build_research_doc_messages(profile: str, user_prompt: str, research_context
     ]
 
 
+def build_research_ppt_messages(profile: str, user_prompt: str, research_context: str) -> list[dict[str, Any]]:
+    slide_targets = {"short": "4-5", "medium": "6-8", "full": "8-10"}.get(profile, "6-8")
+    system_text = (
+        "Ты готовишь содержательную презентацию по внешним источникам. "
+        "Верни только JSON объект вида "
+        '{"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
+        "Нужен не план выступления и не общие фразы, а слайды с реальными выводами и фактами из найденных источников. "
+        "Каждый слайд должен содержать конкретные тезисы, а не заглушки вроде 'Главная идея' или 'Что важно учесть'. "
+        f"Сделай {slide_targets} содержательных слайдов плюс финальный слайд с выводом."
+    )
+    user_text = (
+        f"Тема презентации: {normalized_file_topic(user_prompt)}\n\n"
+        "Сделай презентацию именно с результатами анализа и выводами по теме.\n\n"
+        f"{research_context}"
+    )
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def source_fact_bullets(sources: list[dict[str, str]], limit: int = 6) -> list[str]:
+    bullets: list[str] = []
+    for item in sources:
+        snippet = str(item.get("snippet") or "").strip()
+        excerpt = str(item.get("excerpt") or "").strip()
+        title = str(item.get("title") or "").strip()
+        fact = snippet or excerpt or title
+        fact = re.sub(r"\s+", " ", fact).strip()
+        if not fact:
+            continue
+        if title and snippet and title.lower() not in fact.lower():
+            fact = f"{title}: {fact}"
+        fact = fact[:220]
+        if fact and fact not in bullets:
+            bullets.append(fact)
+        if len(bullets) >= limit:
+            break
+    return bullets
+
+
+def fallback_research_doc_spec(user_prompt: str, sources: list[dict[str, str]], profile: str = "medium") -> dict[str, Any]:
+    topic = normalized_file_topic(user_prompt)
+    facts = source_fact_bullets(sources, limit=8)
+    market_facts = facts[:3] or ["По найденным источникам тема связана с реальным локальным спросом и складской инфраструктурой."]
+    competition_facts = facts[3:6] or ["В результатах поиска встречаются как складская недвижимость, так и альтернативные форматы хранения."]
+    source_titles = [str(item.get("title") or "").strip() for item in sources[:3] if str(item.get("title") or "").strip()]
+    sections = [
+        {
+            "heading": "Резюме",
+            "paragraphs": [
+                f"Документ подготовлен по теме: {topic}. Ниже собраны выводы на основе найденных внешних материалов."
+            ],
+            "bullets": market_facts[:3],
+        },
+        {
+            "heading": "Факты из найденных источников",
+            "paragraphs": [
+                "Внешние материалы указывают на состояние рынка, спрос и смежную складскую инфраструктуру в регионе."
+            ],
+            "bullets": facts[:6],
+        },
+        {
+            "heading": "Интерпретация и вывод",
+            "paragraphs": [
+                "По совокупности найденных сигналов нишу стоит рассматривать как локальный формат хранения с потенциалом там, "
+                "где клиенту важны доступность, гибкость и быстрый запуск. Однако окончательное решение стоит принимать после проверки "
+                "ставок, конкретной локации и силы прямых альтернатив."
+            ],
+            "bullets": competition_facts[:3] + (["Ключевые источники: " + "; ".join(source_titles)] if source_titles else []),
+        },
+    ]
+    if profile != "short":
+        sections.insert(
+            2,
+            {
+                "heading": "Риски и ограничения",
+                "paragraphs": [
+                    "Поисковая выдача показывает смежный, а не идеально точечный рынок, поэтому часть выводов остается оценочной и требует полевой проверки."
+                ],
+                "bullets": [
+                    "Часть источников относится к складской недвижимости шире, а не только к контейнерам",
+                    "Реальные цены и загрузку лучше дополнительно сверять по локальным площадкам и прямым предложениям",
+                    "Финальная экономика сильно зависит от конкретной площадки и условий доступа",
+                ],
+            },
+        )
+    return append_sources_section(
+        {
+            "title": default_file_title("doc", topic),
+            "subtitle": topic,
+            "sections": sections,
+        },
+        sources,
+    )
+
+
+def fallback_research_ppt_spec(user_prompt: str, sources: list[dict[str, str]], profile: str = "medium") -> dict[str, Any]:
+    topic = normalized_file_topic(user_prompt)
+    facts = source_fact_bullets(sources, limit=8)
+    slide_limit = {"short": 4, "medium": 6, "full": 8}.get(profile, 6)
+    slides = [
+        {
+            "title": "О чем говорят источники",
+            "bullets": facts[:3] or ["Поисковая выдача подтверждает наличие релевантной складской и контейнерной тематики по региону."],
+            "note": "",
+        },
+        {
+            "title": "Спрос и рынок",
+            "bullets": facts[3:6] or ["Смежные материалы указывают на активный рынок складской недвижимости и локальный спрос на хранение."],
+            "note": "",
+        },
+        {
+            "title": "Что это значит для ниши",
+            "bullets": [
+                "Контейнерный формат логично тестировать как быстрый и более гибкий вариант локального хранения",
+                "Проверять нужно не город в целом, а конкретные точки с понятным клиентским потоком",
+                "Ключевой вопрос — сравнение ставок и удобства с альтернативами",
+            ],
+            "note": "",
+        },
+        {
+            "title": "Итоговый вывод",
+            "bullets": [
+                "Ниша выглядит рабочей как пилотный локальный формат хранения",
+                "Для решения о запуске нужны проверка локации, ставок и прямых альтернатив",
+                "Источники дают направление, но финальную экономику надо добирать по рынку вручную",
+            ],
+            "note": "",
+        },
+    ]
+    if profile != "short":
+        slides.insert(
+            2,
+            {
+                "title": "Риски и ограничения",
+                "bullets": [
+                    "Не все найденные материалы относятся строго к контейнерам под склад",
+                    "Часть выводов опирается на смежный рынок складской недвижимости",
+                    "Нужна дополнительная сверка локальных предложений и ставок",
+                ],
+                "note": "",
+            },
+        )
+    source_slide = {
+        "title": "Источники",
+        "bullets": [f"{str(item.get('title') or '').strip()} — {str(item.get('url') or '').strip()}" for item in sources[:5] if str(item.get("url") or "").strip()],
+        "note": "",
+    }
+    if source_slide["bullets"]:
+        slides.append(source_slide)
+    return {
+        "title": "Презентация",
+        "subtitle": topic,
+        "slides": slides[:slide_limit] + ([source_slide] if source_slide["bullets"] and source_slide not in slides[:slide_limit] else []),
+    }
+
+
 def append_sources_section(spec: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
     if not sources:
         return spec
@@ -6606,10 +6765,18 @@ def append_sources_section(spec: dict[str, Any], sources: list[dict[str, str]]) 
 def best_file_generation_alias(row: dict[str, Any], kind: str, user_prompt: str) -> str:
     plan_name = str(row.get("plan", "free"))
     selected_alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
-    if kind == "doc" and file_request_needs_research(kind, user_prompt):
-        if text_model_allowed_for_plan(plan_name, "gemini"):
+    if kind in {"doc", "ppt"} and file_request_needs_research(kind, user_prompt):
+        preferred = FILE_RESEARCH_MODEL_ALIAS
+        if preferred in TEXT_MODELS:
+            if preferred == "gemini" and KIE_API_KEY:
+                return preferred
+            if preferred == "gpt54" and KIE_API_KEY:
+                return preferred
+            if preferred not in {"gemini", "gpt54"}:
+                return preferred
+        if KIE_API_KEY and "gemini" in TEXT_MODELS:
             return "gemini"
-        if text_model_allowed_for_plan(plan_name, "gpt54"):
+        if KIE_API_KEY and "gpt54" in TEXT_MODELS:
             return "gpt54"
     return selected_alias
 
@@ -6988,15 +7155,38 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     alias = best_file_generation_alias(row, kind, user_prompt)
     research_sources: list[dict[str, str]] = []
     research_context = ""
-    if kind == "doc" and file_request_needs_research(kind, user_prompt):
+    if kind in {"doc", "ppt"} and file_request_needs_research(kind, user_prompt):
         research_sources, research_context = await collect_web_research(user_prompt)
         if research_context:
-            research_messages = build_research_doc_messages(profile, user_prompt, research_context)
-            research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
-            research_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
-            if research_spec:
-                research_spec = append_sources_section(research_spec, research_sources)
-                return research_spec, research_result
+            if kind == "doc":
+                research_messages = build_research_doc_messages(profile, user_prompt, research_context)
+                research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
+                research_spec = doc_spec_from_plain_text(user_prompt, research_result.text, profile)
+                if research_spec and len(research_spec.get("sections", []) or []) >= 3:
+                    research_spec = append_sources_section(research_spec, research_sources)
+                    return research_spec, research_result
+                return fallback_research_doc_spec(user_prompt, research_sources, profile), research_result
+            if kind == "ppt":
+                research_messages = build_research_ppt_messages(profile, user_prompt, research_context)
+                research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
+                research_spec = extract_json_object(research_result.text)
+                if isinstance(research_spec, dict) and isinstance(research_spec.get("slides"), list) and len(research_spec.get("slides") or []) >= 4:
+                    source_slide = {
+                        "title": "Источники",
+                        "bullets": [
+                            f"{str(item.get('title') or '').strip()} — {str(item.get('url') or '').strip()}"
+                            for item in research_sources[:5]
+                            if str(item.get("url") or "").strip()
+                        ],
+                        "note": "",
+                    }
+                    if source_slide["bullets"]:
+                        slides = research_spec.get("slides") or []
+                        if not any(str(slide.get("title") or "").strip().lower() == "источники" for slide in slides if isinstance(slide, dict)):
+                            slides.append(source_slide)
+                            research_spec["slides"] = slides
+                    return research_spec, research_result
+                return fallback_research_ppt_spec(user_prompt, research_sources, profile), research_result
     messages = build_file_generation_messages(kind, profile, user_prompt)
     if file_request_needs_research(kind, user_prompt):
         if not research_context:
