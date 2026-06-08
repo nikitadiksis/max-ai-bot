@@ -8225,11 +8225,9 @@ async def send_help(chat_id: int) -> None:
 
 async def send_menu(chat_id: int) -> None:
     row = user_profile(chat_id)
-    preset_block = build_preset_block(str(row.get("plan", "free")))
     text = (
         "Главное меню\n\n"
         "Выбери режим кнопками или просто напиши вопрос.\n\n"
-        f"{preset_block}\n\n"
         f"{current_model_focus_block(chat_id)}\n"
         f"{usage_text(row)}\n\n"
         f"{MENU_TEXT}"
@@ -8461,7 +8459,6 @@ def build_growth_text(chat_id: int, row: dict[str, Any] | None = None) -> str:
 def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, Any]]]:
     row = user_profile(chat_id)
     if page == UI_PAGE_MENU:
-        preset_block = build_preset_block(str(row.get("plan", "free")))
         capabilities = (
             "Что умею:\n"
             "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
@@ -8472,7 +8469,6 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "Главное меню\n\n"
             "Выбери режим кнопками или просто напиши вопрос.\n\n"
             f"{capabilities}\n\n"
-            f"{preset_block}\n\n"
             f"{current_model_focus_block(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
@@ -8500,7 +8496,6 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
 def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, Any]]]:
     row = user_profile(chat_id)
     if page == UI_PAGE_MENU:
-        preset_block = build_preset_block(str(row.get("plan", "free")))
         capabilities = (
             "Что умею:\n"
             "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
@@ -8511,7 +8506,6 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "Главное меню\n\n"
             "Выбери режим кнопками или просто напиши вопрос.\n\n"
             f"{capabilities}\n\n"
-            f"{preset_block}\n\n"
             f"{current_model_focus_block(chat_id)}\n"
             f"{usage_text(row)}\n\n"
             f"{MENU_TEXT}"
