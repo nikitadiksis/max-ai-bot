@@ -6249,6 +6249,22 @@ def doc_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium
     }
 
 
+def looks_like_broken_json_payload(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    if not raw:
+        return False
+    if raw.startswith("{") or raw.startswith("["):
+        return True
+    json_markers = ('"title"', '"subtitle"', '"sections"', '"slides"', '"columns"', '"rows"', '"table"')
+    return sum(1 for marker in json_markers if marker in raw) >= 2
+
+
 def doc_spec_needs_enrichment(spec: dict[str, Any], user_prompt: str) -> bool:
     sections = spec.get("sections")
     if not isinstance(sections, list) or not sections:
@@ -6649,8 +6665,10 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
     result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
     spec = extract_json_object(result.text)
     if kind == "doc":
-        if not isinstance(spec, dict) or doc_spec_needs_enrichment(spec, user_prompt):
+        if not isinstance(spec, dict) and not looks_like_broken_json_payload(result.text):
             spec = doc_spec_from_plain_text(user_prompt, result.text, profile)
+        elif isinstance(spec, dict) and doc_spec_needs_enrichment(spec, user_prompt):
+            spec = fallback_file_spec(kind, user_prompt, profile)
     if not isinstance(spec, dict):
         spec = fallback_file_spec(kind, user_prompt, profile)
     return spec, result
