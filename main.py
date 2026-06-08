@@ -12685,7 +12685,7 @@ async def admin_panel(
 ) -> HTMLResponse:
     session_id = resolve_admin_session(request, token)
     if not session_id:
-        raise HTTPException(status_code=403, detail="forbidden")
+        return HTMLResponse(render_admin_login_html(), status_code=401)
 
     try:
         response = HTMLResponse(
