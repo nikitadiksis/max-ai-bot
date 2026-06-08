@@ -3997,46 +3997,6 @@ def parse_usage_tokens(data: dict[str, Any]) -> tuple[int, int, int]:
     return max(0, prompt_tokens), max(0, completion_tokens), max(0, total_tokens)
 
 
-def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
-    plan_buttons = [
-        {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
-        {"type": "callback", "text": "Мой план", "payload": "action:plan"},
-    ]
-    if chat_id is not None and can_pick_models_for_current_preset(chat_id):
-        plan_buttons.append({"type": "callback", "text": "⚙ Модели", "payload": "action:preset_models"})
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {
-                "buttons": [
-                    [
-                        {"type": "callback", "text": "⚡ Быстро", "payload": "set_preset:fast"},
-                        {"type": "callback", "text": "⚖ Баланс", "payload": "set_preset:balanced"},
-                    ],
-                    [
-                        {"type": "callback", "text": "🧠 Качество", "payload": "set_preset:quality"},
-                        {"type": "callback", "text": "🚀 Эксперт", "payload": "set_preset:expert"},
-                    ],
-                    [
-                        *plan_buttons,
-                    ],
-                    [
-                        {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
-                        {"type": "callback", "text": "🎁 Бонусы", "payload": "action:growth"},
-                    ],
-                    [
-                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                        {"type": "callback", "text": "Сброс", "payload": "action:clear"},
-                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
-                    ],
-                    [
-                        {"type": "callback", "text": "📣 Канал", "payload": "action:channel"},
-                    ],
-                ]
-            },
-        }
-    ]
-
 
 def build_channel_gate_keyboard() -> list[dict[str, Any]]:
     return [
@@ -4083,19 +4043,6 @@ def channel_gate_allows_text(text: str) -> bool:
     command = value.split(maxsplit=1)[0].lower()
     return command in {"/start", "/id", "/support", "/channel"}
 
-
-def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) -> list[dict[str, Any]]:
-    row = user_profile(chat_id)
-    buttons: list[list[dict[str, Any]]] = [
-        [
-            {"type": "callback", "text": "Меню", "payload": "reply_action:menu"},
-            {"type": "callback", "text": "🎨 Картинка", "payload": "reply_action:image_menu"},
-        ]
-    ]
-    if str(row.get("plan", "free")) == "free":
-        buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
-    buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
-    return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
 def build_growth_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
@@ -7001,82 +6948,6 @@ async def ask_text_model(chat_id: int, user_text: str, selected_alias: str | Non
     return result
 
 
-def build_file_generation_messages(kind: str, user_prompt: str) -> list[dict[str, Any]]:
-    format_rules = {
-        "doc": (
-            "Верни только JSON объект вида "
-            '{"title":"...", "subtitle":"...", "sections":[{"heading":"...", "paragraphs":["..."], "bullets":["..."]}], '
-            '"table":{"title":"...", "columns":["..."], "rows":[["..."]]}}. '
-            "sections обязателен. table добавляй только если она реально нужна."
-        ),
-        "ppt": (
-            "Верни только JSON объект вида "
-            '{"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
-            "Сделай 6-8 содержательных слайдов, если пользователь не указал другое."
-        ),
-        "sheet": (
-            "Верни только JSON объект вида "
-            '{"title":"...", "sheet_name":"...", "columns":["..."], "rows":[["..."]], "summary":"..."}. '
-            "columns и rows обязательны. Данные делай практичными и пригодными для работы."
-        ),
-    }
-    system_text = (
-        "Ты помогаешь собрать готовый офисный файл для пользователя. "
-        "Отвечай только валидным JSON без markdown, пояснений и code fences. "
-        "Пиши на русском, если пользователь пишет по-русски. "
-        "Делай структуру компактной, практичной и пригодной для реального использования. "
-        + format_rules.get(kind, "")
-    )
-    return [
-        {"role": "system", "content": system_text},
-        {"role": "user", "content": user_prompt.strip()},
-    ]
-
-
-def fallback_file_spec(kind: str, user_prompt: str) -> dict[str, Any]:
-    topic = user_prompt.strip() or "Новый файл"
-    if kind == "ppt":
-        return {
-            "title": "Презентация",
-            "subtitle": topic,
-            "slides": [
-                {"title": "Тема и цель", "bullets": [topic, "Цель и ожидаемый результат"]},
-                {"title": "Ключевые тезисы", "bullets": ["Главная идея", "Что важно учесть", "Следующий шаг"]},
-                {"title": "Рекомендации", "bullets": ["Приоритет 1", "Приоритет 2", "Приоритет 3"]},
-            ],
-        }
-    if kind == "sheet":
-        return {
-            "title": "Таблица",
-            "sheet_name": "Данные",
-            "columns": ["Параметр", "Значение", "Комментарий"],
-            "rows": [
-                ["Запрос", topic, "Исходная задача пользователя"],
-                ["Статус", "Черновик", "Можно доработать"],
-            ],
-            "summary": "Черновая таблица по запросу пользователя.",
-        }
-    return {
-        "title": "Документ",
-        "subtitle": topic,
-        "sections": [
-            {
-                "heading": "Задача",
-                "paragraphs": [topic],
-                "bullets": ["Ключевая цель", "Основной результат", "Следующий шаг"],
-            }
-        ],
-    }
-
-
-async def generate_file_spec(chat_id: int, kind: str, user_prompt: str) -> tuple[dict[str, Any], TextAnswerResult]:
-    row = user_profile(chat_id)
-    plan_name = str(row.get("plan", "free"))
-    alias = str(row.get("selected_model_alias") or best_default_alias_for_plan(plan_name))
-    messages = build_file_generation_messages(kind, user_prompt)
-    result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=messages)
-    spec = extract_json_object(result.text) or fallback_file_spec(kind, user_prompt)
-    return spec, result
 
 
 def build_file_generation_messages(kind: str, profile: str, user_prompt: str) -> list[dict[str, Any]]:
@@ -7355,59 +7226,6 @@ def build_xlsx_bytes(spec: dict[str, Any]) -> bytes:
     return out.getvalue()
 
 
-async def process_file_request(chat_id: int, kind: str, prompt: str, profile: str = "medium") -> bool:
-    clean_prompt = prompt.strip()
-    if not clean_prompt:
-        return False
-    if len(clean_prompt) > MAX_TEXT_INPUT_CHARS:
-        await max_send_message(chat_id, f"Слишком длинное описание. Максимум {MAX_TEXT_INPUT_CHARS} символов.", attachments=build_keyboard())
-        return True
-    ok_cd, reason_cd = check_cooldown(chat_id, "message")
-    if not ok_cd:
-        await max_send_message(chat_id, reason_cd, attachments=build_keyboard())
-        return True
-    ok, reason = check_limit_only(chat_id, "messages")
-    if not ok:
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
-        return True
-    cost = file_request_cost(kind)
-    ok_credit, reason_credit = check_and_consume_credits(chat_id, cost, f"{FILE_KIND_LABELS.get(kind, 'файл')}")
-    if not ok_credit:
-        await max_send_message(chat_id, reason_credit, attachments=purchase_help_keyboard_for_row(user_profile(chat_id)))
-        return True
-    ok, reason = check_and_consume_limit(chat_id, "messages")
-    if not ok:
-        state.user_store.refund_credits(chat_id, cost)
-        await max_send_message(chat_id, reason, attachments=build_keyboard())
-        return True
-    await max_send_message(chat_id, f"Собираю {FILE_KIND_LABELS.get(kind, 'файл')}, это может занять немного времени...", notify=False)
-    try:
-        spec, result = await generate_file_spec(chat_id, kind, profile, clean_prompt)
-        title = str(spec.get("title") or clean_prompt[:60] or FILE_KIND_LABELS.get(kind, "Файл")).strip()
-        if kind == "ppt":
-            file_bytes = build_pptx_bytes(spec)
-        elif kind == "sheet":
-            file_bytes = build_xlsx_bytes(spec)
-        else:
-            file_bytes = build_docx_bytes(spec)
-        filename = f"{sanitize_filename_part(title, FILE_KIND_LABELS.get(kind, 'file'))}.{FILE_KIND_EXTENSIONS.get(kind, 'bin')}"
-        await send_generated_file(chat_id, kind=kind, title=title, file_bytes=file_bytes, filename=filename)
-        final_row = user_profile(chat_id)
-        research_flag = int(bool(spec.get("_research_used")))
-        research_sources_count = int(spec.get("_research_sources_count", 0) or 0)
-        state.user_store.record_usage_event(
-            chat_id=chat_id,
-            event_type="file_request",
-            plan=str(final_row.get("plan", "")),
-            model_alias=str(final_row.get("selected_model_alias") or ""),
-            credits_spent=cost,
-            tokens_total=int(result.total_tokens),
-            details=f"kind={kind};profile={profile};title={title};research={research_flag};sources={research_sources_count}",
-        )
-        return True
-    except Exception:
-        state.user_store.refund_credits(chat_id, cost)
-        raise
 
 
 async def process_file_request(chat_id: int, kind: str, prompt: str, profile: str = "medium") -> bool:
@@ -7487,131 +7305,6 @@ async def process_file_request(chat_id: int, kind: str, prompt: str, profile: st
         if cost > 0:
             state.user_store.refund_credits(chat_id, cost)
         raise
-
-
-def build_files_menu_text(chat_id: int) -> str:
-    row = user_profile(chat_id)
-    if str(row.get("plan", "free")).strip().lower() == "free":
-        return (
-            "📄 Файлы\n\n"
-            "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
-            "Что доступно:\n"
-            "• Документ (.docx)\n"
-            "• Презентация (.pptx)\n"
-            "• Таблица (.xlsx)\n\n"
-            "На Free:\n"
-            "• 1 короткий файл каждые 14 дней\n"
-            "• средняя и полная версии доступны на платных тарифах\n\n"
-            "Можно нажать кнопку ниже или просто написать:\n"
-            "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
-        )
-    return (
-        "📄 Файлы\n\n"
-        "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
-        "Что доступно:\n"
-        "• Документ (.docx)\n"
-        "• Презентация (.pptx)\n"
-        "• Таблица (.xlsx)\n\n"
-        "Стоимость:\n"
-        f"• Документ — {FILE_DOC_REQUEST_COST} запросов\n"
-        f"• Презентация — {FILE_PPT_REQUEST_COST} запросов\n"
-        f"• Таблица — {FILE_SHEET_REQUEST_COST} запросов\n\n"
-        "Можно нажать кнопку ниже или просто написать:\n"
-        "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
-    )
-
-
-def build_file_size_text(kind: str) -> str:
-    kind_label = FILE_KIND_LABELS.get(kind, "файл").capitalize()
-    row = user_profile(0) if False else None
-    current_row = None
-    hint = ""
-    if kind == "ppt":
-        hint = "Короткая: до 5 слайдов\nСредняя: 6-8 слайдов\nПолная: 9-12 слайдов"
-    elif kind == "sheet":
-        hint = "Короткая: простая рабочая таблица\nСредняя: нормальная рабочая версия\nПолная: расширенная таблица"
-    else:
-        hint = "Короткая: краткий документ\nСредняя: стандартный рабочий документ\nПолная: подробная версия"
-    return (
-        f"{kind_label}\n\n"
-        "Выбери объем перед генерацией.\n\n"
-        f"{hint}\n\n"
-        "После этого я попрошу описать задачу одним сообщением."
-    )
-
-
-def build_file_prompt_text(kind: str, profile: str = "medium", chat_id: int | None = None) -> str:
-    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
-    is_free_plan = False
-    if chat_id is not None:
-        is_free_plan = str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free"
-    row = user_profile(0) if False else None
-    if kind == "ppt":
-        free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
-        return (
-            f"Режим: Презентация — {profile_label}\n\n"
-            "Напиши, какую презентацию собрать одним сообщением.\n\n"
-            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
-            f"{free_line}"
-        )
-    if kind == "sheet":
-        free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
-        return (
-            f"Режим: Таблица — {profile_label}\n\n"
-            "Напиши, какую таблицу собрать одним сообщением.\n\n"
-            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
-            f"{free_line}"
-        )
-    free_line = "Лимит Free: 1 короткий файл каждые 14 дней." if profile == "short" else f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
-    return (
-        f"Режим: Документ — {profile_label}\n\n"
-        "Напиши, какой документ собрать одним сообщением.\n\n"
-        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
-        f"{free_line}"
-    )
-
-
-def build_file_prompt_text(kind: str, profile: str = "medium", chat_id: int | None = None) -> str:
-    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
-    is_free_plan = False
-    if chat_id is not None:
-        is_free_plan = str(user_profile(chat_id).get("plan", "free")).strip().lower() == "free"
-
-    if kind == "ppt":
-        footer = (
-            "Лимит Free: 1 короткий файл каждые 14 дней."
-            if is_free_plan
-            else f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
-        )
-        return (
-            f"Режим: Презентация — {profile_label}\n\n"
-            "Напиши, какую презентацию собрать одним сообщением.\n\n"
-            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
-            f"{footer}"
-        )
-    if kind == "sheet":
-        footer = (
-            "Лимит Free: 1 короткий файл каждые 14 дней."
-            if is_free_plan
-            else f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
-        )
-        return (
-            f"Режим: Таблица — {profile_label}\n\n"
-            "Напиши, какую таблицу собрать одним сообщением.\n\n"
-            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
-            f"{footer}"
-        )
-    footer = (
-        "Лимит Free: 1 короткий файл каждые 14 дней."
-        if is_free_plan
-        else f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
-    )
-    return (
-        f"Режим: Документ — {profile_label}\n\n"
-        "Напиши, какой документ собрать одним сообщением.\n\n"
-        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
-        f"{footer}"
-    )
 
 
 async def generate_image(prompt: str) -> ImageResult:
@@ -7710,29 +7403,6 @@ def current_model_display(chat_id: int) -> str:
     return model.label
 
 
-def build_files_menu_keyboard(chat_id: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {
-                "buttons": [
-                    [
-                        {"type": "callback", "text": "📄 Документ", "payload": "files:doc"},
-                        {"type": "callback", "text": "📊 Презентация", "payload": "files:ppt"},
-                    ],
-                    [
-                        {"type": "callback", "text": "📈 Таблица", "payload": "files:sheet"},
-                    ],
-                    [
-                        {"type": "callback", "text": "Меню", "payload": "action:menu"},
-                        {"type": "callback", "text": "Помощь", "payload": "action:support"},
-                    ],
-                ]
-            },
-        }
-    ]
-
-
 def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
     plan_buttons = [
         {"type": "callback", "text": "Тарифы", "payload": "action:tariffs"},
@@ -7788,52 +7458,6 @@ def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) ->
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
 
 
-def build_files_prompt_keyboard() -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "inline_keyboard",
-            "payload": {"buttons": [[{"type": "callback", "text": "Отмена", "payload": "files:cancel"}]]},
-        }
-    ]
-
-
-def build_files_menu_text(chat_id: int) -> str:
-    return (
-        "📄 Файлы\n\n"
-        "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
-        "Что доступно:\n"
-        "• Документ (.docx)\n"
-        "• Презентация (.pptx)\n"
-        "• Таблица (.xlsx)\n\n"
-        "Стоимость:\n"
-        f"• Документ — {FILE_DOC_REQUEST_COST} запросов\n"
-        f"• Презентация — {FILE_PPT_REQUEST_COST} запросов\n"
-        f"• Таблица — {FILE_SHEET_REQUEST_COST} запросов\n\n"
-        "Можно нажать кнопку ниже или просто написать:\n"
-        "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
-    )
-
-
-def build_file_prompt_text(kind: str) -> str:
-    if kind == "ppt":
-        return (
-            "Напиши, какую презентацию собрать одним сообщением.\n\n"
-            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
-            f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
-        )
-    if kind == "sheet":
-        return (
-            "Напиши, какую таблицу собрать одним сообщением.\n\n"
-            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
-            f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
-        )
-    return (
-        "Напиши, какой документ собрать одним сообщением.\n\n"
-        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
-        f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
-    )
-
-
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
     set_image_mode(chat_id, "")
     await show_managed_content(
@@ -7865,6 +7489,36 @@ def build_files_size_keyboard(kind: str) -> list[dict[str, Any]]:
             },
         }
     ]
+def build_files_menu_text(chat_id: int) -> str:
+    row = user_profile(chat_id)
+    if str(row.get("plan", "free")).strip().lower() == "free":
+        return (
+            "📄 Файлы\n\n"
+            "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
+            "Что доступно:\n"
+            "• Документ (.docx)\n"
+            "• Презентация (.pptx)\n"
+            "• Таблица (.xlsx)\n\n"
+            "На Free:\n"
+            "• 1 короткий файл каждые 14 дней\n"
+            "• средняя и полная версии доступны на платных тарифах\n\n"
+            "Можно нажать кнопку ниже или просто написать:\n"
+            "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
+        )
+    return (
+        "📄 Файлы\n\n"
+        "Здесь можно собрать готовый файл и получить его прямо в чат.\n\n"
+        "Что доступно:\n"
+        "• Документ (.docx)\n"
+        "• Презентация (.pptx)\n"
+        "• Таблица (.xlsx)\n\n"
+        "Стоимость:\n"
+        f"• Документ — {FILE_DOC_REQUEST_COST} запросов\n"
+        f"• Презентация — {FILE_PPT_REQUEST_COST} запросов\n"
+        f"• Таблица — {FILE_SHEET_REQUEST_COST} запросов\n\n"
+        "Можно нажать кнопку ниже или просто написать:\n"
+        "«сделай презентацию ...», «подготовь документ ...», «собери таблицу ...»"
+    )
 
 
 def build_files_prompt_keyboard() -> list[dict[str, Any]]:
@@ -7889,30 +7543,6 @@ def build_file_size_text(kind: str) -> str:
         "Выбери объем перед генерацией.\n\n"
         f"{hint}\n\n"
         "После этого я попрошу описать задачу одним сообщением."
-    )
-
-
-def build_file_prompt_text(kind: str, profile: str = "medium") -> str:
-    profile_label = FILE_PROFILE_LABELS.get(profile, FILE_PROFILE_LABELS["medium"])
-    if kind == "ppt":
-        return (
-            f"Режим: Презентация — {profile_label}\n\n"
-            "Напиши, какую презентацию собрать одним сообщением.\n\n"
-            "Хороший пример: «сделай презентацию на 8 слайдов про запуск AI-бота для рекламы и продаж».\n\n"
-            f"Стоимость: {FILE_PPT_REQUEST_COST} запросов."
-        )
-    if kind == "sheet":
-        return (
-            f"Режим: Таблица — {profile_label}\n\n"
-            "Напиши, какую таблицу собрать одним сообщением.\n\n"
-            "Хороший пример: «собери таблицу бюджета на рекламу по каналам на месяц».\n\n"
-            f"Стоимость: {FILE_SHEET_REQUEST_COST} запросов."
-        )
-    return (
-        f"Режим: Документ — {profile_label}\n\n"
-        "Напиши, какой документ собрать одним сообщением.\n\n"
-        "Хороший пример: «подготовь коммерческое предложение для клиента на разработку бота».\n\n"
-        f"Стоимость: {FILE_DOC_REQUEST_COST} запросов."
     )
 
 
