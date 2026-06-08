@@ -432,8 +432,6 @@ HELP_TEXT = (
     "/clear — очистить контекст"
 )
 
-HELP_TEXT += "\n/files — меню файлов: документ, презентация, таблица"
-
 ADMIN_HELP_TEXT = (
     "\n\nАдмин:\n"
     "/admin help\n"
@@ -7773,7 +7771,6 @@ def build_keyboard(chat_id: int | None = None) -> list[dict[str, Any]]:
                     [*plan_buttons],
                     [
                         {"type": "callback", "text": "🎨 Картинка", "payload": "action:image_menu"},
-                        {"type": "callback", "text": "📄 Файлы", "payload": "action:files_menu"},
                         {"type": "callback", "text": "🎁 Бонусы", "payload": "action:growth"},
                     ],
                     [
@@ -7796,13 +7793,16 @@ def build_reply_shortcuts_keyboard(chat_id: int, include_share: bool = False) ->
         [
             {"type": "callback", "text": "Меню", "payload": "reply_action:menu"},
             {"type": "callback", "text": "🎨 Картинка", "payload": "reply_action:image_menu"},
-            {"type": "callback", "text": "📄 Файлы", "payload": "reply_action:files_menu"},
         ]
     ]
     if str(row.get("plan", "free")) == "free":
         buttons[0].append({"type": "callback", "text": "Тарифы", "payload": "reply_action:tariffs"})
     buttons.append([{"type": "callback", "text": "Сброс", "payload": "reply_action:clear"}])
     return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+
+def files_feature_unavailable_text() -> str:
+    return "📄 Файлы скоро вернем. Режим еще дорабатывается."
 
 
 async def send_image_menu(chat_id: int, notify: bool = False) -> None:
@@ -7951,9 +7951,9 @@ async def send_files_menu(chat_id: int, notify: bool = False) -> None:
     clear_file_pending_input(chat_id)
     await show_managed_content(
         chat_id,
-        build_files_menu_text(chat_id),
-        attachments=build_files_menu_keyboard(chat_id),
-        page=UI_PAGE_FILES_MENU,
+        files_feature_unavailable_text(),
+        attachments=build_keyboard(chat_id),
+        page=UI_PAGE_MENU,
         push_history=False,
         force_new=False,
     )
@@ -8504,7 +8504,6 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
             "Что умею:\n"
             "• ⚡ ответы через GPT, Gemini и DeepSeek\n"
             f"• 🎨 {image_capability_line().replace('• ', '')}\n"
-            "• 📄 документы, презентации и таблицы\n"
             "• 🧠 сохранение контекста диалога"
         )
         text = (
@@ -8534,7 +8533,7 @@ def build_ui_page_payload(chat_id: int, page: str) -> tuple[str, list[dict[str, 
     if page == UI_PAGE_IMAGE_MENU:
         return build_image_menu_text(chat_id), build_image_menu_keyboard(chat_id)
     if page == UI_PAGE_FILES_MENU:
-        return build_files_menu_text(chat_id), build_files_menu_keyboard(chat_id)
+        return files_feature_unavailable_text(), build_keyboard(chat_id)
     return "Открой меню и выбери раздел.", build_keyboard(chat_id)
 
 
@@ -10182,7 +10181,31 @@ async def handle_callback(update: dict[str, Any]) -> bool:
         return True
 
     if payload == "action:files_menu":
-        await send_files_menu(chat_id)
+        clear_file_pending_input(chat_id)
+        await show_managed_content(
+            chat_id,
+            files_feature_unavailable_text(),
+            attachments=build_keyboard(chat_id),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_MENU,
+            push_history=False,
+            notification="Режим скоро вернем",
+        )
+        return True
+
+    if payload in {"files:doc", "files:ppt", "files:sheet", "files:cancel"} or payload.startswith("files:sizepick:") or payload.startswith("files:size:"):
+        clear_file_pending_input(chat_id)
+        await show_managed_content(
+            chat_id,
+            files_feature_unavailable_text(),
+            attachments=build_keyboard(chat_id),
+            callback_id=callback_id,
+            source_mid=source_mid,
+            page=UI_PAGE_MENU,
+            push_history=False,
+            notification="Режим скоро вернем",
+        )
         return True
 
     if payload.startswith("files:sizepick:"):
@@ -10840,7 +10863,8 @@ async def handle_command(chat_id: int, text: str) -> bool:
         return True
 
     if command == "/files":
-        await send_files_menu(chat_id)
+        clear_file_pending_input(chat_id)
+        await max_send_message(chat_id, files_feature_unavailable_text(), attachments=build_keyboard())
         return True
 
     if command == "/channel":
