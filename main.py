@@ -1579,7 +1579,7 @@ class UserStore:
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (admin_panel_source, admin_panel_source, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1621,6 +1621,7 @@ class UserStore:
 
     def suspicious_users_report(self, limit: int = 25) -> list[dict[str, Any]]:
         with self._connect() as conn:
+            admin_panel_source = "%source=admin panel%"
             rows = conn.execute(
                 """
                 SELECT
@@ -1647,7 +1648,7 @@ class UserStore:
                                 FROM usage_events e
                                 WHERE e.chat_id = u.chat_id
                                   AND e.event_type = 'payment'
-                                  AND e.details LIKE '%source=admin panel%'
+                                  AND e.details LIKE ?
                              )
                         THEN 'Оплата подтверждена вручную через админку'
                         ELSE ''
@@ -1667,7 +1668,7 @@ class UserStore:
                         FROM usage_events e
                         WHERE e.chat_id = u.chat_id
                           AND e.event_type = 'payment'
-                          AND e.details LIKE '%source=admin panel%'
+                          AND e.details LIKE ?
                     )
                   )
                 ORDER BY u.updated_at DESC
