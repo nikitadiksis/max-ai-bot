@@ -5550,6 +5550,15 @@ def is_expected_max_delivery_error(exc: Exception | str) -> bool:
     )
 
 
+def is_max_attachment_not_ready_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return (
+        "attachment.not.ready" in text
+        or "file.not.processed" in text
+        or "errors.process.attachment.file.not.processed" in text
+    )
+
+
 async def max_edit_message(
     chat_id: int,
     message_mid: str,
@@ -5723,6 +5732,37 @@ async def send_generated_file(
         f"Готово. Собрал {kind_label}: {title}",
         attachments=[attachment, *build_reply_shortcuts_keyboard(chat_id)],
     )
+
+
+async def send_generated_file(
+    chat_id: int,
+    *,
+    kind: str,
+    title: str,
+    file_bytes: bytes,
+    filename: str,
+) -> None:
+    attachment_payload = await upload_binary_to_max(
+        data_bytes=file_bytes,
+        mime_type=FILE_KIND_MIME_TYPES.get(kind, "application/octet-stream"),
+        filename=filename,
+        upload_type="file",
+    )
+    attachment = {"type": "file", "payload": attachment_payload}
+    text = f"Готово. Собрал {FILE_KIND_LABELS.get(kind, 'файл')}: {title}"
+    attachments = [attachment, *build_reply_shortcuts_keyboard(chat_id)]
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            await max_send_message(chat_id, text, attachments=attachments)
+            return
+        except Exception as exc:
+            if not is_max_attachment_not_ready_error(exc) or attempt == 4:
+                raise
+            last_exc = exc
+            await asyncio.sleep(1.2 + attempt * 0.8)
+    if last_exc:
+        raise last_exc
 
 
 def friendly_image_generation_error(exc: Exception, *, is_edit: bool = False) -> str:
