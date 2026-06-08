@@ -1703,21 +1703,21 @@ class UserStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT
-                    u.chat_id,
-                    u.max_user_id,
-                    u.referral_code,
-                    u.referrals_invited,
-                    SUM(CASE WHEN r.plan != 'free' THEN 1 ELSE 0 END) AS paid_referrals,
-                    SUM(CASE WHEN r.last_active_at >= ? THEN 1 ELSE 0 END) AS active_recent_referrals
-                FROM users u
-                LEFT JOIN users r ON r.referred_by_chat_id = u.chat_id
-                WHERE u.referrals_invited >= 3
-                GROUP BY u.chat_id, u.max_user_id, u.referral_code, u.referrals_invited
-                HAVING paid_referrals = 0
-                ORDER BY u.referrals_invited DESC, active_recent_referrals ASC, u.chat_id DESC
-                LIMIT ?
-                """,
+            SELECT
+                u.chat_id,
+                u.max_user_id,
+                u.referral_code,
+                u.referrals_invited,
+                SUM(CASE WHEN r.plan != 'free' THEN 1 ELSE 0 END) AS paid_referrals,
+                SUM(CASE WHEN r.last_active_at >= ? THEN 1 ELSE 0 END) AS active_recent_referrals
+            FROM users u
+            LEFT JOIN users r ON r.referred_by_chat_id = u.chat_id
+            WHERE u.referrals_invited >= 3
+            GROUP BY u.chat_id, u.max_user_id, u.referral_code, u.referrals_invited
+            HAVING SUM(CASE WHEN r.plan != 'free' THEN 1 ELSE 0 END) = 0
+            ORDER BY u.referrals_invited DESC, active_recent_referrals ASC, u.chat_id DESC
+            LIMIT ?
+            """,
                 ((datetime.utcnow() - timedelta(days=14)).replace(microsecond=0).isoformat(), limit),
             ).fetchall()
             return [dict(row) for row in rows]
