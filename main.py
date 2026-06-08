@@ -6272,6 +6272,88 @@ def doc_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium
     }
 
 
+def ppt_spec_from_plain_text(user_prompt: str, text: str, profile: str = "medium") -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    topic = normalized_file_topic(user_prompt)
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", raw) if block.strip()]
+    slides: list[dict[str, Any]] = []
+    heading_hints = (
+        "введение",
+        "обзор",
+        "резюме",
+        "вывод",
+        "рекоменда",
+        "риски",
+        "спрос",
+        "предлож",
+        "цены",
+        "эконом",
+        "конкур",
+        "рын",
+        "сегмент",
+        "клиент",
+        "контекст",
+    )
+
+    for index, block in enumerate(blocks[:10], start=1):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        heading = ""
+        content_lines = lines
+        first_line = re.sub(r"^[#>\-\*\d\.\)\s]+", "", lines[0]).strip()
+        if first_line and (
+            lines[0].startswith("#")
+            or lines[0].endswith(":")
+            or (len(first_line) <= 80 and any(first_line.lower().startswith(hint) for hint in heading_hints))
+        ):
+            heading = first_line.rstrip(":")
+            content_lines = lines[1:]
+
+        bullets: list[str] = []
+        note = ""
+        for line in content_lines:
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if re.match(r"^[-*•]\s+", cleaned):
+                bullets.append(re.sub(r"^[-*•]\s+", "", cleaned).strip())
+                continue
+            if re.match(r"^\d+[\.\)]\s+", cleaned):
+                bullets.append(re.sub(r"^\d+[\.\)]\s+", "", cleaned).strip())
+                continue
+            sentences = [item.strip(" -•") for item in re.split(r"(?<=[.!?])\s+", cleaned) if item.strip(" -•")]
+            if sentences:
+                bullets.extend(sentences[:2])
+            elif not note:
+                note = cleaned
+
+        bullets = [bullet for bullet in bullets if bullet][:4]
+        if not heading:
+            heading = "Ключевой вывод" if index == 1 else f"Слайд {index}"
+        if bullets:
+            slides.append({"title": heading, "bullets": bullets, "note": note})
+
+    if len(slides) < 2:
+        return None
+
+    slide_limit = {"short": 5, "medium": 7, "full": 9}.get(profile, 7)
+    return {
+        "title": "Презентация",
+        "subtitle": topic,
+        "slides": slides[:slide_limit],
+    }
+
+
 def looks_like_broken_json_payload(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
@@ -6570,14 +6652,14 @@ def build_research_ppt_messages(profile: str, user_prompt: str, research_context
     slide_targets = {"short": "4-5", "medium": "6-8", "full": "8-10"}.get(profile, "6-8")
     system_text = (
         "Ты готовишь содержательную презентацию по внешним источникам. "
-        "Верни только JSON объект вида "
-        '{"title":"...", "subtitle":"...", "slides":[{"title":"...", "bullets":["..."], "note":"..."}]}. '
+        "Верни обычный аналитический текст с явными заголовками будущих слайдов, короткими абзацами и списками. "
+        "Не возвращай JSON, markdown-таблицы и code fences. "
         "Нужен не план выступления и не общие фразы, а слайды с реальными выводами и фактами из найденных источников. "
         "Каждый слайд должен содержать конкретные тезисы, а не заглушки вроде 'Главная идея' или 'Что важно учесть'. "
         "Если запрос про рынок или нишу, строй презентацию как рыночный разбор: контекст рынка, спрос и сегменты клиентов, конкуренты и альтернативы, "
         "ценовые сигналы и экономика, риски запуска, итоговый вывод и рекомендация по запуску. "
         "В каждом буллете формулируй именно результат или наблюдение. Избегай фраз 'источники говорят', 'логично тестировать', 'важно учесть'. "
-        f"Сделай {slide_targets} содержательных слайдов плюс финальный слайд с выводом."
+        f"Сделай материал на {slide_targets} содержательных слайдов плюс финальный слайд с выводом."
     )
     user_text = (
         f"Тема презентации: {normalized_file_topic(user_prompt)}\n\n"
@@ -7148,7 +7230,7 @@ async def generate_file_spec(chat_id: int, kind: str, profile: str, user_prompt:
             if kind == "ppt":
                 research_messages = build_research_ppt_messages(profile, user_prompt, research_context)
                 research_result = await complete_text_messages(alias=alias, plan_name=plan_name, messages=research_messages)
-                research_spec = extract_json_object(research_result.text)
+                research_spec = ppt_spec_from_plain_text(user_prompt, research_result.text, profile)
                 if isinstance(research_spec, dict) and isinstance(research_spec.get("slides"), list) and len(research_spec.get("slides") or []) >= 4:
                     source_slide = {
                         "title": "Источники",
