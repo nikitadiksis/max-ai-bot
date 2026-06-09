@@ -805,6 +805,20 @@ def campaign_deep_link(campaign: str, source: str = "ads") -> str:
     return f"{base_url}{separator}start={payload}"
 
 
+def log_campaign_open(chat_id: int, source: str, campaign: str, entrypoint: str) -> None:
+    source_value = re.sub(r"[^a-z0-9_-]", "", str(source or "").strip().lower())[:32]
+    campaign_value = re.sub(r"[^a-z0-9_-]", "", str(campaign or "").strip().lower())[:48]
+    if not source_value and not campaign_value:
+        return
+    state.user_store.record_usage_event(
+        chat_id,
+        event_type="campaign_open",
+        plan=source_value,
+        model_alias=campaign_value,
+        details=f"entrypoint={entrypoint}"[:500],
+    )
+
+
 def referral_share_message_v2(code: str) -> str:
     normalized = normalize_referral_code(code)
     return (
@@ -2333,6 +2347,21 @@ class UserStore:
                 """,
                 (since, since),
             ).fetchall()
+            campaign_open_rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(lower(plan), ''), 'direct') AS source,
+                    COALESCE(NULLIF(lower(model_alias), ''), '-') AS campaign,
+                    COUNT(*) AS opens,
+                    COUNT(DISTINCT chat_id) AS unique_open_users
+                FROM usage_events
+                WHERE created_at >= ? AND event_type = 'campaign_open'
+                GROUP BY source, campaign
+                ORDER BY opens DESC, unique_open_users DESC, campaign ASC
+                LIMIT 50
+                """,
+                (since,),
+            ).fetchall()
             promo_code_rows = conn.execute(
                 """
                 WITH promo_base AS (
@@ -2558,6 +2587,7 @@ class UserStore:
                 "top_referrers": top_referrers,
                 "suspicious_referrals": suspicious_referrals,
                 "sources": [dict(row) for row in source_rows],
+                "campaign_opens": [dict(row) for row in campaign_open_rows],
                 "promo_codes": [dict(row) for row in promo_code_rows],
                 "top_screens": top_screens,
                 "top_presets": top_presets,
@@ -10808,6 +10838,7 @@ async def handle_command(chat_id: int, text: str) -> bool:
         row = user_profile(chat_id)
         if command == "/start" and arg:
             start_source, start_campaign = acquisition_meta_from_start_payload({"payload": arg})
+            log_campaign_open(chat_id, source=start_source, campaign=start_campaign, entrypoint="start_command")
             state.user_store.set_acquisition_meta(chat_id, source=start_source or ("referral" if is_referral_code(arg) else "direct"), campaign=start_campaign)
             start_ref = referral_code_from_start_payload({"payload": arg}) or (normalize_referral_code(arg) if is_referral_code(arg) else "")
             if start_ref:
@@ -11223,6 +11254,7 @@ async def process_update(update: dict[str, Any]) -> None:
 
     if update_type in {"bot_started", "user_added", "bot_added"}:
         source, campaign = acquisition_meta_from_start_payload(update)
+        log_campaign_open(chat_id, source=source, campaign=campaign, entrypoint=update_type)
         state.user_store.set_acquisition_meta(chat_id, source=source or "direct", campaign=campaign)
         referral_applied = await maybe_apply_start_referral(chat_id, update)
         if referral_applied:
@@ -12363,6 +12395,7 @@ def render_admin_analytics_html_v2(token: str, days: int = 30) -> str:
 def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
     report = state.user_store.kpi_report(days=days)
     source_rows = report.get("sources", []) or []
+    open_rows = report.get("campaign_opens", []) or []
     promo_rows = report.get("promo_codes", []) or []
 
     by_campaign: dict[str, dict[str, Any]] = {}
@@ -12376,6 +12409,8 @@ def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
             {
                 "campaign": campaign,
                 "source": source,
+                "opens": 0,
+                "unique_open_users": 0,
                 "users_count": 0,
                 "promo_activations": 0,
                 "paid_users": 0,
@@ -12386,6 +12421,26 @@ def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
         item["paid_users"] += int(row.get("paid_users", 0) or 0)
         item["revenue_rub"] += int(row.get("revenue_rub", 0) or 0)
 
+    for row in open_rows:
+        source = str(row.get("source", "") or "direct").strip().lower() or "direct"
+        campaign = str(row.get("campaign", "") or "-").strip().lower() or "-"
+        key = campaign if campaign != "-" else f"source:{source}"
+        item = by_campaign.setdefault(
+            key,
+            {
+                "campaign": campaign,
+                "source": source,
+                "opens": 0,
+                "unique_open_users": 0,
+                "users_count": 0,
+                "promo_activations": 0,
+                "paid_users": 0,
+                "revenue_rub": 0,
+            },
+        )
+        item["opens"] += int(row.get("opens", 0) or 0)
+        item["unique_open_users"] += int(row.get("unique_open_users", 0) or 0)
+
     for row in promo_rows:
         promo_code = str(row.get("promo_code", "") or "").strip().lower()
         if not promo_code:
@@ -12395,6 +12450,8 @@ def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
             {
                 "campaign": promo_code,
                 "source": "promo",
+                "opens": 0,
+                "unique_open_users": 0,
                 "users_count": 0,
                 "promo_activations": 0,
                 "paid_users": 0,
@@ -12411,6 +12468,7 @@ def campaign_export_rows(days: int = 30) -> list[dict[str, Any]]:
             -int(x.get("revenue_rub", 0) or 0),
             -int(x.get("paid_users", 0) or 0),
             -int(x.get("promo_activations", 0) or 0),
+            -int(x.get("opens", 0) or 0),
             -int(x.get("users_count", 0) or 0),
             str(x.get("campaign", "")),
         ),
@@ -12434,6 +12492,8 @@ def campaign_export_csv(days: int = 30) -> str:
         [
             "campaign",
             "source",
+            "opens",
+            "unique_open_users",
             "users_count",
             "promo_activations",
             "paid_users",
@@ -12446,6 +12506,8 @@ def campaign_export_csv(days: int = 30) -> str:
             [
                 str(row.get("campaign", "") or ""),
                 str(row.get("source", "") or ""),
+                int(row.get("opens", 0) or 0),
+                int(row.get("unique_open_users", 0) or 0),
                 int(row.get("users_count", 0) or 0),
                 int(row.get("promo_activations", 0) or 0),
                 int(row.get("paid_users", 0) or 0),
@@ -12486,7 +12548,8 @@ def campaign_media_plan_xlsx(days: int = 30) -> bytes:
         "Channel Link",
         "Post Date",
         "Spent (RUB)",
-        "Starts (users_count)",
+        "Opens",
+        "New Leads",
         "Promo Activations",
         "Paid Users",
         "Revenue (RUB)",
@@ -12509,6 +12572,7 @@ def campaign_media_plan_xlsx(days: int = 30) -> bytes:
     for idx, (campaign, channel_name, budget, placement_url) in enumerate(ADS_MEDIA_CHANNELS, start=1):
         row_idx = idx + 1
         live = by_campaign.get(campaign.lower(), {})
+        opens = int(live.get("opens", 0) or 0)
         users_count = int(live.get("users_count", 0) or 0)
         promo_activations = int(live.get("promo_activations", 0) or 0)
         paid_users = int(live.get("paid_users", 0) or 0)
@@ -12533,47 +12597,48 @@ def campaign_media_plan_xlsx(days: int = 30) -> bytes:
         channel_cell.style = "Hyperlink"
         ws.cell(row=row_idx, column=9, value="")
         ws.cell(row=row_idx, column=10, value=spent_rub)
-        ws.cell(row=row_idx, column=11, value=users_count)
-        ws.cell(row=row_idx, column=12, value=promo_activations)
-        ws.cell(row=row_idx, column=13, value=paid_users)
-        ws.cell(row=row_idx, column=14, value=revenue_rub)
-        ws.cell(row=row_idx, column=15, value=f"=IF(L{row_idx}>0,J{row_idx}/L{row_idx},0)")
-        ws.cell(row=row_idx, column=16, value=f"=IF(M{row_idx}>0,J{row_idx}/M{row_idx},0)")
-        ws.cell(row=row_idx, column=17, value=f"=IF(J{row_idx}>0,(N{row_idx}-J{row_idx})/J{row_idx},0)")
+        ws.cell(row=row_idx, column=11, value=opens)
+        ws.cell(row=row_idx, column=12, value=users_count)
+        ws.cell(row=row_idx, column=13, value=promo_activations)
+        ws.cell(row=row_idx, column=14, value=paid_users)
+        ws.cell(row=row_idx, column=15, value=revenue_rub)
+        ws.cell(row=row_idx, column=16, value=f"=IF(L{row_idx}>0,J{row_idx}/L{row_idx},0)")
+        ws.cell(row=row_idx, column=17, value=f"=IF(N{row_idx}>0,J{row_idx}/N{row_idx},0)")
+        ws.cell(row=row_idx, column=18, value=f"=IF(J{row_idx}>0,(O{row_idx}-J{row_idx})/J{row_idx},0)")
 
     total_row = len(ADS_MEDIA_CHANNELS) + 3
     ws.cell(row=total_row, column=1, value="TOTAL").font = Font(bold=True)
-    for col in (6, 10, 11, 12, 13, 14):
+    for col in (6, 10, 11, 12, 13, 14, 15):
         letter = get_column_letter(col)
         ws.cell(row=total_row, column=col, value=f"=SUM({letter}2:{letter}{total_row-1})")
-    ws.cell(row=total_row, column=15, value=f"=IF(L{total_row}>0,J{total_row}/L{total_row},0)")
-    ws.cell(row=total_row, column=16, value=f"=IF(M{total_row}>0,J{total_row}/M{total_row},0)")
-    ws.cell(row=total_row, column=17, value=f"=IF(J{total_row}>0,(N{total_row}-J{total_row})/J{total_row},0)")
+    ws.cell(row=total_row, column=16, value=f"=IF(L{total_row}>0,J{total_row}/L{total_row},0)")
+    ws.cell(row=total_row, column=17, value=f"=IF(N{total_row}>0,J{total_row}/N{total_row},0)")
+    ws.cell(row=total_row, column=18, value=f"=IF(J{total_row}>0,(O{total_row}-J{total_row})/J{total_row},0)")
 
     for r in range(2, total_row + 1):
-        for c in range(1, 18):
+        for c in range(1, 19):
             cell = ws.cell(row=r, column=c)
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            if c in (1, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17):
+            if c in (1, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
                 cell.alignment = Alignment(vertical="center")
 
-    for col in (6, 10, 14, 15, 16):
+    for col in (6, 10, 15, 16, 17):
         for r in range(2, total_row + 1):
             ws.cell(row=r, column=col).number_format = "#,##0.00"
     for r in range(2, total_row + 1):
-        ws.cell(row=r, column=17).number_format = "0.00%"
+        ws.cell(row=r, column=18).number_format = "0.00%"
 
     widths = {
         1: 10, 2: 48, 3: 12, 4: 42, 5: 20, 6: 20, 7: 14, 8: 18, 9: 14,
-        10: 12, 11: 16, 12: 16, 13: 12, 14: 14, 15: 10, 16: 12, 17: 10,
+        10: 12, 11: 12, 12: 14, 13: 16, 14: 12, 15: 14, 16: 10, 17: 12, 18: 10,
     }
     for col, width in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = width
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:Q{total_row-1}"
+    ws.auto_filter.ref = f"A1:R{total_row-1}"
     status_validation = DataValidation(type="list", formula1='"planned,booked,posted,done,cancelled"', allow_blank=True)
     ws.add_data_validation(status_validation)
     status_validation.add(f"G2:G{total_row-1}")
