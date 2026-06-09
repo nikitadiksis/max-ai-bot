@@ -210,6 +210,7 @@ SUPPORT_TEXT = os.getenv("SUPPORT_TEXT", "Поддержка: напиши на�
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@aimaxbots.ru").strip()
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "").strip()
 BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").strip()
+DEFAULT_BOT_PUBLIC_URL = "https://max.ru/id231128398751_1_bot"
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://max.ru/id231128398751_biz").strip()
 CHANNEL_GATE_ENABLED = os.getenv("CHANNEL_GATE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
@@ -764,8 +765,22 @@ def max_share_url(text: str) -> str:
     return f"https://max.ru/:share?text={quote(str(text or ''), safe='')}"
 
 
+def normalize_bot_public_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    host = (parsed.netloc or "").strip().lower()
+    path = (parsed.path or "").strip()
+    if host != "max.ru":
+        return ""
+    if not path or not path.endswith("_bot"):
+        return ""
+    return f"https://max.ru{path}"
+
+
 def bot_public_url_value() -> str:
-    return (BOT_PUBLIC_URL or "").strip()
+    return normalize_bot_public_url(BOT_PUBLIC_URL) or normalize_bot_public_url(DEFAULT_BOT_PUBLIC_URL)
 
 
 def campaign_start_payload(campaign: str, source: str = "ads") -> str:
