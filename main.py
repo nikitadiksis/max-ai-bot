@@ -1208,6 +1208,18 @@ class UserStore:
             "UPDATE users SET referred_by_chat_id = ? WHERE referred_by_chat_id = ?",
             (new_chat_id, old_chat_id),
         )
+        rebound_note = f"rebound_from_chat_id={old_chat_id};rebound_to_chat_id={new_chat_id};rebound_at={now}"
+        conn.execute(
+            """
+            UPDATE usage_events
+            SET details = CASE
+                WHEN details IS NULL OR details = '' THEN ?
+                ELSE details || ';' || ?
+            END
+            WHERE chat_id = ?
+            """,
+            (rebound_note, rebound_note, old_chat_id),
+        )
         for table in ("payment_requests", "usage_events", "promo_activations", "promo_bonus_grants"):
             conn.execute(f"UPDATE {table} SET chat_id = ? WHERE chat_id = ?", (new_chat_id, old_chat_id))
 
@@ -8123,6 +8135,12 @@ async def _process_image_generation_queued(chat_id: int, user_prompt: str, model
         return True
 
     request_for_model = model_prompt or prompt
+    image_details = (
+        f"mode=image_generate;queued_at={datetime.utcnow().isoformat()};"
+        f"prompt_len={len(prompt)};"
+        f"style={get_image_prefs(chat_id).get('style','')};"
+        f"aspect={get_image_prefs(chat_id).get('aspect','')}"
+    )
     queue_before = await enqueue_image_job(
         ImageJob(
             kind="generate",
@@ -8130,7 +8148,7 @@ async def _process_image_generation_queued(chat_id: int, user_prompt: str, model
             user_prompt=prompt,
             model_prompt=request_for_model,
             credits_spent=img_cost,
-            details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+            details=image_details,
             limit_plan=plan_name,
         )
     )
@@ -8212,6 +8230,12 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
         return True
 
     prepared_prompt = build_image_prompt(prompt, chat_id)
+    image_details = (
+        f"mode=image_edit;queued_at={datetime.utcnow().isoformat()};"
+        f"prompt_len={len(prompt)};reference=1;"
+        f"style={get_image_prefs(chat_id).get('style','')};"
+        f"aspect={get_image_prefs(chat_id).get('aspect','')}"
+    )
     queue_before = await enqueue_image_job(
         ImageJob(
             kind="edit",
@@ -8219,7 +8243,7 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
             user_prompt=prompt,
             model_prompt=prepared_prompt,
             credits_spent=edit_cost,
-            details=f"mode=image_edit;style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+            details=image_details,
             limit_plan=plan_name,
             reference_image_data_url=reference_image_data_url,
         )
