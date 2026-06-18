@@ -558,6 +558,7 @@ class ImageJob:
     model_prompt: str
     credits_spent: int
     details: str
+    limit_plan: str = ""
     reference_image_data_url: str = ""
 
 
@@ -2083,6 +2084,34 @@ class UserStore:
                 (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), chat_id),
             )
             conn.commit()
+
+    def clear_free_image_usage(self, chat_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET free_image_week_used = 0, free_image_last_used_at = '', updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (datetime.utcnow().isoformat(), chat_id),
+            )
+            conn.commit()
+
+    def has_image_usage_since(self, chat_id: int, since: str) -> bool:
+        since_value = str(since or "").strip()
+        if not since_value:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM usage_events
+                WHERE chat_id = ? AND event_type = 'image_request' AND created_at >= ?
+                LIMIT 1
+                """,
+                (chat_id, since_value),
+            ).fetchone()
+            return bool(row)
 
     def increment_free_file_usage(self, chat_id: int) -> None:
         with self._connect() as conn:
@@ -5224,6 +5253,11 @@ async def http_bytes_request_with_retries(
 
 def user_profile(chat_id: int) -> dict[str, Any]:
     row = state.user_store.get_or_create_user(chat_id, best_default_alias_for_plan("free"))
+    if str(row.get("plan", "free")).strip().lower() == "free":
+        free_image_last_used_at = str(row.get("free_image_last_used_at", "") or "").strip()
+        if free_image_last_used_at and not state.user_store.has_image_usage_since(chat_id, free_image_last_used_at):
+            state.user_store.clear_free_image_usage(chat_id)
+            row = state.user_store.get_or_create_user(chat_id, best_default_alias_for_plan("free"))
     plan = row["plan"]
     expires_at = parse_iso_datetime(row.get("subscription_expires_at", ""))
     if plan != "free" and (expires_at is None or expires_at <= datetime.utcnow()):
@@ -5454,10 +5488,7 @@ def consume_limit(chat_id: int, limit_type: str) -> None:
         return
 
     if limit_type == "images":
-        if str(row.get("plan", "free")) == "free":
-            state.user_store.increment_free_week_image_usage(chat_id)
-            return
-        state.user_store.increment_image_usage(chat_id)
+        consume_image_limit_for_plan(chat_id, str(row.get("plan", "free")))
         return
 
     if limit_type == "files":
@@ -5472,6 +5503,13 @@ def check_and_consume_limit(chat_id: int, limit_type: str) -> tuple[bool, str]:
         return False, reason
     consume_limit(chat_id, limit_type)
     return True, ""
+
+
+def consume_image_limit_for_plan(chat_id: int, plan_name: str) -> None:
+    if str(plan_name or "free").strip().lower() == "free":
+        state.user_store.increment_free_week_image_usage(chat_id)
+        return
+    state.user_store.increment_image_usage(chat_id)
 
 
 def check_cooldown(chat_id: int, kind: str) -> tuple[bool, str]:
@@ -5836,6 +5874,7 @@ async def process_image_job(job: ImageJob) -> None:
         if job.kind == "edit":
             image = await generate_image_from_reference(job.model_prompt, job.reference_image_data_url)
             await send_generated_image(chat_id, job.model_prompt, image, display_prompt=job.user_prompt)
+            consume_image_limit_for_plan(chat_id, job.limit_plan)
             final_row = user_profile(chat_id)
             state.user_store.record_usage_event(
                 chat_id=chat_id,
@@ -5849,6 +5888,7 @@ async def process_image_job(job: ImageJob) -> None:
         else:
             image = await generate_image(job.model_prompt)
             await send_generated_image(chat_id, job.model_prompt, image, display_prompt=job.user_prompt)
+            consume_image_limit_for_plan(chat_id, job.limit_plan)
             final_row = user_profile(chat_id)
             state.user_store.record_usage_event(
                 chat_id=chat_id,
@@ -8068,7 +8108,7 @@ async def _process_image_generation_queued(chat_id: int, user_prompt: str, model
             )
             return True
 
-    ok, reason = check_and_consume_limit(chat_id, "images")
+    ok, reason = check_limit_only(chat_id, "images")
     if not ok:
         if img_cost > 0:
             state.user_store.refund_credits(chat_id, img_cost)
@@ -8091,6 +8131,7 @@ async def _process_image_generation_queued(chat_id: int, user_prompt: str, model
             model_prompt=request_for_model,
             credits_spent=img_cost,
             details=f"style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+            limit_plan=plan_name,
         )
     )
     set_image_mode(chat_id, "")
@@ -8157,7 +8198,7 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
         )
         return True
 
-    ok, reason = check_and_consume_limit(chat_id, "images")
+    ok, reason = check_limit_only(chat_id, "images")
     if not ok:
         state.user_store.refund_credits(chat_id, edit_cost)
         await show_managed_content(
@@ -8179,6 +8220,7 @@ async def _process_image_edit_generation_queued(chat_id: int, user_prompt: str, 
             model_prompt=prepared_prompt,
             credits_spent=edit_cost,
             details=f"mode=image_edit;style={get_image_prefs(chat_id).get('style','')};aspect={get_image_prefs(chat_id).get('aspect','')}",
+            limit_plan=plan_name,
             reference_image_data_url=reference_image_data_url,
         )
     )
