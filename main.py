@@ -3847,6 +3847,24 @@ def record_ui_page_view(chat_id: int, page: str | None) -> None:
     )
 
 
+def safe_event_value(value: Any, limit: int = 160) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_:\\-./=]", "_", str(value or "").strip())
+    return cleaned[:limit]
+
+
+def record_callback_action(chat_id: int, payload: str, source_mid: str | None = None) -> None:
+    row = user_profile(chat_id)
+    details = f"payload={safe_event_value(payload)}"
+    if source_mid:
+        details += f";source_mid={safe_event_value(source_mid, 80)}"
+    state.user_store.record_usage_event(
+        chat_id=chat_id,
+        event_type="callback_action",
+        plan=str(row.get("plan", "")),
+        details=details,
+    )
+
+
 def normalize_text_content(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -9874,6 +9892,7 @@ async def handle_callback(update: dict[str, Any]) -> bool:
     if chat_id is None or not payload:
         return False
     ensure_update_user_binding(chat_id, update)
+    record_callback_action(chat_id, payload, source_mid=source_mid)
 
     if payload == "channel_gate:check":
         ok, reason = await check_channel_subscription(chat_id, force=True)
