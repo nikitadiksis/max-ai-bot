@@ -3848,7 +3848,7 @@ def record_ui_page_view(chat_id: int, page: str | None) -> None:
 
 
 def safe_event_value(value: Any, limit: int = 160) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9_:\\-./=]", "_", str(value or "").strip())
+    cleaned = re.sub(r"[^a-zA-Z0-9_:\\./=-]", "_", str(value or "").strip())
     return cleaned[:limit]
 
 
