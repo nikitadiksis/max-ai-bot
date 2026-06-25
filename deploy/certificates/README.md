@@ -18,3 +18,6 @@ SHA-256:
 
 Downloaded and verified against the `*.max.ru` TLS certificate chain on
 2026-06-25.
+
+The same trust store is used for T-Bank API connections. `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` point Python HTTP clients to the updated system bundle.
