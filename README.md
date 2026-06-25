@@ -218,7 +218,7 @@ curl https://your-domain/health
 Create subscription:
 
 ```bash
-curl -X POST "https://platform-api.max.ru/subscriptions" \
+curl -X POST "https://platform-api2.max.ru/subscriptions" \
   -H "Authorization: YOUR_MAX_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -231,7 +231,7 @@ curl -X POST "https://platform-api.max.ru/subscriptions" \
 Check subscriptions:
 
 ```bash
-curl -X GET "https://platform-api.max.ru/subscriptions" \
+curl -X GET "https://platform-api2.max.ru/subscriptions" \
   -H "Authorization: YOUR_MAX_TOKEN"
 ```
 

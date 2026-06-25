@@ -76,7 +76,7 @@ SITE_DIR = BASE_DIR / "site"
 LOGS_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
-MAX_API = "https://platform-api.max.ru"
+MAX_API = os.getenv("MAX_API_BASE_URL", "https://platform-api2.max.ru").strip().rstrip("/")
 OPENROUTER_CHAT_API = "https://openrouter.ai/api/v1/chat/completions"
 KIE_GEMINI_CHAT_API_DEFAULT = "https://api.kie.ai/gemini-2.5-flash/v1/chat/completions"
 KIE_GPT54_API_DEFAULT = "https://api.kie.ai/codex/v1/responses"
